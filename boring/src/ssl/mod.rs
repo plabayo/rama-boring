@@ -3041,52 +3041,6 @@ impl SslRef {
         }
     }
 
-    /// Set which alps settings for given protocol
-    #[corresponds(SSL_add_application_settings)]
-    pub fn add_application_settings(
-        &mut self,
-        protocol: &[u8],
-        settings: &[u8],
-    ) -> Result<(), ErrorStack> {
-        unsafe {
-            cvt(ffi::SSL_add_application_settings(
-                self.as_ptr(),
-                protocol.as_ptr(),
-                protocol.len(),
-                settings.as_ptr(),
-                settings.len(),
-            ) as c_int)
-            .map(|_| ())
-        }
-    }
-
-    #[corresponds(SSL_get0_peer_application_settings)]
-    pub fn get_peer_application_settings(&self) -> &[u8] {
-        unsafe {
-            let mut ptr = ptr::null();
-            let mut len = 0;
-            ffi::SSL_get0_peer_application_settings(self.as_ptr(), &mut ptr, &mut len);
-            slice::from_raw_parts(ptr, len)
-        }
-    }
-
-    #[corresponds(SSL_has_application_settings)]
-    pub fn has_application_settings(&self) -> bool {
-        unsafe {
-            let r = ffi::SSL_has_application_settings(self.as_ptr());
-            if r == 0 {
-                false
-            } else {
-                true
-            }
-        }
-    }
-
-    // #[corresponds(SSL_alps_use_new_codepoint)]
-    // pub fn set_alps_use_new_codepoint(&self, value: bool) {
-    //     unsafe { ffi::SSL_set_alps_use(self.as_ptr()) }
-    // }
-
     #[corresponds(SSL_set_record_size_limit)]
     pub fn set_record_size_limit(&mut self, value: u16) -> Result<(), ErrorStack> {
         unsafe { cvt(ffi::SSL_set_record_size_limit(self.as_ptr(), value) as c_int).map(|_| ()) }
