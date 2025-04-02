@@ -497,6 +497,10 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
         apply_patch(config, "underscore-wildcards.patch")?;
     }
 
+    // We dont feature gate these changes as we rely on them in a lot of places
+    println!("cargo:warning=applying rama tls patch");
+    apply_patch(config, "rama_tls.patch")?;
+
     Ok(())
 }
 
