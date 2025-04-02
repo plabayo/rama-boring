@@ -550,6 +550,7 @@ impl ExtensionType {
         Self(ffi::TLSEXT_TYPE_application_layer_protocol_negotiation as u16);
     pub const PADDING: Self = Self(ffi::TLSEXT_TYPE_padding as u16);
     pub const EXTENDED_MASTER_SECRET: Self = Self(ffi::TLSEXT_TYPE_extended_master_secret as u16);
+    pub const RECORD_SIZE_LIMIT: Self = Self(ffi::TLSEXT_TYPE_record_size_limit as u16);
     pub const QUIC_TRANSPORT_PARAMETERS_LEGACY: Self =
         Self(ffi::TLSEXT_TYPE_quic_transport_parameters_legacy as u16);
     pub const QUIC_TRANSPORT_PARAMETERS_STANDARD: Self =
@@ -3065,6 +3066,25 @@ impl SslRef {
             } else {
                 Err(ErrorStack::get())
             }
+        }
+    }
+    #[corresponds(SSL_set_record_size_limit)]
+    pub fn set_record_size_limit(&mut self, value: u16) -> Result<(), ErrorStack> {
+        unsafe { cvt(ffi::SSL_set_record_size_limit(self.as_ptr(), value) as c_int).map(|_| ()) }
+    }
+
+    #[corresponds(SSL_set_delegated_credential_schemes)]
+    pub fn set_delegated_credential_schemes(
+        &mut self,
+        schemes: &[SslSignatureAlgorithm],
+    ) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt_0i(ffi::SSL_set_delegated_credential_schemes(
+                self.as_ptr(),
+                schemes.as_ptr() as *const _,
+                schemes.len(),
+            ))
+            .map(|_| ())
         }
     }
 
