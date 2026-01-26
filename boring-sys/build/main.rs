@@ -667,7 +667,7 @@ fn get_cpp_runtime_libs(config: &Config) -> Vec<String> {
     if env::var_os("CARGO_CFG_UNIX").is_some() {
         match env::var("CARGO_CFG_TARGET_OS").unwrap().as_ref() {
             "android" => vec!["c++_shared".to_owned()],
-            "macos" | "ios" | "freebsd" => vec!["c++".to_owned()],
+            "macos" | "ios" | "freebsd" | "openbsd" => vec!["c++".to_owned()],
             _ => vec!["stdc++".to_owned()],
         }
     } else {
