@@ -254,6 +254,73 @@ where
 /// The error type returned after a failed handshake.
 pub struct HandshakeError<S>(ssl::HandshakeError<AsyncStreamBridge<S>>);
 
+#[derive(Debug)]
+/// Exposed SslError
+pub struct SslError {
+    library: Option<&'static str>,
+    function: Option<&'static str>,
+    file: &'static str,
+    line: u32,
+    reason: Option<String>,
+    reason_code: i32,
+    library_code: i32,
+}
+
+impl fmt::Display for SslError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        writeln!(
+            f,
+            "lib={:?} func={:?} reason={:?} file={} line={} lib_code={} reason_code={}",
+            self.library,
+            self.function,
+            self.reason,
+            self.file,
+            self.line,
+            self.library_code,
+            self.reason_code,
+        )
+    }
+}
+
+impl std::error::Error for SslError {}
+
+#[derive(Debug)]
+/// Exposed SslError stack
+pub struct SslErrorStack {
+    // there will always be at least 1 error
+    errors: Vec<SslError>,
+}
+
+impl SslErrorStack {
+    /// Return the first error from the error stack
+    pub fn first(&self) -> &SslError {
+        // assumed to always have at least 1 error
+        &self.errors[0]
+    }
+
+    /// Return the first error from the error stack
+    pub fn into_first(self) -> SslError {
+        // assumed to always have at least 1 error
+        self.errors.into_iter().next().unwrap()
+    }
+
+    /// Return an iterator over all errors in this error stack
+    pub fn iter(&self) -> impl Iterator<Item = &SslError> {
+        self.errors.iter()
+    }
+}
+
+impl fmt::Display for SslErrorStack {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, e) in self.errors.iter().enumerate() {
+            writeln!(f, "#{i} {e}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for SslErrorStack {}
+
 impl<S> HandshakeError<S> {
     /// Returns a shared reference to the `Ssl` object associated with this error.
     #[must_use]
@@ -298,6 +365,33 @@ impl<S> HandshakeError<S> {
             ssl::HandshakeError::Failure(s) => s.error().io_error(),
             _ => None,
         }
+    }
+
+    /// Returns a reference to the inner I/O error, if any.
+    #[must_use]
+    pub fn as_ssl_error_stack(&self) -> Option<SslErrorStack> {
+        if let ssl::HandshakeError::Failure(s) = &self.0 {
+            if let Some(error_stack) = s.error().ssl_error() {
+                if error_stack.errors().is_empty() {
+                    return None;
+                }
+                let n = error_stack.errors().len().min(8);
+                let mut errors = Vec::with_capacity(n);
+                for e in error_stack.errors().iter().take(n) {
+                    errors.push(SslError {
+                        library: e.library(),
+                        function: e.function(),
+                        file: e.file(),
+                        line: e.line(),
+                        reason: e.reason().map(ToString::to_string),
+                        reason_code: e.reason_code() as i32,
+                        library_code: e.library_code(),
+                    });
+                }
+                return Some(SslErrorStack { errors });
+            }
+        }
+        None
     }
 }
 
