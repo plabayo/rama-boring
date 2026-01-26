@@ -258,26 +258,56 @@ pub struct HandshakeError<S>(ssl::HandshakeError<AsyncStreamBridge<S>>);
 /// Exposed SslError
 pub struct SslError {
     library: Option<&'static str>,
-    function: Option<&'static str>,
     file: &'static str,
     line: u32,
     reason: Option<String>,
-    reason_code: i32,
-    library_code: i32,
+    reason_code: rama_boring::libc_types::c_int,
+    library_code: rama_boring::libc_types::c_int,
+}
+
+impl SslError {
+    /// Returns the name of the library reporting the error, if available.
+    pub fn library(&self) -> Option<&'static str> {
+        self.library
+    }
+
+    /// Returns the name of the source file which encountered the error.
+    pub fn file(&self) -> &'static str {
+        self.file
+    }
+
+    /// Returns the line in the source file which encountered the error.
+    ///
+    /// 0 if unknown
+    pub fn line(&self) -> u32 {
+        self.line
+    }
+
+    /// Returns the reason for the error.
+    pub fn reason(&self) -> Option<&str> {
+        self.reason.as_deref()
+    }
+
+    /// Returns reason code corresponding to some of the `{lib}_R_{reason}` constants.
+    ///
+    /// Reason codes are ambiguous, and different libraries reuse the same numeric values for different errors.
+    /// Use [`SslError::library_code`] to compare error codes.
+    pub fn reason_code(&self) -> rama_boring::libc_types::c_int {
+        self.reason_code
+    }
+
+    /// Returns the raw OpenSSL error constant for the library reporting the error (`ERR_LIB_{name}`).
+    pub fn library_code(&self) -> rama_boring::libc_types::c_int {
+        self.library_code
+    }
 }
 
 impl fmt::Display for SslError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(
             f,
-            "lib={:?} func={:?} reason={:?} file={} line={} lib_code={} reason_code={}",
-            self.library,
-            self.function,
-            self.reason,
-            self.file,
-            self.line,
-            self.library_code,
-            self.reason_code,
+            "lib={:?} rfile={} line={} lib_code={} reason={:?} reason_code={}",
+            self.library, self.file, self.line, self.library_code, self.reason, self.reason_code,
         )
     }
 }
@@ -380,11 +410,10 @@ impl<S> HandshakeError<S> {
                 for e in error_stack.errors().iter().take(n) {
                     errors.push(SslError {
                         library: e.library(),
-                        function: e.function(),
                         file: e.file(),
                         line: e.line(),
                         reason: e.reason().map(ToString::to_string),
-                        reason_code: e.reason_code() as i32,
+                        reason_code: e.reason_code(),
                         library_code: e.library_code(),
                     });
                 }

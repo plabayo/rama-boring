@@ -116,7 +116,7 @@ use crate::error::ErrorStack;
 mod macros;
 
 mod bio;
-mod libc_types;
+pub mod libc_types;
 #[macro_use]
 mod util;
 pub mod aes;
