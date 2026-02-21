@@ -23,15 +23,9 @@ ssbzSibBsu/6iGtCOGEoXJf//////////wIBAg==
 -----END DH PARAMETERS-----
 ";
 
-enum ContextType {
-    WithMethod(SslMethod),
-}
-
 #[allow(clippy::inconsistent_digit_grouping)]
-fn ctx(ty: ContextType) -> Result<SslContextBuilder, ErrorStack> {
-    let mut ctx = match ty {
-        ContextType::WithMethod(method) => SslContextBuilder::new(method),
-    }?;
+fn ctx(method: SslMethod) -> Result<SslContextBuilder, ErrorStack> {
+    let mut ctx = SslContextBuilder::new(method)?;
 
     let mut opts = SslOptions::ALL
         | SslOptions::NO_COMPRESSION
@@ -73,7 +67,7 @@ impl SslConnector {
     ///
     /// The default configuration is subject to change, and is currently derived from Python.
     pub fn builder(method: SslMethod) -> Result<SslConnectorBuilder, ErrorStack> {
-        let mut ctx = ctx(ContextType::WithMethod(method))?;
+        let mut ctx = ctx(method)?;
         ctx.set_default_verify_paths()?;
         ctx.set_cipher_list(
             "DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:!aDSS:!SRP:!PSK",
@@ -209,9 +203,7 @@ impl ConnectConfiguration {
             self.ssl.set_hostname(domain)?;
         }
 
-        let verify_hostname = self.verify_hostname;
-
-        if verify_hostname {
+        if self.verify_hostname {
             setup_verify_hostname(&mut self.ssl, domain)?;
         }
 
@@ -281,7 +273,7 @@ impl SslAcceptor {
     ///
     /// [docs]: https://wiki.mozilla.org/Security/Server_Side_TLS
     pub fn mozilla_intermediate_v5(method: SslMethod) -> Result<SslAcceptorBuilder, ErrorStack> {
-        let mut ctx = ctx(ContextType::WithMethod(method))?;
+        let mut ctx = ctx(method)?;
         ctx.set_options(SslOptions::NO_TLSV1 | SslOptions::NO_TLSV1_1);
         let dh = Dh::params_from_pem(FFDHE_2048.as_bytes())?;
         ctx.set_tmp_dh(&dh)?;
@@ -302,7 +294,7 @@ impl SslAcceptor {
     /// [docs]: https://wiki.mozilla.org/Security/Server_Side_TLS
     // FIXME remove in next major version
     pub fn mozilla_intermediate(method: SslMethod) -> Result<SslAcceptorBuilder, ErrorStack> {
-        let mut ctx = ctx(ContextType::WithMethod(method))?;
+        let mut ctx = ctx(method)?;
         ctx.set_options(SslOptions::CIPHER_SERVER_PREFERENCE);
         ctx.set_options(SslOptions::NO_TLSV1_3);
         let dh = Dh::params_from_pem(FFDHE_2048.as_bytes())?;
@@ -328,7 +320,7 @@ impl SslAcceptor {
     /// [docs]: https://wiki.mozilla.org/Security/Server_Side_TLS
     // FIXME remove in next major version
     pub fn mozilla_modern(method: SslMethod) -> Result<SslAcceptorBuilder, ErrorStack> {
-        let mut ctx = ctx(ContextType::WithMethod(method))?;
+        let mut ctx = ctx(method)?;
         ctx.set_options(
             SslOptions::CIPHER_SERVER_PREFERENCE | SslOptions::NO_TLSV1 | SslOptions::NO_TLSV1_1,
         );

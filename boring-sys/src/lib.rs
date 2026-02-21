@@ -10,7 +10,6 @@
     non_upper_case_globals,
     unused_imports
 )]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
 
 use std::convert::TryInto;
 use std::ffi::c_void;
@@ -26,6 +25,13 @@ use std::os::raw::{c_char, c_int, c_uint, c_ulong};
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
+
+// explicitly require presence of some symbols to check if the bindings worked
+pub use generated::{ssl_compliance_policy_t, ERR_add_error_data, SSL_set1_groups}; // if these are missing, your include path is incorrect or has a wrong version of boringssl
+pub use generated::{BIO_new, OPENSSL_free, SSL_ERROR_NONE}; // if these are missing, your include path is incorrect
+
+// NOTE: cloudflare has MLKEM768 as well, check if we need this later
+
 pub use generated::*;
 
 #[cfg(target_pointer_width = "64")]

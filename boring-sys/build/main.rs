@@ -3,7 +3,6 @@ use std::env;
 use std::ffi::OsString;
 use std::fs;
 use std::io;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
@@ -281,8 +280,8 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
             boringssl_cmake.define("CMAKE_TOOLCHAIN_FILE", toolchain_file);
 
             // 21 is the minimum level tested. You can give higher value.
-            boringssl_cmake.define("ANDROID_NATIVE_API_LEVEL", "21");
-            boringssl_cmake.define("ANDROID_STL", "c++_shared");
+            boringssl_cmake.define("ANDROID_NATIVE_API_LEVEL", "21"); // NOTE: cloudflare uses CMAKE_SYSTEM_VERSION
+            boringssl_cmake.define("ANDROID_STL", "c++_shared"); // NOTE: cloudflare uses CMAKE_ANDROID_STL_TYPE
         }
 
         "macos" => {
@@ -457,25 +456,18 @@ fn get_extra_clang_args_for_bindgen(config: &Config) -> Vec<String> {
             // When cross-compiling for Apple targets, tell bindgen to use SDK sysroot,
             // and *don't* use system headers of the host macOS.
             let sdk = get_apple_sdk_name(config);
-            let output = std::process::Command::new("xcrun")
-                .args(["--show-sdk-path", "--sdk", sdk])
-                .output()
-                .unwrap();
-            if !output.status.success() {
-                if let Some(exit_code) = output.status.code() {
-                    println!("cargo:warning=xcrun failed: exit code {exit_code}");
-                } else {
-                    println!("cargo:warning=xcrun failed: killed");
+            match run_command(Command::new("xcrun").args(["--show-sdk-path", "--sdk", sdk])) {
+                Ok(output) => {
+                    let sysroot = std::str::from_utf8(&output.stdout).expect("xcrun output");
+                    params.push("-isysroot".to_string());
+                    // There is typically a newline at the end which confuses clang.
+                    params.push(sysroot.trim_end().to_string());
                 }
-                std::io::stderr().write_all(&output.stderr).unwrap();
-                // Uh... let's try anyway, I guess?
-                return params;
+                Err(e) => {
+                    println!("cargo:warning={e}");
+                    // Uh... let's try anyway, I guess?
+                }
             }
-            let mut sysroot = String::from_utf8(output.stdout).unwrap();
-            // There is typically a newline at the end which confuses clang.
-            sysroot.truncate(sysroot.trim_end().len());
-            params.push("-isysroot".to_string());
-            params.push(sysroot);
         }
         "android" => {
             let mut android_sysroot = config

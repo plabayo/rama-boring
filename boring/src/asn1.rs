@@ -25,7 +25,7 @@
 //! let tomorrow = Asn1Time::days_from_now(1);
 //! ```
 use crate::ffi;
-use crate::libc_types::{c_char, c_int, c_long, time_t};
+use crate::libc_types::{c_int, c_long, time_t};
 use foreign_types::{ForeignType, ForeignTypeRef};
 use std::cmp::Ordering;
 use std::ffi::CString;
@@ -405,7 +405,7 @@ impl Asn1StringRef {
                 return Err(ErrorStack::get());
             }
 
-            Ok(OpensslString::from_ptr(ptr as *mut c_char))
+            Ok(OpensslString::from_ptr(ptr.cast()))
         }
     }
 
@@ -544,7 +544,7 @@ impl Asn1BitStringRef {
     #[corresponds(ASN1_STRING_length)]
     #[must_use]
     pub fn len(&self) -> usize {
-        unsafe { ffi::ASN1_STRING_length(self.as_ptr() as *const _) as usize }
+        unsafe { ffi::ASN1_STRING_length(self.as_ptr().cast_const()) as usize }
     }
 
     /// Determines if the string is empty.
@@ -586,7 +586,7 @@ impl Asn1Object {
         unsafe {
             ffi::init();
             let txt = CString::new(txt).map_err(ErrorStack::internal_error)?;
-            let obj: *mut ffi::ASN1_OBJECT = cvt_p(ffi::OBJ_txt2obj(txt.as_ptr() as *const _, 0))?;
+            let obj: *mut ffi::ASN1_OBJECT = cvt_p(ffi::OBJ_txt2obj(txt.as_ptr(), 0))?;
             Ok(Asn1Object::from_ptr(obj))
         }
     }
@@ -603,9 +603,9 @@ impl Asn1ObjectRef {
 impl fmt::Display for Asn1ObjectRef {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         unsafe {
-            let mut buf = [0; 80];
+            let mut buf = [0u8; 80];
             let len = ffi::OBJ_obj2txt(
-                buf.as_mut_ptr() as *mut _,
+                buf.as_mut_ptr().cast(),
                 buf.len() as c_int,
                 self.as_ptr(),
                 0,

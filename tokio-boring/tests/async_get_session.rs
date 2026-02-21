@@ -26,7 +26,7 @@ async fn test() {
         builder
             .set_session_cache_mode(SslSessionCacheMode::SERVER | SslSessionCacheMode::NO_INTERNAL);
         builder.set_new_session_callback(|_, session| {
-            SERVER_SESSION_DER.set(session.to_der().unwrap()).unwrap()
+            SERVER_SESSION_DER.set(session.to_der().unwrap()).unwrap();
         });
 
         unsafe {

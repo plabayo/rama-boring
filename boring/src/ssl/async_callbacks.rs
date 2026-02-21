@@ -98,6 +98,8 @@ impl SslContextBuilder {
         });
     }
 
+    // TODO: cloudflare also has credential version which is fallible here (Result<(), ErrorStack>)
+    // ... What to do with that?
     /// Configures a custom private key method on the context.
     ///
     /// A task waker must be set on `Ssl` values associated with the resulting

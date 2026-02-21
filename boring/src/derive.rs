@@ -50,7 +50,6 @@ impl<'a> Deriver<'a> {
     /// Returns the size of the shared secret.
     ///
     /// It can be used to size the buffer passed to [`Deriver::derive`].
-    #[corresponds(EVP_PKEY_derive)]
     pub fn len(&mut self) -> Result<usize, ErrorStack> {
         unsafe {
             let mut len = 0;
@@ -64,14 +63,7 @@ impl<'a> Deriver<'a> {
     #[corresponds(EVP_PKEY_derive)]
     pub fn derive(&mut self, buf: &mut [u8]) -> Result<usize, ErrorStack> {
         let mut len = buf.len();
-        unsafe {
-            cvt(ffi::EVP_PKEY_derive(
-                self.0,
-                buf.as_mut_ptr() as *mut _,
-                &mut len,
-            ))
-            .map(|_| len)
-        }
+        unsafe { cvt(ffi::EVP_PKEY_derive(self.0, buf.as_mut_ptr(), &mut len)).map(|_| len) }
     }
 
     /// A convenience function which derives a shared secret and returns it in a new buffer.

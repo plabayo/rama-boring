@@ -103,7 +103,7 @@ where
         unsafe {
             let mut pub_key = ptr::null();
             DSA_get0_key(self.as_ptr(), &mut pub_key, ptr::null_mut());
-            BigNumRef::from_ptr(pub_key as *mut _)
+            BigNumRef::from_ptr(pub_key.cast_mut())
         }
     }
 }
@@ -132,7 +132,7 @@ where
         unsafe {
             let mut priv_key = ptr::null();
             DSA_get0_key(self.as_ptr(), ptr::null_mut(), &mut priv_key);
-            BigNumRef::from_ptr(priv_key as *mut _)
+            BigNumRef::from_ptr(priv_key.cast_mut())
         }
     }
 }
@@ -154,7 +154,7 @@ where
         unsafe {
             let mut p = ptr::null();
             DSA_get0_pqg(self.as_ptr(), &mut p, ptr::null_mut(), ptr::null_mut());
-            BigNumRef::from_ptr(p as *mut _)
+            BigNumRef::from_ptr(p.cast_mut())
         }
     }
 
@@ -164,7 +164,7 @@ where
         unsafe {
             let mut q = ptr::null();
             DSA_get0_pqg(self.as_ptr(), ptr::null_mut(), &mut q, ptr::null_mut());
-            BigNumRef::from_ptr(q as *mut _)
+            BigNumRef::from_ptr(q.cast_mut())
         }
     }
 
@@ -174,7 +174,7 @@ where
         unsafe {
             let mut g = ptr::null();
             DSA_get0_pqg(self.as_ptr(), ptr::null_mut(), ptr::null_mut(), &mut g);
-            BigNumRef::from_ptr(g as *mut _)
+            BigNumRef::from_ptr(g.cast_mut())
         }
     }
 }
@@ -195,7 +195,7 @@ impl Dsa<Private> {
             let dsa = Dsa::from_ptr(cvt_p(ffi::DSA_new())?);
             cvt(ffi::DSA_generate_parameters_ex(
                 dsa.0,
-                bits as c_uint,
+                c_uint::from(bits),
                 ptr::null(),
                 0,
                 ptr::null_mut(),
@@ -300,7 +300,7 @@ mod test {
         let mut ctx = BigNumContext::new().unwrap();
         let mut calc = BigNum::new().unwrap();
         calc.mod_exp(g, priv_key, p, &mut ctx).unwrap();
-        assert_eq!(&calc, pub_key)
+        assert_eq!(&calc, pub_key);
     }
 
     #[test]
