@@ -249,10 +249,10 @@ index 4ce8d1802..3baf92b11 100644
        !ssl_add_client_hello(hs)) {
      return ssl_hs_error;
 diff --git a/ssl/internal.h b/ssl/internal.h
-index fe41e4966..0223c0196 100644
+index 682acbf23..9b2e89a99 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
-@@ -370,6 +370,15 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
+@@ -325,6 +325,15 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
                              const bool has_aes_hw, const char *rule_str,
                              bool strict);
  
@@ -268,9 +268,9 @@ index fe41e4966..0223c0196 100644
  // ssl_cipher_auth_mask_for_key returns the mask of cipher |algorithm_auth|
  // values suitable for use with |key| in TLS 1.2 and below. |sign_ok| indicates
  // whether |key| may be used for signing.
-@@ -2111,6 +2120,11 @@ bool tls13_process_new_session_ticket(SSL *ssl, const SSLMessage &msg);
- bssl::UniquePtr<SSL_SESSION> tls13_create_session_with_ticket(SSL *ssl,
-                                                               CBS *body);
+@@ -2077,6 +2086,11 @@ bool tls13_add_finished(SSL_HANDSHAKE *hs);
+ bool tls13_process_new_session_ticket(SSL *ssl, const SSLMessage &msg);
+ UniquePtr<SSL_SESSION> tls13_create_session_with_ticket(SSL *ssl, CBS *body);
  
 +// rama_ssl_setup_extension_order uses the extension order as
 +// defined by the provided extension order, or falls back
@@ -280,11 +280,10 @@ index fe41e4966..0223c0196 100644
  // ssl_setup_extension_permutation computes a ClientHello extension permutation
  // for |hs|, if applicable. It returns true on success and false on error.
  bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs);
-@@ -3356,6 +3370,13 @@ struct SSL_CONFIG {
+@@ -3346,6 +3360,12 @@ struct SSL_CONFIG {
    // alps_use_new_codepoint if set indicates we use new ALPS extension codepoint
    // to negotiate and convey application settings.
    bool alps_use_new_codepoint : 1;
-+
 +
 +  // Value that will be used for record size extension
 +  uint16_t record_size_limit = 0;
@@ -294,7 +293,7 @@ index fe41e4966..0223c0196 100644
  };
  
  // From RFC 8446, used in determining PSK modes.
-@@ -3971,9 +3992,17 @@ struct ssl_ctx_st : public bssl::RefCounted<ssl_ctx_st> {
+@@ -3952,9 +3972,17 @@ struct ssl_ctx_st : public bssl::RefCounted<ssl_ctx_st> {
    // grease_enabled is whether GREASE (RFC 8701) is enabled.
    bool grease_enabled : 1;
  
