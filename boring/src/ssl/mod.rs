@@ -3730,6 +3730,30 @@ impl SslRef {
     pub fn set_compliance_policy(&mut self, policy: CompliancePolicy) -> Result<(), ErrorStack> {
         unsafe { cvt_0i(ffi::SSL_set_compliance_policy(self.as_ptr(), policy.0)).map(|_| ()) }
     }
+
+    /// Sets whether to use the new ALPS codepoint for `SSL`.
+    #[corresponds(SSL_set_alps_use_new_codepoint)]
+    pub fn set_alps_use_new_codepoint(&mut self, use_new_codepoint: bool) {
+        let use_new_codepoint = if use_new_codepoint { 1 } else { 0 };
+        unsafe {
+            ffi::SSL_set_alps_use_new_codepoint(self.as_ptr(), use_new_codepoint);
+        }
+    }
+
+    /// Adds application settings for the given protocol to be sent via ALPS.
+    #[corresponds(SSL_add_application_settings)]
+    pub fn add_application_settings(&mut self, alps: &[u8]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt_0i(ffi::SSL_add_application_settings(
+                self.as_ptr(),
+                alps.as_ptr(),
+                alps.len(),
+                ptr::null(),
+                0,
+            ))
+            .map(|_| ())
+        }
+    }
 }
 
 /// An SSL stream midway through the handshake process.
