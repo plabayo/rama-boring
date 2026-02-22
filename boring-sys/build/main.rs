@@ -208,13 +208,6 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
     let src_path = get_boringssl_source_path(config);
     let mut boringssl_cmake = cmake::Config::new(src_path);
 
-    // Do not build tests or benchmarks. This avoids pulling in third_party/benchmark.
-    boringssl_cmake
-        .define("BUILD_TESTING", "OFF")
-        .define("BENCHMARK_ENABLE_TESTING", "OFF")
-        .define("BENCHMARK_ENABLE_GTEST_TESTS", "OFF")
-        .define("BENCHMARK_ENABLE_INSTALL", "OFF");
-
     if config.env.cmake_toolchain_file.is_some() {
         return boringssl_cmake;
     }
@@ -524,6 +517,10 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
     // Chromium ships now always with PQ, so we enable these always
     println!("cargo:info=applying post quantum crypto patch to boringssl");
     apply_patch(config, "rama_boring_pq.patch")?;
+
+    // disable fuzz/test/bench code (can give issues in some build configs)
+    println!("cargo:info=applying boringssl cmake cleanup patch");
+    apply_patch(config, "rama_boringssl_cmake.patch")?;
 
     Ok(())
 }
