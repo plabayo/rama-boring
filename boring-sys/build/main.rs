@@ -280,8 +280,8 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
             boringssl_cmake.define("CMAKE_TOOLCHAIN_FILE", toolchain_file);
 
             // 21 is the minimum level tested. You can give higher value.
-            boringssl_cmake.define("ANDROID_NATIVE_API_LEVEL", "21"); // NOTE: cloudflare uses CMAKE_SYSTEM_VERSION
-            boringssl_cmake.define("ANDROID_STL", "c++_shared"); // NOTE: cloudflare uses CMAKE_ANDROID_STL_TYPE
+            boringssl_cmake.define("CMAKE_SYSTEM_VERSION", "21");
+            boringssl_cmake.define("CMAKE_ANDROID_STL_TYPE", "c++_shared");
         }
 
         "macos" => {
@@ -478,38 +478,18 @@ fn get_extra_clang_args_for_bindgen(config: &Config) -> Vec<String> {
 
             android_sysroot.extend(["toolchains", "llvm", "prebuilt"]);
 
-            let toolchain = match pick_best_android_ndk_toolchain(&android_sysroot) {
-                Ok(toolchain) => toolchain,
-                Err(e) => {
-                    println!(
-                        "cargo:warning=failed to find prebuilt Android NDK toolchain for bindgen: {e}"
-                    );
-                    // Uh... let's try anyway, I guess?
-                    return params;
+            match pick_best_android_ndk_toolchain(&android_sysroot) {
+                Ok(toolchain) => {
+                    android_sysroot.push(toolchain);
+                    android_sysroot.push("sysroot");
+                    params.push("--sysroot".to_string());
+                    params.push(android_sysroot.into_os_string().into_string().unwrap());
                 }
-            };
-            android_sysroot.push(toolchain);
-            android_sysroot.push("sysroot");
-
-            // Map rust target arch -> NDK arch dir used under sysroot/usr/lib
-            let arch = match config.target_arch.as_str() {
-                "aarch64" => "aarch64",
-                "x86_64" => "x86_64",
-                "x86" => "i686",
-                _ => "arm", // armv7
-            };
-
-            // Keep API level consistent with your CMake ("21")
-            let api = "21";
-            let libdir = android_sysroot
-                .join("usr")
-                .join("lib")
-                .join(format!("{arch}-linux-android"))
-                .join(api);
-            println!("cargo:rustc-link-search=native={}", libdir.display());
-
-            params.push("--sysroot".to_string());
-            params.push(android_sysroot.into_os_string().into_string().unwrap());
+                Err(e) => {
+                    println!("cargo:warning=failed to find prebuilt Android NDK toolchain for bindgen: {e}");
+                    // Uh... let's try anyway, I guess?
+                }
+            }
         }
         _ => {}
     }
@@ -663,14 +643,12 @@ fn get_cpp_runtime_libs(config: &Config) -> Vec<String> {
         return vec![];
     }
 
-    if env::var_os("CARGO_CFG_UNIX").is_some() {
-        match env::var("CARGO_CFG_TARGET_OS").unwrap().as_ref() {
-            "android" => vec!["c++_shared".to_owned()],
-            "macos" | "ios" | "freebsd" | "openbsd" => vec!["c++".to_owned()],
-            _ => vec!["stdc++".to_owned()],
+    match &*config.target_os {
+        "macos" | "ios" | "freebsd" | "openbsd" | "android" => vec!["c++".to_owned()],
+        _ if env::var_os("CARGO_CFG_UNIX").is_some() || target.contains("-gnu") => {
+            vec!["stdc++".to_owned()]
         }
-    } else {
-        vec![]
+        _ => vec![],
     }
 }
 
