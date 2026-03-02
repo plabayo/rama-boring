@@ -128,6 +128,7 @@ pub mod dh;
 pub mod dsa;
 pub mod ec;
 pub mod ecdsa;
+pub mod ed25519;
 pub mod error;
 pub mod ex_data;
 pub mod hash;
@@ -149,6 +150,7 @@ pub mod stack;
 pub mod string;
 pub mod symm;
 pub mod version;
+pub mod x25519;
 pub mod x509;
 
 fn cvt_p<T>(r: *mut T) -> Result<*mut T, ErrorStack> {

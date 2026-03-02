@@ -421,6 +421,33 @@ impl<T> PKey<T> {
 }
 
 impl PKey<Private> {
+    fn from_raw_private_key(id: Id, key: &[u8]) -> Result<PKey<Private>, ErrorStack> {
+        unsafe {
+            ffi::init();
+            let alg = raw_key_algorithm(id)?;
+            cvt_p(ffi::EVP_PKEY_from_raw_private_key(
+                alg,
+                key.as_ptr(),
+                key.len(),
+            ))
+            .map(|p| PKey::from_ptr(p))
+        }
+    }
+
+    /// Creates a new `PKey` containing an Ed25519 private key from raw bytes.
+    ///
+    /// The key must be exactly 32 bytes.
+    pub fn from_ed25519_private_key(key: &[u8]) -> Result<PKey<Private>, ErrorStack> {
+        Self::from_raw_private_key(Id::ED25519, key)
+    }
+
+    /// Creates a new `PKey` containing an X25519 private key from raw bytes.
+    ///
+    /// The key must be exactly 32 bytes.
+    pub fn from_x25519_private_key(key: &[u8]) -> Result<PKey<Private>, ErrorStack> {
+        Self::from_raw_private_key(Id::X25519, key)
+    }
+
     private_key_from_pem! {
         /// Deserializes a private key from a PEM-encoded key type specific format.
         #[corresponds(PEM_read_bio_PrivateKey)]
@@ -522,6 +549,33 @@ impl PKey<Private> {
 }
 
 impl PKey<Public> {
+    fn from_raw_public_key(id: Id, key: &[u8]) -> Result<PKey<Public>, ErrorStack> {
+        unsafe {
+            ffi::init();
+            let alg = raw_key_algorithm(id)?;
+            cvt_p(ffi::EVP_PKEY_from_raw_public_key(
+                alg,
+                key.as_ptr(),
+                key.len(),
+            ))
+            .map(|p| PKey::from_ptr(p))
+        }
+    }
+
+    /// Creates a new `PKey` containing an Ed25519 public key from raw bytes.
+    ///
+    /// The key must be exactly 32 bytes.
+    pub fn from_ed25519_public_key(key: &[u8]) -> Result<PKey<Public>, ErrorStack> {
+        Self::from_raw_public_key(Id::ED25519, key)
+    }
+
+    /// Creates a new `PKey` containing an X25519 public key from raw bytes.
+    ///
+    /// The key must be exactly 32 bytes.
+    pub fn from_x25519_public_key(key: &[u8]) -> Result<PKey<Public>, ErrorStack> {
+        Self::from_raw_public_key(Id::X25519, key)
+    }
+
     from_pem! {
         /// Decodes a PEM-encoded SubjectPublicKeyInfo structure.
         ///
@@ -543,6 +597,25 @@ impl PKey<Public> {
 }
 
 use crate::ffi::EVP_PKEY_up_ref;
+
+fn raw_key_algorithm(id: Id) -> Result<*const ffi::EVP_PKEY_ALG, ErrorStack> {
+    let alg = unsafe {
+        match id {
+            Id::ED25519 => ffi::EVP_pkey_ed25519(),
+            Id::X25519 => ffi::EVP_pkey_x25519(),
+            _ => {
+                return Err(ErrorStack::internal_error_str(
+                    "unsupported raw key algorithm",
+                ));
+            }
+        }
+    };
+    if alg.is_null() {
+        Err(ErrorStack::internal_error_str("missing raw key algorithm"))
+    } else {
+        Ok(alg)
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -733,5 +806,44 @@ mod tests {
         assert_ne!(raw_public_key, raw_private_key);
         pkey.raw_public_key(&mut [0; 5])
             .expect_err("buffer too small");
+    }
+
+    #[test]
+    fn test_ed25519_from_raw_private_public() {
+        const ED25519_PRIVATE_KEY_DER: &str = concat!(
+            "302e020100300506032b6570042204207c8c6497f9960d5595d7815f550569e5",
+            "f77764ac97e63e339aaa68cc1512b683"
+        );
+        let pkey =
+            PKey::private_key_from_der(&Vec::from_hex(ED25519_PRIVATE_KEY_DER).unwrap()).unwrap();
+        let mut raw_private = [0_u8; 32];
+        pkey.raw_private_key(&mut raw_private).unwrap();
+        let mut raw_public = [0_u8; 32];
+        pkey.raw_public_key(&mut raw_public).unwrap();
+
+        let from_private = PKey::from_ed25519_private_key(&raw_private).unwrap();
+        assert_eq!(from_private.id(), Id::ED25519);
+        let from_public = PKey::from_ed25519_public_key(&raw_public).unwrap();
+        assert_eq!(from_public.id(), Id::ED25519);
+    }
+
+    #[test]
+    fn test_x25519_from_raw_private_public() {
+        let private_a = [1_u8; 32];
+        let private_b = [2_u8; 32];
+        let pkey_a = PKey::from_x25519_private_key(&private_a).unwrap();
+        let pkey_b = PKey::from_x25519_private_key(&private_b).unwrap();
+        assert_eq!(pkey_a.id(), Id::X25519);
+        assert_eq!(pkey_b.id(), Id::X25519);
+
+        let mut public_a = [0_u8; 32];
+        let mut public_b = [0_u8; 32];
+        pkey_a.raw_public_key(&mut public_a).unwrap();
+        pkey_b.raw_public_key(&mut public_b).unwrap();
+
+        let public_key_a = PKey::from_x25519_public_key(&public_a).unwrap();
+        let public_key_b = PKey::from_x25519_public_key(&public_b).unwrap();
+        assert_eq!(public_key_a.id(), Id::X25519);
+        assert_eq!(public_key_b.id(), Id::X25519);
     }
 }
