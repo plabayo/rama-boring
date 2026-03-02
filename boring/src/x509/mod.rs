@@ -23,8 +23,8 @@ use std::str;
 use std::sync::LazyLock;
 
 use crate::asn1::{
-    Asn1BitStringRef, Asn1IntegerRef, Asn1Object, Asn1ObjectRef, Asn1StringRef, Asn1TimeRef,
-    Asn1Type,
+    Asn1BitStringRef, Asn1IntegerRef, Asn1Object, Asn1ObjectRef, Asn1String, Asn1StringRef,
+    Asn1TimeRef, Asn1Type,
 };
 use crate::bio::{MemBio, MemBioSlice};
 use crate::conf::ConfRef;
@@ -484,6 +484,30 @@ impl X509Builder {
         }
     }
 
+    /// Adds an extension value to the certificate from object identifier + raw payload bytes.
+    ///
+    /// `der_payload` is the raw extension payload bytes (ASN.1 OCTET STRING contents).
+    pub fn append_extension_der_payload(
+        &mut self,
+        object: &Asn1ObjectRef,
+        critical: bool,
+        der_payload: &[u8],
+    ) -> Result<(), ErrorStack> {
+        let extension = X509Extension::from_der_payload(object, critical, der_payload)?;
+        self.append_extension(extension.as_ref())
+    }
+
+    /// Adds all extension values from `cert` to the certificate being built.
+    ///
+    /// This preserves extension order from the source certificate.
+    #[corresponds(X509_add_ext)]
+    pub fn append_extensions_from_cert(&mut self, cert: &X509Ref) -> Result<(), ErrorStack> {
+        for ext in cert.extensions() {
+            self.append_extension(ext)?;
+        }
+        Ok(())
+    }
+
     /// Signs the certificate with a private key.
     #[corresponds(X509_sign)]
     pub fn sign<T>(&mut self, key: &PKeyRef<T>, hash: MessageDigest) -> Result<(), ErrorStack>
@@ -524,6 +548,39 @@ impl X509Ref {
     #[must_use]
     pub fn subject_name_hash(&self) -> u32 {
         unsafe { ffi::X509_subject_name_hash(self.as_ptr()) as u32 }
+    }
+
+    /// Returns the number of extensions in this certificate.
+    #[corresponds(X509_get_ext_count)]
+    #[must_use]
+    pub fn extension_count(&self) -> usize {
+        unsafe { ffi::X509_get_ext_count(self.as_ptr()) as usize }
+    }
+
+    /// Returns a certificate extension by index.
+    ///
+    /// Returns `None` if `index` is out of bounds.
+    #[corresponds(X509_get_ext)]
+    #[must_use]
+    pub fn extension(&self, index: usize) -> Option<&X509ExtensionRef> {
+        if index >= self.extension_count() {
+            return None;
+        }
+
+        unsafe {
+            let ext = ffi::X509_get_ext(self.as_ptr(), index as c_int);
+            X509ExtensionRef::from_const_ptr_opt(ext.cast_const())
+        }
+    }
+
+    /// Returns an iterator over this certificate's extensions.
+    #[must_use]
+    pub fn extensions(&self) -> X509ExtensionIter<'_> {
+        X509ExtensionIter {
+            cert: self,
+            index: 0,
+            len: self.extension_count(),
+        }
     }
 
     /// Returns this certificate's subject alternative name entries, if they exist.
@@ -751,6 +808,33 @@ impl X509Ref {
         ffi::i2d_X509
     }
 }
+
+/// Iterator over certificate extensions.
+pub struct X509ExtensionIter<'a> {
+    cert: &'a X509Ref,
+    index: usize,
+    len: usize,
+}
+
+impl<'a> Iterator for X509ExtensionIter<'a> {
+    type Item = &'a X509ExtensionRef;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.len {
+            return None;
+        }
+        let item = self.cert.extension(self.index);
+        self.index += 1;
+        item
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.len.saturating_sub(self.index);
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for X509ExtensionIter<'_> {}
 
 impl ToOwned for X509Ref {
     type Owned = X509;
@@ -988,6 +1072,34 @@ impl X509Extension {
         cvt_p(ffi::X509V3_EXT_i2d(nid.as_raw(), critical as _, value))
             .map(|p| X509Extension::from_ptr(p))
     }
+
+    /// Constructs an X509 extension from a raw object identifier and payload bytes.
+    ///
+    /// `der_payload` is the raw DER bytes of the extension payload
+    /// (the ASN.1 OCTET STRING contents), not the full extension DER structure.
+    #[corresponds(X509_EXTENSION_create_by_OBJ)]
+    pub fn from_der_payload(
+        object: &Asn1ObjectRef,
+        critical: bool,
+        der_payload: &[u8],
+    ) -> Result<X509Extension, ErrorStack> {
+        unsafe {
+            ffi::init();
+            let octet = Asn1String::from_ptr(cvt_p(ffi::ASN1_OCTET_STRING_new())?.cast());
+            cvt(ffi::ASN1_STRING_set(
+                octet.as_ptr(),
+                der_payload.as_ptr().cast(),
+                try_int(der_payload.len())?,
+            ))?;
+            cvt_p(ffi::X509_EXTENSION_create_by_OBJ(
+                ptr::null_mut(),
+                object.as_ptr(),
+                critical as c_int,
+                octet.as_ptr().cast(),
+            ))
+            .map(|p| X509Extension::from_ptr(p))
+        }
+    }
 }
 
 impl X509ExtensionRef {
@@ -995,6 +1107,37 @@ impl X509ExtensionRef {
         /// Serializes the Extension to its standard DER encoding.
         to_der,
         ffi::i2d_X509_EXTENSION
+    }
+
+    /// Returns this extension's object identifier.
+    #[corresponds(X509_EXTENSION_get_object)]
+    #[must_use]
+    pub fn object(&self) -> &Asn1ObjectRef {
+        unsafe {
+            let object = ffi::X509_EXTENSION_get_object(self.as_ptr());
+            Asn1ObjectRef::from_const_ptr_opt(object)
+                .expect("x509 extension object must not be null")
+        }
+    }
+
+    /// Returns whether this extension is marked critical.
+    #[corresponds(X509_EXTENSION_get_critical)]
+    #[must_use]
+    pub fn critical(&self) -> bool {
+        unsafe { ffi::X509_EXTENSION_get_critical(self.as_ptr()) != 0 }
+    }
+
+    /// Returns this extension's raw ASN.1 OCTET STRING value.
+    ///
+    /// This is the extension payload bytes (not the full extension DER envelope).
+    #[corresponds(X509_EXTENSION_get_data)]
+    #[must_use]
+    pub fn data(&self) -> &Asn1StringRef {
+        unsafe {
+            let data = ffi::X509_EXTENSION_get_data(self.as_ptr());
+            Asn1StringRef::from_const_ptr_opt(data.cast_const())
+                .expect("x509 extension data must not be null")
+        }
     }
 }
 

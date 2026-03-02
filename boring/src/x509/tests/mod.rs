@@ -298,6 +298,167 @@ fn x509_builder() {
 }
 
 #[test]
+fn x509_extension_accessors_and_append_from_cert() {
+    let pkey = pkey();
+
+    let mut name = X509Name::builder().unwrap();
+    name.append_entry_by_nid(Nid::COMMONNAME, "mirror-source.example")
+        .unwrap();
+    let name = name.build();
+
+    let mut source_builder = X509::builder().unwrap();
+    source_builder.set_version(2).unwrap();
+    source_builder.set_subject_name(&name).unwrap();
+    source_builder.set_issuer_name(&name).unwrap();
+    source_builder
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    source_builder
+        .set_not_after(&Asn1Time::days_from_now(30).unwrap())
+        .unwrap();
+    source_builder.set_pubkey(&pkey).unwrap();
+
+    let mut serial = BigNum::new().unwrap();
+    serial.rand(128, MsbOption::MAYBE_ZERO, false).unwrap();
+    source_builder
+        .set_serial_number(&serial.to_asn1_integer().unwrap())
+        .unwrap();
+
+    let basic_constraints = BasicConstraints::new().critical().ca().build().unwrap();
+    source_builder
+        .append_extension(basic_constraints.as_ref())
+        .unwrap();
+    let key_usage = KeyUsage::new()
+        .digital_signature()
+        .key_encipherment()
+        .build()
+        .unwrap();
+    source_builder.append_extension(&key_usage).unwrap();
+    source_builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+    let source_cert = source_builder.build();
+
+    assert_eq!(source_cert.extension_count(), 2);
+    let mut source_exts = source_cert.extensions();
+    let source_ext0 = source_exts.next().unwrap();
+    assert_eq!(source_ext0.object().nid(), Nid::BASIC_CONSTRAINTS);
+    assert!(source_ext0.critical());
+    assert!(!source_ext0.data().is_empty());
+    let source_ext1 = source_exts.next().unwrap();
+    assert_eq!(source_ext1.object().nid(), Nid::KEY_USAGE);
+    assert!(!source_ext1.critical());
+    assert!(!source_ext1.data().is_empty());
+    assert!(source_exts.next().is_none());
+
+    let mut target_builder = X509::builder().unwrap();
+    target_builder.set_version(2).unwrap();
+    target_builder.set_subject_name(&name).unwrap();
+    target_builder.set_issuer_name(&name).unwrap();
+    target_builder
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    target_builder
+        .set_not_after(&Asn1Time::days_from_now(30).unwrap())
+        .unwrap();
+    target_builder.set_pubkey(&pkey).unwrap();
+
+    let mut target_serial = BigNum::new().unwrap();
+    target_serial
+        .rand(128, MsbOption::MAYBE_ZERO, false)
+        .unwrap();
+    target_builder
+        .set_serial_number(&target_serial.to_asn1_integer().unwrap())
+        .unwrap();
+
+    target_builder
+        .append_extensions_from_cert(&source_cert)
+        .unwrap();
+    target_builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+    let target_cert = target_builder.build();
+
+    assert_eq!(target_cert.extension_count(), source_cert.extension_count());
+    for (source_ext, target_ext) in source_cert.extensions().zip(target_cert.extensions()) {
+        assert_eq!(source_ext.object().nid(), target_ext.object().nid());
+        assert_eq!(source_ext.critical(), target_ext.critical());
+        assert_eq!(source_ext.data().as_slice(), target_ext.data().as_slice());
+    }
+}
+
+#[test]
+fn x509_extension_append_der_payload() {
+    let pkey = pkey();
+
+    let mut name = X509Name::builder().unwrap();
+    name.append_entry_by_nid(Nid::COMMONNAME, "append-der.example")
+        .unwrap();
+    let name = name.build();
+
+    let mut source_builder = X509::builder().unwrap();
+    source_builder.set_version(2).unwrap();
+    source_builder.set_subject_name(&name).unwrap();
+    source_builder.set_issuer_name(&name).unwrap();
+    source_builder
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    source_builder
+        .set_not_after(&Asn1Time::days_from_now(30).unwrap())
+        .unwrap();
+    source_builder.set_pubkey(&pkey).unwrap();
+
+    let mut source_serial = BigNum::new().unwrap();
+    source_serial
+        .rand(128, MsbOption::MAYBE_ZERO, false)
+        .unwrap();
+    source_builder
+        .set_serial_number(&source_serial.to_asn1_integer().unwrap())
+        .unwrap();
+
+    let key_usage = KeyUsage::new()
+        .digital_signature()
+        .key_encipherment()
+        .build()
+        .unwrap();
+    source_builder.append_extension(&key_usage).unwrap();
+    source_builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+    let source_cert = source_builder.build();
+    let source_ext = source_cert.extension(0).unwrap();
+
+    let mut target_builder = X509::builder().unwrap();
+    target_builder.set_version(2).unwrap();
+    target_builder.set_subject_name(&name).unwrap();
+    target_builder.set_issuer_name(&name).unwrap();
+    target_builder
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    target_builder
+        .set_not_after(&Asn1Time::days_from_now(30).unwrap())
+        .unwrap();
+    target_builder.set_pubkey(&pkey).unwrap();
+
+    let mut target_serial = BigNum::new().unwrap();
+    target_serial
+        .rand(128, MsbOption::MAYBE_ZERO, false)
+        .unwrap();
+    target_builder
+        .set_serial_number(&target_serial.to_asn1_integer().unwrap())
+        .unwrap();
+
+    target_builder
+        .append_extension_der_payload(
+            source_ext.object(),
+            source_ext.critical(),
+            source_ext.data().as_slice(),
+        )
+        .unwrap();
+    target_builder.sign(&pkey, MessageDigest::sha256()).unwrap();
+    let target_cert = target_builder.build();
+    let target_ext = target_cert.extension(0).unwrap();
+
+    assert_eq!(source_ext.object().nid(), target_ext.object().nid());
+    assert_eq!(source_ext.critical(), target_ext.critical());
+    assert_eq!(source_ext.data().as_slice(), target_ext.data().as_slice());
+}
+
+#[test]
 fn x509_extension_new() {
     assert!(X509Extension::new(None, None, "crlDistributionPoints", "section").is_err());
     assert!(X509Extension::new(None, None, "proxyCertInfo", "").is_err());
