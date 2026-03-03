@@ -43,7 +43,7 @@ pub use rama_boring::ssl::{
 /// allow to make use of async callbacks provided by the boring crate.
 pub async fn connect<S>(
     config: ConnectConfiguration,
-    domain: &str,
+    domain: Option<&str>,
     stream: S,
 ) -> Result<SslStream<S>, HandshakeError<S>>
 where

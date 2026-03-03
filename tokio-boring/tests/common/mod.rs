@@ -65,7 +65,7 @@ pub(crate) async fn connect(
 
     let stream = TcpStream::connect(&addr).await.unwrap();
 
-    rama_boring_tokio::connect(config, "localhost", stream).await
+    rama_boring_tokio::connect(config, Some("localhost"), stream).await
 }
 
 pub(crate) fn create_connector(

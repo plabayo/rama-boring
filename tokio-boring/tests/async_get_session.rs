@@ -73,7 +73,7 @@ async fn test() {
     let client = async move {
         rama_boring_tokio::connect(
             connector.configure().unwrap(),
-            "localhost",
+            Some("localhost"),
             TcpStream::connect(&addr).await.unwrap(),
         )
         .await
@@ -91,7 +91,7 @@ async fn test() {
 
         rama_boring_tokio::connect(
             config,
-            "localhost",
+            Some("localhost"),
             TcpStream::connect(&addr).await.unwrap(),
         )
         .await

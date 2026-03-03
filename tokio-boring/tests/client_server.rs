@@ -18,7 +18,7 @@ async fn google() {
         .build()
         .configure()
         .unwrap();
-    let mut stream = rama_boring_tokio::connect(config, "google.com", stream)
+    let mut stream = rama_boring_tokio::connect(config, Some("google.com"), stream)
         .await
         .unwrap();
 
@@ -31,6 +31,36 @@ async fn google() {
 
     // any response code is fine
     assert!(response.starts_with("HTTP/1.0 "));
+    assert!(response.ends_with("</html>") || response.ends_with("</HTML>"));
+}
+
+#[tokio::test]
+async fn ramaproxy_org_no_sni() {
+    let addr = "ramaproxy.org:443"
+        .to_socket_addrs()
+        .unwrap()
+        .next()
+        .unwrap();
+    let stream = TcpStream::connect(&addr).await.unwrap();
+
+    let config = SslConnector::builder(SslMethod::tls())
+        .unwrap()
+        .build()
+        .configure()
+        .unwrap();
+    let mut stream = rama_boring_tokio::connect(config, None, stream)
+        .await
+        .unwrap();
+
+    stream.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+
+    let mut buf = vec![];
+    stream.read_to_end(&mut buf).await.unwrap();
+    let response = String::from_utf8_lossy(&buf);
+    let response = response.trim_end();
+
+    // any response code is fine
+    assert!(response.starts_with("HTTP/1.1 "));
     assert!(response.ends_with("</html>") || response.ends_with("</HTML>"));
 }
 

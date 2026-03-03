@@ -79,10 +79,10 @@ impl SslConnector {
 
     /// Initiates a client-side TLS session on a stream.
     ///
-    /// The domain is used for SNI and hostname verification.
+    /// The domain, if given, is used for SNI and hostname verification.
     pub fn setup_connect<S>(
         &self,
-        domain: &str,
+        domain: Option<&str>,
         stream: S,
     ) -> Result<MidHandshakeSslStream<S>, ErrorStack>
     where
@@ -93,11 +93,15 @@ impl SslConnector {
 
     /// Attempts a client-side TLS session on a stream.
     ///
-    /// The domain is used for SNI (if it is not an IP address) and hostname verification if enabled.
+    /// The domain, if given, is used for SNI (if it is not an IP address) and hostname verification if enabled.
     ///
     /// This is a convenience method which combines [`Self::setup_connect`] and
     /// [`MidHandshakeSslStream::handshake`].
-    pub fn connect<S>(&self, domain: &str, stream: S) -> Result<SslStream<S>, HandshakeError<S>>
+    pub fn connect<S>(
+        &self,
+        domain: Option<&str>,
+        stream: S,
+    ) -> Result<SslStream<S>, HandshakeError<S>>
     where
         S: Read + Write,
     {
@@ -197,14 +201,17 @@ impl ConnectConfiguration {
 
     /// Returns an [`Ssl`] configured to connect to the provided domain.
     ///
-    /// The domain is used for SNI (if it is not an IP address) and hostname verification if enabled.
-    pub fn into_ssl(mut self, domain: &str) -> Result<Ssl, ErrorStack> {
-        if self.sni && domain.parse::<IpAddr>().is_err() {
-            self.ssl.set_hostname(domain)?;
-        }
+    /// The domain, if given, is used for SNI (if it is not an IP address)
+    /// and hostname verification if enabled.
+    pub fn into_ssl(mut self, maybe_domain: Option<&str>) -> Result<Ssl, ErrorStack> {
+        if let Some(domain) = maybe_domain {
+            if self.sni && domain.parse::<IpAddr>().is_err() {
+                self.ssl.set_hostname(domain)?;
+            }
 
-        if self.verify_hostname {
-            setup_verify_hostname(&mut self.ssl, domain)?;
+            if self.verify_hostname {
+                setup_verify_hostname(&mut self.ssl, domain)?;
+            }
         }
 
         Ok(self.ssl)
@@ -212,13 +219,13 @@ impl ConnectConfiguration {
 
     /// Initiates a client-side TLS session on a stream.
     ///
-    /// The domain is used for SNI (if it is not an IP address) and hostname verification if enabled.
+    /// The domain, if given, is used for SNI (if it is not an IP address) and hostname verification if enabled.
     ///
     /// This is a convenience method which combines [`Self::into_ssl`] and
     /// [`Ssl::setup_connect`].
     pub fn setup_connect<S>(
         self,
-        domain: &str,
+        domain: Option<&str>,
         stream: S,
     ) -> Result<MidHandshakeSslStream<S>, ErrorStack>
     where
@@ -229,11 +236,15 @@ impl ConnectConfiguration {
 
     /// Attempts a client-side TLS session on a stream.
     ///
-    /// The domain is used for SNI (if it is not an IP address) and hostname verification if enabled.
+    /// The domain, if given, is used for SNI (if it is not an IP address) and hostname verification if enabled.
     ///
     /// This is a convenience method which combines [`Self::setup_connect`] and
     /// [`MidHandshakeSslStream::handshake`].
-    pub fn connect<S>(self, domain: &str, stream: S) -> Result<SslStream<S>, HandshakeError<S>>
+    pub fn connect<S>(
+        self,
+        domain: Option<&str>,
+        stream: S,
+    ) -> Result<SslStream<S>, HandshakeError<S>>
     where
         S: Read + Write,
     {

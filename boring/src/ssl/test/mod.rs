@@ -778,7 +778,7 @@ fn connector_valid_hostname() {
     connector.set_ca_file("test/root-ca.pem").unwrap();
 
     let s = server.connect_tcp();
-    let mut s = connector.build().connect("foobar.com", s).unwrap();
+    let mut s = connector.build().connect(Some("foobar.com"), s).unwrap();
     s.read_exact(&mut [0]).unwrap();
 }
 
@@ -792,7 +792,7 @@ fn connector_invalid_hostname() {
     connector.set_ca_file("test/root-ca.pem").unwrap();
 
     let s = server.connect_tcp();
-    connector.build().connect("bogus.com", s).unwrap_err();
+    connector.build().connect(Some("bogus.com"), s).unwrap_err();
 }
 
 #[test]
@@ -808,7 +808,24 @@ fn connector_invalid_no_hostname_verification() {
         .configure()
         .unwrap()
         .verify_hostname(false)
-        .connect("bogus.com", s)
+        .connect(Some("bogus.com"), s)
+        .unwrap();
+    s.read_exact(&mut [0]).unwrap();
+}
+
+#[test]
+fn connector_invalid_no_domain() {
+    let server = Server::builder().build();
+
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+    connector.set_ca_file("test/root-ca.pem").unwrap();
+
+    let s = server.connect_tcp();
+    let mut s = connector
+        .build()
+        .configure()
+        .unwrap()
+        .connect(None, s)
         .unwrap();
     s.read_exact(&mut [0]).unwrap();
 }
@@ -826,7 +843,7 @@ fn connector_no_hostname_still_verifies() {
         .configure()
         .unwrap()
         .verify_hostname(false)
-        .connect("fizzbuzz.com", s)
+        .connect(Some("fizzbuzz.com"), s)
         .is_err());
 }
 
@@ -843,8 +860,21 @@ fn connector_no_hostname_can_disable_verify() {
         .configure()
         .unwrap()
         .verify_hostname(false)
-        .connect("foobar.com", s)
+        .connect(Some("foobar.com"), s)
         .unwrap();
+    s.read_exact(&mut [0]).unwrap();
+}
+
+#[test]
+fn connector_no_domain() {
+    let server = Server::builder().build();
+
+    let mut connector = SslConnector::builder(SslMethod::tls()).unwrap();
+    connector.set_verify(SslVerifyMode::NONE);
+    let connector = connector.build();
+
+    let s = server.connect_tcp();
+    let mut s = connector.configure().unwrap().connect(None, s).unwrap();
     s.read_exact(&mut [0]).unwrap();
 }
 
@@ -870,7 +900,7 @@ fn test_mozilla_server(new: fn(SslMethod) -> Result<SslAcceptorBuilder, ErrorSta
     let connector = connector.build();
 
     let stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
-    let mut stream = connector.connect("foobar.com", stream).unwrap();
+    let mut stream = connector.connect(Some("foobar.com"), stream).unwrap();
 
     let mut buf = [0; 5];
     stream.read_exact(&mut buf).unwrap();
