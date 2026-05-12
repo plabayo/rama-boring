@@ -68,6 +68,17 @@ pub(crate) async fn connect(
     rama_boring_tokio::connect(config, Some("localhost"), stream).await
 }
 
+pub(crate) async fn connect_without_sni(
+    addr: SocketAddr,
+    setup: impl FnOnce(&mut SslConnectorBuilder) -> Result<(), ErrorStack>,
+) -> Result<SslStream<TcpStream>, HandshakeError<TcpStream>> {
+    let config = create_connector(setup).configure().unwrap();
+
+    let stream = TcpStream::connect(&addr).await.unwrap();
+
+    rama_boring_tokio::connect(config, None, stream).await
+}
+
 pub(crate) fn create_connector(
     setup: impl FnOnce(&mut SslConnectorBuilder) -> Result<(), ErrorStack>,
 ) -> SslConnector {

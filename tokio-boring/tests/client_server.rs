@@ -1,12 +1,15 @@
 use futures::future;
-use rama_boring::ssl::{SslConnector, SslMethod};
+use rama_boring::ssl::{NameType, SslConnector, SslMethod};
 use std::net::ToSocketAddrs;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::pin::Pin;
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 mod common;
 
-use self::common::{connect, create_server, with_trivial_client_server_exchange};
+use self::common::{
+    connect, connect_without_sni, create_server, with_trivial_client_server_exchange,
+};
 
 #[tokio::test]
 async fn google() {
@@ -35,33 +38,39 @@ async fn google() {
 }
 
 #[tokio::test]
-async fn ramaproxy_org_no_sni() {
-    let addr = "ramaproxy.org:443"
-        .to_socket_addrs()
-        .unwrap()
-        .next()
-        .unwrap();
-    let stream = TcpStream::connect(&addr).await.unwrap();
+async fn no_sni_local() {
+    let (stream, addr) = create_server(|_| ());
 
-    let config = SslConnector::builder(SslMethod::tls())
-        .unwrap()
-        .build()
-        .configure()
-        .unwrap();
-    let mut stream = rama_boring_tokio::connect(config, None, stream)
-        .await
-        .unwrap();
+    let server = async {
+        let mut stream = stream.await.unwrap();
 
-    stream.write_all(b"GET / HTTP/1.0\r\n\r\n").await.unwrap();
+        // The client must NOT have sent SNI.
+        assert!(stream.ssl().servername(NameType::HOST_NAME).is_none());
 
-    let mut buf = vec![];
-    stream.read_to_end(&mut buf).await.unwrap();
-    let response = String::from_utf8_lossy(&buf);
-    let response = response.trim_end();
+        let mut buf = [0; 4];
+        stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"asdf");
 
-    // any response code is fine
-    assert!(response.starts_with("HTTP/1.1 "));
-    assert!(response.ends_with("</html>") || response.ends_with("</HTML>"));
+        stream.write_all(b"jkl;").await.unwrap();
+
+        future::poll_fn(|ctx| Pin::new(&mut stream).poll_shutdown(ctx))
+            .await
+            .unwrap();
+    };
+
+    let client = async {
+        let mut stream = connect_without_sni(addr, |builder| builder.set_ca_file("tests/cert.pem"))
+            .await
+            .unwrap();
+
+        stream.write_all(b"asdf").await.unwrap();
+
+        let mut buf = vec![];
+        stream.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(buf, b"jkl;");
+    };
+
+    future::join(server, client).await;
 }
 
 #[tokio::test]
