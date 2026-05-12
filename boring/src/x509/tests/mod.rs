@@ -199,6 +199,37 @@ fn test_subject_key_id() {
 }
 
 #[test]
+fn test_pubkey_digest_matches_method1_ski() {
+    // nid_test_cert_pem has an SKI built via OpenSSL's `subjectKeyIdentifier = hash`,
+    // which is RFC 5280 §4.2.1.2 method (1): SHA-1 of the SubjectPublicKey BIT STRING
+    // contents. `pubkey_digest(sha1)` must reproduce the same 20 bytes.
+    let cert = include_bytes!("../../../test/nid_test_cert.pem");
+    let cert = X509::from_pem(cert).unwrap();
+
+    let ski = cert.subject_key_id().expect("unable to extract SKI");
+    let pubkey_sha1 = cert
+        .pubkey_digest(MessageDigest::sha1())
+        .expect("pubkey_digest sha1");
+
+    assert_eq!(pubkey_sha1.len(), 20);
+    assert_eq!(ski.as_slice(), &pubkey_sha1[..]);
+}
+
+#[test]
+fn test_pubkey_digest_length_varies_with_digest() {
+    let cert = include_bytes!("../../../test/cert.pem");
+    let cert = X509::from_pem(cert).unwrap();
+
+    let sha1 = cert.pubkey_digest(MessageDigest::sha1()).expect("sha1");
+    assert_eq!(sha1.len(), 20);
+
+    let sha256 = cert.pubkey_digest(MessageDigest::sha256()).expect("sha256");
+    assert_eq!(sha256.len(), 32);
+
+    assert_ne!(&sha1[..], &sha256[..20]);
+}
+
+#[test]
 fn test_x509_name_print_ex() {
     let cert = include_bytes!("../../../test/cert.pem");
     let cert = X509::from_pem(cert).unwrap();

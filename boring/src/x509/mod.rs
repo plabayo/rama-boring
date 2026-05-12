@@ -680,6 +680,31 @@ impl X509Ref {
         }
     }
 
+    /// Returns a digest of the contents of the certificate's SubjectPublicKey
+    /// BIT STRING, i.e. the public-key bytes excluding the ASN.1 wrapper.
+    ///
+    /// Hashed with SHA-1 this matches RFC 5280 §4.2.1.2 method (1) for
+    /// constructing a Subject/Authority Key Identifier.
+    #[corresponds(X509_pubkey_digest)]
+    pub fn pubkey_digest(&self, hash_type: MessageDigest) -> Result<DigestBytes, ErrorStack> {
+        unsafe {
+            let mut digest = DigestBytes {
+                buf: [0; ffi::EVP_MAX_MD_SIZE as usize],
+                len: ffi::EVP_MAX_MD_SIZE as usize,
+            };
+            let mut len = try_int(ffi::EVP_MAX_MD_SIZE)?;
+            cvt(ffi::X509_pubkey_digest(
+                self.as_ptr(),
+                hash_type.as_ptr(),
+                digest.buf.as_mut_ptr(),
+                &mut len,
+            ))?;
+            digest.len = try_int(len)?;
+
+            Ok(digest)
+        }
+    }
+
     #[deprecated(since = "0.10.9", note = "renamed to digest")]
     pub fn fingerprint(&self, hash_type: MessageDigest) -> Result<Vec<u8>, ErrorStack> {
         self.digest(hash_type).map(|b| b.to_vec())
