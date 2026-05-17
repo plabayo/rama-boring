@@ -201,12 +201,38 @@ fn get_boringssl_platform_output_path(config: &Config) -> String {
     }
 }
 
+/// Returns the symbol prefix to apply via boringssl's BORINGSSL_PREFIX
+/// mechanism, or `None` when prefixing should be skipped.
+///
+/// Prefixing rewrites every boringssl symbol (e.g. `SSL_new` ->
+/// `rama_boring_<version>_SSL_new`). This makes it possible to use
+/// this in combination with openssl without issues
+fn build_prefix(config: &Config) -> Option<String> {
+    if config.env.docs_rs {
+        return None;
+    }
+    if config.env.path.is_some() {
+        return None;
+    }
+
+    Some(format!(
+        "rama_boring_{}",
+        env!("CARGO_PKG_VERSION")
+            .replace('.', "_")
+            .replace('-', "_")
+    ))
+}
+
 /// Returns a new `cmake::Config` for building BoringSSL.
 ///
 /// It will add platform-specific parameters if needed.
 fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
     let src_path = get_boringssl_source_path(config);
     let mut boringssl_cmake = cmake::Config::new(src_path);
+
+    if let Some(prefix) = build_prefix(config) {
+        boringssl_cmake.define("BORINGSSL_PREFIX", &prefix);
+    }
 
     if config.env.cmake_toolchain_file.is_some() {
         return boringssl_cmake;
@@ -749,6 +775,14 @@ fn generate_bindings(config: &Config) {
             .clang_arg(sysroot.display().to_string());
     }
 
+    if let Some(prefix) = build_prefix(config) {
+        builder = builder
+            .clang_arg(format!("-DBORINGSSL_PREFIX={prefix}"))
+            .parse_callbacks(Box::new(StripPrefixCallback {
+                prefix: format!("{prefix}_"),
+            }));
+    }
+
     let headers = [
         "aes.h",
         "asn1_mac.h",
@@ -807,4 +841,23 @@ fn ensure_err_lib_enum_is_named(source_code: &mut Vec<u8>) {
         format!("\n/// Newtype for [`ERR_LIB_SSL`] constants\npub use {enum_type} as ErrLib;\n")
             .as_bytes(),
     );
+}
+
+/// bindgen callback that strips the BORINGSSL_PREFIX from generated Rust
+/// identifiers while keeping the the prefix on the C side.
+#[derive(Debug)]
+struct StripPrefixCallback {
+    prefix: String,
+}
+
+impl bindgen::callbacks::ParseCallbacks for StripPrefixCallback {
+    fn generated_name_override(
+        &self,
+        item_info: bindgen::callbacks::ItemInfo<'_>,
+    ) -> Option<String> {
+        item_info
+            .name
+            .strip_prefix(self.prefix.as_str())
+            .map(String::from)
+    }
 }
