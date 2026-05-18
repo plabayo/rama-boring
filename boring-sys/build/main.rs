@@ -215,12 +215,11 @@ fn build_prefix(config: &Config) -> Option<String> {
         return None;
     }
 
-    Some(format!(
-        "rama_boring_{}",
-        env!("CARGO_PKG_VERSION")
-            .replace('.', "_")
-            .replace('-', "_")
-    ))
+    let version: String = env!("CARGO_PKG_VERSION")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    Some(format!("rama_boring_{version}"))
 }
 
 /// Returns a new `cmake::Config` for building BoringSSL.
@@ -548,6 +547,11 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
     println!("cargo:info=applying boringssl cmake cleanup patch");
     apply_patch(config, "rama_boringssl_cmake.patch")?;
 
+    // BoringSSL's `verify_boringssl_prefix` audit otherwise requires Go at
+    // cmake configure time whenever BORINGSSL_PREFIX is set.
+    println!("cargo:info=applying boringssl prefix patch (drop Go-dependent audit)");
+    apply_patch(config, "rama_boring_prefix.patch")?;
+
     Ok(())
 }
 
@@ -774,7 +778,8 @@ fn generate_bindings(config: &Config) {
             .clang_arg(sysroot.display().to_string());
     }
 
-    if let Some(prefix) = build_prefix(config) {
+    let prefix = build_prefix(config);
+    if let Some(prefix) = &prefix {
         builder = builder.clang_arg(format!("-DBORINGSSL_PREFIX={prefix}"));
     }
 
@@ -821,7 +826,7 @@ fn generate_bindings(config: &Config) {
         .write(Box::new(&mut source_code))
         .expect("Couldn't serialize bindings!");
     ensure_err_lib_enum_is_named(&mut source_code);
-    if build_prefix(config).is_some() {
+    if prefix.is_some() {
         make_link_names_target_portable(&mut source_code);
     }
     fs::write(config.out_dir.join("bindings.rs"), source_code).expect("Couldn't write bindings!");
@@ -844,6 +849,16 @@ fn make_link_names_target_portable(source_code: &mut Vec<u8>) {
     let needle = [link_name, escape].concat();
     let src = String::from_utf8(std::mem::take(source_code))
         .expect("bindgen output should be valid UTF-8");
+
+    let matches = src.matches(needle.as_str()).count();
+    assert!(
+        matches > 0,
+        "make_link_names_target_portable: expected to find at least one \
+         `#[link_name = \"\\u{{1}}{u}…\"]` attribute in bindgen output but \
+         found none. Bindgen's serialisation format may have changed; \
+         re-evaluate this post-processor.",
+        u = if host_adds_underscore { "_" } else { "" },
+    );
     *source_code = src.replace(&needle, link_name).into_bytes();
 }
 
