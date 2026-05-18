@@ -201,12 +201,37 @@ fn get_boringssl_platform_output_path(config: &Config) -> String {
     }
 }
 
+/// Returns the symbol prefix to apply via boringssl's BORINGSSL_PREFIX
+/// mechanism, or `None` when prefixing should be skipped.
+///
+/// Prefixing rewrites every boringssl symbol (e.g. `SSL_new` ->
+/// `rama_boring_<version>_SSL_new`). This makes it possible to use
+/// this in combination with openssl without issues
+fn build_prefix(config: &Config) -> Option<String> {
+    if config.env.docs_rs {
+        return None;
+    }
+    if config.env.path.is_some() {
+        return None;
+    }
+
+    let version: String = env!("CARGO_PKG_VERSION")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    Some(format!("rama_boring_{version}"))
+}
+
 /// Returns a new `cmake::Config` for building BoringSSL.
 ///
 /// It will add platform-specific parameters if needed.
 fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
     let src_path = get_boringssl_source_path(config);
     let mut boringssl_cmake = cmake::Config::new(src_path);
+
+    if let Some(prefix) = build_prefix(config) {
+        boringssl_cmake.define("BORINGSSL_PREFIX", &prefix);
+    }
 
     if config.env.cmake_toolchain_file.is_some() {
         return boringssl_cmake;
@@ -522,6 +547,11 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
     println!("cargo:info=applying boringssl cmake cleanup patch");
     apply_patch(config, "rama_boringssl_cmake.patch")?;
 
+    // BoringSSL's `verify_boringssl_prefix` audit otherwise requires Go at
+    // cmake configure time whenever BORINGSSL_PREFIX is set.
+    println!("cargo:info=applying boringssl prefix patch (drop Go-dependent audit)");
+    apply_patch(config, "rama_boring_prefix.patch")?;
+
     Ok(())
 }
 
@@ -591,8 +621,7 @@ fn built_boring_source_path(config: &Config) -> &PathBuf {
             cfg.env("CMAKE_BUILD_PARALLEL_LEVEL", num_jobs);
         }
 
-        cfg.build_target("ssl").build();
-        cfg.build_target("crypto").build()
+        cfg.build_target("ssl").build()
     })
 }
 
@@ -749,6 +778,11 @@ fn generate_bindings(config: &Config) {
             .clang_arg(sysroot.display().to_string());
     }
 
+    let prefix = build_prefix(config);
+    if let Some(prefix) = &prefix {
+        builder = builder.clang_arg(format!("-DBORINGSSL_PREFIX={prefix}"));
+    }
+
     let headers = [
         "aes.h",
         "asn1_mac.h",
@@ -792,7 +826,40 @@ fn generate_bindings(config: &Config) {
         .write(Box::new(&mut source_code))
         .expect("Couldn't serialize bindings!");
     ensure_err_lib_enum_is_named(&mut source_code);
+    if prefix.is_some() {
+        make_link_names_target_portable(&mut source_code);
+    }
     fs::write(config.out_dir.join("bindings.rs"), source_code).expect("Couldn't write bindings!");
+}
+
+/// Rewrite `#[link_name = "\u{1}<mangled>"]` attributes so the link name is
+/// just the bare C symbol. This is needed so it is consistent everywhere and
+/// not dependent on which host type we ran the build on.
+fn make_link_names_target_portable(source_code: &mut Vec<u8>) {
+    let host_adds_underscore = cfg!(any(
+        target_vendor = "apple",
+        all(target_arch = "x86", target_os = "windows"),
+    ));
+    let link_name = "link_name = \"";
+    let escape = if host_adds_underscore {
+        "\\u{1}_"
+    } else {
+        "\\u{1}"
+    };
+    let needle = [link_name, escape].concat();
+    let src = String::from_utf8(std::mem::take(source_code))
+        .expect("bindgen output should be valid UTF-8");
+
+    let matches = src.matches(needle.as_str()).count();
+    assert!(
+        matches > 0,
+        "make_link_names_target_portable: expected to find at least one \
+         `#[link_name = \"\\u{{1}}{u}…\"]` attribute in bindgen output but \
+         found none. Bindgen's serialisation format may have changed; \
+         re-evaluate this post-processor.",
+        u = if host_adds_underscore { "_" } else { "" },
+    );
+    *source_code = src.replace(&needle, link_name).into_bytes();
 }
 
 /// err.h has anonymous `enum { ERR_LIB_NONE = 1 }`, which makes a dodgy `_bindgen_ty_1` name
