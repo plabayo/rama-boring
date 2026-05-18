@@ -775,11 +775,7 @@ fn generate_bindings(config: &Config) {
     }
 
     if let Some(prefix) = build_prefix(config) {
-        builder = builder
-            .clang_arg(format!("-DBORINGSSL_PREFIX={prefix}"))
-            .parse_callbacks(Box::new(StripPrefixCallback {
-                prefix: format!("{prefix}_"),
-            }));
+        builder = builder.clang_arg(format!("-DBORINGSSL_PREFIX={prefix}"));
     }
 
     let headers = [
@@ -825,7 +821,30 @@ fn generate_bindings(config: &Config) {
         .write(Box::new(&mut source_code))
         .expect("Couldn't serialize bindings!");
     ensure_err_lib_enum_is_named(&mut source_code);
+    if build_prefix(config).is_some() {
+        make_link_names_target_portable(&mut source_code);
+    }
     fs::write(config.out_dir.join("bindings.rs"), source_code).expect("Couldn't write bindings!");
+}
+
+/// Rewrite `#[link_name = "\u{1}<mangled>"]` attributes so the link name is
+/// just the bare C symbol. This is needed so it is consistent everywhere and
+/// not dependent on which host type we ran the build on.
+fn make_link_names_target_portable(source_code: &mut Vec<u8>) {
+    let host_adds_underscore = cfg!(any(
+        target_vendor = "apple",
+        all(target_arch = "x86", target_os = "windows"),
+    ));
+    let link_name = "link_name = \"";
+    let escape = if host_adds_underscore {
+        "\\u{1}_"
+    } else {
+        "\\u{1}"
+    };
+    let needle = [link_name, escape].concat();
+    let src = String::from_utf8(std::mem::take(source_code))
+        .expect("bindgen output should be valid UTF-8");
+    *source_code = src.replace(&needle, link_name).into_bytes();
 }
 
 /// err.h has anonymous `enum { ERR_LIB_NONE = 1 }`, which makes a dodgy `_bindgen_ty_1` name
@@ -840,23 +859,4 @@ fn ensure_err_lib_enum_is_named(source_code: &mut Vec<u8>) {
         format!("\n/// Newtype for [`ERR_LIB_SSL`] constants\npub use {enum_type} as ErrLib;\n")
             .as_bytes(),
     );
-}
-
-/// bindgen callback that strips the BORINGSSL_PREFIX from generated Rust
-/// identifiers while keeping the the prefix on the C side.
-#[derive(Debug)]
-struct StripPrefixCallback {
-    prefix: String,
-}
-
-impl bindgen::callbacks::ParseCallbacks for StripPrefixCallback {
-    fn generated_name_override(
-        &self,
-        item_info: bindgen::callbacks::ItemInfo<'_>,
-    ) -> Option<String> {
-        item_info
-            .name
-            .strip_prefix(self.prefix.as_str())
-            .map(String::from)
-    }
 }
