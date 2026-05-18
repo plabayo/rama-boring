@@ -617,8 +617,7 @@ fn built_boring_source_path(config: &Config) -> &PathBuf {
             cfg.env("CMAKE_BUILD_PARALLEL_LEVEL", num_jobs);
         }
 
-        cfg.build_target("ssl").build();
-        cfg.build_target("crypto").build()
+        cfg.build_target("ssl").build()
     })
 }
 
