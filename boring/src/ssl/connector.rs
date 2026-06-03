@@ -77,6 +77,25 @@ impl SslConnector {
         Ok(SslConnectorBuilder(ctx))
     }
 
+    /// Same as [`Self::builder`] but WITHOUT calling `set_default_verify_paths`.
+    ///
+    /// `builder` eagerly parses the entire OS trust store into the context's
+    /// cert store on every call. Callers that supply their own verify store
+    /// (e.g. a shared, parse-once store) or disable verification entirely pay
+    /// that cost for nothing — the parsed store is immediately replaced or
+    /// never consulted. This variant skips it; the caller is responsible for
+    /// installing a cert store (e.g. via `set_cert_store` / `set_cert_store_ref`)
+    /// when verification is enabled.
+    pub fn no_default_verify_builder(method: SslMethod) -> Result<SslConnectorBuilder, ErrorStack> {
+        let mut ctx = ctx(method)?;
+        ctx.set_cipher_list(
+            "DEFAULT:!aNULL:!eNULL:!MD5:!3DES:!DES:!RC4:!IDEA:!SEED:!aDSS:!SRP:!PSK",
+        )?;
+        setup_verify(&mut ctx);
+
+        Ok(SslConnectorBuilder(ctx))
+    }
+
     /// Initiates a client-side TLS session on a stream.
     ///
     /// The domain, if given, is used for SNI and hostname verification.
