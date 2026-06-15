@@ -341,7 +341,9 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
             if config.target.contains("-pc-windows-gnu") {
                 boringssl_cmake.define("CMAKE_CXX_STANDARD", "17");
             } else if config.target.ends_with("-pc-windows-msvc") {
-                boringssl_cmake.generator("Visual Studio 17 2022");
+                // Don't pin a Visual Studio generator: let cmake-rs auto detect the installed
+                // version so the build keeps working across ci updates / env updates.
+                // If newer Visual Studio's start to throw errors: updating `cmake` crate should fix it.
                 if config.target_arch == "x86" {
                     boringssl_cmake.define("CMAKE_GENERATOR_PLATFORM", "Win32");
                 } else if config.target_arch == "aarch64" {
