@@ -838,30 +838,27 @@ fn generate_bindings(config: &Config) {
 /// just the bare C symbol. This is needed so it is consistent everywhere and
 /// not dependent on which host type we ran the build on.
 fn make_link_names_target_portable(source_code: &mut Vec<u8>) {
-    let host_adds_underscore = cfg!(any(
-        target_vendor = "apple",
-        all(target_arch = "x86", target_os = "windows"),
-    ));
     let link_name = "link_name = \"";
-    let escape = if host_adds_underscore {
-        "\\u{1}_"
-    } else {
-        "\\u{1}"
-    };
-    let needle = [link_name, escape].concat();
+    let with_underscore = [link_name, "\\u{1}_"].concat();
+    let bare = [link_name, "\\u{1}"].concat();
     let src = String::from_utf8(std::mem::take(source_code))
         .expect("bindgen output should be valid UTF-8");
 
-    let matches = src.matches(needle.as_str()).count();
+    // Bare is subset of with_underscore, so if bare matches we also match with_underscore
+    let matches = src.matches(bare.as_str()).count();
     assert!(
         matches > 0,
         "make_link_names_target_portable: expected to find at least one \
-         `#[link_name = \"\\u{{1}}{u}…\"]` attribute in bindgen output but \
-         found none. Bindgen's serialisation format may have changed; \
-         re-evaluate this post-processor.",
-        u = if host_adds_underscore { "_" } else { "" },
+         `#[link_name = \"\\u{{1}}…\"]` attribute in bindgen output but found \
+         none. Bindgen's serialisation format may have changed for this target; \
+         re-evaluate this post-processor."
     );
-    *source_code = src.replace(&needle, link_name).into_bytes();
+
+    // Strip longest prefix first
+    *source_code = src
+        .replace(&with_underscore, link_name)
+        .replace(&bare, link_name)
+        .into_bytes();
 }
 
 /// err.h has anonymous `enum { ERR_LIB_NONE = 1 }`, which makes a dodgy `_bindgen_ty_1` name
