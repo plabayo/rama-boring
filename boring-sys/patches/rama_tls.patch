@@ -227,19 +227,34 @@ index ec505e370..eb5d9f146 100644
    if (!hs->config->permute_extensions) {
      return true;
 diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
-index 4ce8d1802..3baf92b11 100644
+index 901040c2a..f157f70f5 100644
 --- a/ssl/handshake_client.cc
 +++ b/ssl/handshake_client.cc
-@@ -110,7 +110,7 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
- 
+@@ -108,6 +108,14 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+     return false;
+   }
+
++  if (ssl->ctx->rama_preserve_cipher_list) {
++    for (const SSL_CIPHER *cipher : SSL_get_ciphers(ssl)) {
++      if (!CBB_add_u16(&child, SSL_CIPHER_get_protocol_id(cipher))) {
++        return false;
++      }
++    }
++  } else {
++
    // Add TLS 1.3 ciphers. Order ChaCha20-Poly1305 relative to AES-GCM based on
    // hardware support.
--  if (hs->max_version >= TLS1_3_VERSION) {
-+  if (!ssl->ctx->rama_preserve_cipher_list && hs->max_version >= TLS1_3_VERSION) {
-     static const uint16_t kCiphersNoAESHardware[] = {
-         SSL_CIPHER_CHACHA20_POLY1305_SHA256,
-         SSL_CIPHER_AES_128_GCM_SHA256,
-@@ -432,7 +432,7 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
+   if (hs->max_version >= TLS1_3_VERSION) {
+@@ -169,6 +177,8 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+     }
+   }
+
++  }
++
+   if (ssl->mode & SSL_MODE_SEND_FALLBACK_SCSV) {
+     if (!CBB_add_u16(&child, SSL_CIPHER_FALLBACK_SCSV)) {
+       return false;
+@@ -419,7 +429,7 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
    }
  
    if (!ssl_setup_key_shares(hs, /*override_group_id=*/0) ||
