@@ -73,6 +73,36 @@ fn test_connect_with_set_raw_cipher_list_client_ctx() {
 }
 
 #[test]
+fn test_connect_with_set_raw_cipher_list_tls13_only() {
+    let mut server = Server::builder();
+    server
+        .ctx()
+        .set_select_certificate_callback(|client_hello| {
+            assert_eq!(
+                client_hello.ciphers(),
+                &[0x13, 0x01, 0x13, 0x03, 0x13, 0x02],
+            );
+            Ok(())
+        });
+    let server = server.build();
+
+    let mut client = server.client();
+    client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client
+        .ctx()
+        .set_raw_cipher_list(&[0x1301, 0x1303, 0x1302])
+        .unwrap();
+    let _ = client.connect();
+}
+
+#[test]
 fn set_extension_order() {
     let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
     // firefox 136 @ MacOS (2025-03-29)
