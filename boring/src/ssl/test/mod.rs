@@ -103,6 +103,50 @@ fn test_connect_with_set_raw_cipher_list_tls13_only() {
 }
 
 #[test]
+fn test_standard_cipher_list_resets_raw_cipher_mode() {
+    let mut server = Server::builder();
+    server.expected_connections_count(2);
+    server
+        .ctx()
+        .set_select_certificate_callback(|client_hello| {
+            let mut ciphers = client_hello
+                .ciphers()
+                .chunks_exact(2)
+                .map(|cipher| u16::from_be_bytes([cipher[0], cipher[1]]))
+                .collect::<Vec<_>>();
+            ciphers.sort_unstable();
+            assert_eq!(ciphers, [0x1301, 0x1302, 0x1303]);
+            Ok(())
+        });
+    let server = server.build();
+
+    for strict in [false, true] {
+        let mut client = server.client();
+        client.ctx().set_raw_cipher_list(&[0x1301]).unwrap();
+        if strict {
+            client
+                .ctx()
+                .set_strict_cipher_list("ECDHE-RSA-AES128-GCM-SHA256")
+                .unwrap();
+        } else {
+            client
+                .ctx()
+                .set_cipher_list("ECDHE-RSA-AES128-GCM-SHA256")
+                .unwrap();
+        }
+        client
+            .ctx()
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        client
+            .ctx()
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        let _ = client.connect();
+    }
+}
+
+#[test]
 fn set_extension_order() {
     let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
     // firefox 136 @ MacOS (2025-03-29)

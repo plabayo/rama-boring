@@ -405,7 +405,7 @@ index 724a0f272..75377f90c 100644
    switch (EVP_PKEY_id(key)) {
      case EVP_PKEY_RSA:
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index 69f3fe2f5..e3aedd3e5 100644
+index a1ba926fd..ef4084ca1 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
 @@ -393,6 +393,7 @@ ssl_ctx_st::ssl_ctx_st(const SSL_METHOD *ssl_method)
@@ -416,22 +416,43 @@ index 69f3fe2f5..e3aedd3e5 100644
        permute_extensions(false),
        allow_unknown_alpn_protos(false),
        false_start_allowed_without_alpn(false),
-@@ -1987,6 +1988,14 @@ int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str) {
-                                 false /* not strict */);
- }
- 
-+int RAMA_SSL_CTX_set_raw_cipher_list(SSL_CTX *ctx, const uint16_t *values, int num) {
-+    bool result = rama_ssl_create_raw_cipher_list(&ctx->cipher_list, values, num);
-+    if (result) {
-+        ctx->rama_preserve_cipher_list = true;
-+    }
-+    return result;
+@@ -2130,6 +2131,20 @@ const char *SSL_get_cipher_list(const SSL *ssl, int n) {
+ int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str) {
+   const bool has_aes_hw = ctx->aes_hw_override ? ctx->aes_hw_override_value
+                                                : EVP_has_aes_hardware();
+-  return ssl_create_cipher_list(&ctx->cipher_list, has_aes_hw, str,
+-                                false /* not strict */);
++  const bool result = ssl_create_cipher_list(
++      &ctx->cipher_list, has_aes_hw, str, false /* not strict */);
++  if (result) {
++    ctx->rama_preserve_cipher_list = false;
++  }
++  return result;
 +}
 +
++int RAMA_SSL_CTX_set_raw_cipher_list(SSL_CTX *ctx, const uint16_t *values,
++                                     int num) {
++  const bool result =
++      rama_ssl_create_raw_cipher_list(&ctx->cipher_list, values, num);
++  if (result) {
++    ctx->rama_preserve_cipher_list = true;
++  }
++  return result;
+ }
+@@ -2137,6 +2152,10 @@ int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx, const char *str) {
  int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx, const char *str) {
    const bool has_aes_hw = ctx->aes_hw_override ? ctx->aes_hw_override_value
                                                 : EVP_has_aes_hardware();
-@@ -2293,6 +2302,43 @@ void SSL_set_alps_use_new_codepoint(SSL *ssl, int use_new) {
+-  return ssl_create_cipher_list(&ctx->cipher_list, has_aes_hw, str,
+-                                true /* strict */);
++  const bool result = ssl_create_cipher_list(
++      &ctx->cipher_list, has_aes_hw, str, true /* strict */);
++  if (result) {
++    ctx->rama_preserve_cipher_list = false;
++  }
++  return result;
+ }
+@@ -2293,6 +2312,43 @@ void SSL_set_alps_use_new_codepoint(SSL *ssl, int use_new) {
    ssl->config->alps_use_new_codepoint = !!use_new;
  }
  
