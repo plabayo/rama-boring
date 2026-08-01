@@ -1,14 +1,17 @@
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index f017a0351..298865342 100644
+index 7d9499dbc..96634160a 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -1682,6 +1682,10 @@ OPENSSL_EXPORT int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx,
+@@ -1682,6 +1682,13 @@ OPENSSL_EXPORT int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx,
  // garbage inputs, unless an empty cipher list results.
  OPENSSL_EXPORT int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str);
  
-+// Fork of SSL_CTX_set_cipher_list but working with direct cipher values
-+// that are used as a source of truth
-+OPENSSL_EXPORT int RAMA_SSL_CTX_set_raw_cipher_list(SSL_CTX *ctx, const uint16_t *values, int num);
++// RAMA_SSL_CTX_set_raw_cipher_list configures the exact cipher suite vector
++// sent by clients created from |ctx|. The list is not filtered by protocol
++// version, authentication requirements, or local support. Unknown values and
++// duplicates are preserved. |num| must be positive.
++OPENSSL_EXPORT int RAMA_SSL_CTX_set_raw_cipher_list(
++    SSL_CTX *ctx, const uint16_t *values, int num);
 +
  // SSL_set_strict_cipher_list configures the cipher list for |ssl|, evaluating
  // |str| as a cipher string and returning error if |str| contains anything
@@ -47,7 +50,7 @@ index f017a0351..298865342 100644
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
 diff --git a/include/openssl/tls1.h b/include/openssl/tls1.h
-index dde04dd7e..d3d7efb8e 100644
+index 696ccfd4a..b4ec98209 100644
 --- a/include/openssl/tls1.h
 +++ b/include/openssl/tls1.h
 @@ -89,6 +89,9 @@ extern "C" {
@@ -69,7 +72,7 @@ index dde04dd7e..d3d7efb8e 100644
  #define TLSEXT_MAXLEN_host_name 255
  
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
-index ec505e370..eb5d9f146 100644
+index daf643572..3f8a6003f 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
 @@ -2945,7 +2945,33 @@ static bool ext_quic_transport_params_add_serverhello_legacy(SSL_HANDSHAKE *hs,
@@ -226,34 +229,47 @@ index ec505e370..eb5d9f146 100644
  bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs) {
    if (!hs->config->permute_extensions) {
      return true;
+diff --git a/ssl/handoff.cc b/ssl/handoff.cc
+index 9f56ca5c4..e44c3b265 100644
+--- a/ssl/handoff.cc
++++ b/ssl/handoff.cc
+@@ -165,9 +165,11 @@ bool SSL_apply_handoff(SSL *ssl, Span<const uint8_t> handoff) {
+       return false;
+     }
+   }
+   for (const SSL_CIPHER *unsupported_cipher : unsupported.get()) {
+-    ssl->config->cipher_list->Remove(unsupported_cipher);
++    if (!ssl->config->cipher_list->Remove(unsupported_cipher)) {
++      return false;
++    }
+   }
+   if (sk_SSL_CIPHER_num(SSL_get_ciphers(ssl)) == 0) {
+     return false;
+   }
 diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
-index 901040c2a..f157f70f5 100644
+index 901040c2a..9493332fb 100644
 --- a/ssl/handshake_client.cc
 +++ b/ssl/handshake_client.cc
-@@ -108,6 +108,14 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+@@ -108,6 +108,19 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
      return false;
    }
 
-+  if (ssl->ctx->rama_preserve_cipher_list) {
-+    for (const SSL_CIPHER *cipher : SSL_get_ciphers(ssl)) {
-+      if (!CBB_add_u16(&child, SSL_CIPHER_get_protocol_id(cipher))) {
++  const SSLCipherPreferenceList *cipher_list = ssl_get_cipher_preferences(ssl);
++  if (!cipher_list->rama_raw_cipher_list.empty()) {
++    for (uint16_t cipher : cipher_list->rama_raw_cipher_list) {
++      if (!CBB_add_u16(&child, cipher)) {
 +        return false;
 +      }
 +    }
-+  } else {
-+
++    if (ssl->mode & SSL_MODE_SEND_FALLBACK_SCSV &&
++        !CBB_add_u16(&child, SSL_CIPHER_FALLBACK_SCSV)) {
++      return false;
++    }
++    return CBB_flush(out);
++  }
    // Add TLS 1.3 ciphers. Order ChaCha20-Poly1305 relative to AES-GCM based on
    // hardware support.
    if (hs->max_version >= TLS1_3_VERSION) {
-@@ -169,6 +177,8 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
-     }
-   }
-
-+  }
-+
-   if (ssl->mode & SSL_MODE_SEND_FALLBACK_SCSV) {
-     if (!CBB_add_u16(&child, SSL_CIPHER_FALLBACK_SCSV)) {
-       return false;
 @@ -419,7 +429,7 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
    }
  
@@ -264,21 +280,40 @@ index 901040c2a..f157f70f5 100644
        !ssl_add_client_hello(hs)) {
      return ssl_hs_error;
 diff --git a/ssl/internal.h b/ssl/internal.h
-index 682acbf23..9b2e89a99 100644
+index 682acbf23..3a37c9bbc 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
-@@ -325,6 +325,15 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
+@@ -287,14 +287,18 @@ struct SSLCipherPreferenceList {
+   SSLCipherPreferenceList() = default;
+   ~SSLCipherPreferenceList();
+ 
+   bool Init(UniquePtr<STACK_OF(SSL_CIPHER)> ciphers,
+             Span<const bool> in_group_flags);
+   bool Init(const SSLCipherPreferenceList &);
+ 
+-  void Remove(const SSL_CIPHER *cipher);
++  bool Remove(const SSL_CIPHER *cipher);
+ 
+   UniquePtr<STACK_OF(SSL_CIPHER)> ciphers;
+   bool *in_group_flags = nullptr;
++
++  // If non-empty, this is the exact cipher suite vector to send in the
++  // ClientHello. It may contain unsupported values and duplicates.
++  Array<uint16_t> rama_raw_cipher_list;
+ };
+ 
+ // AllCiphers returns an array of all supported ciphers, sorted by id.
+@@ -325,6 +325,14 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
                              const bool has_aes_hw, const char *rule_str,
                              bool strict);
  
-+// fork of `ssl_create_cipher_list` ^
-+// with the key difference that we respect the `rule_str` param
-+// as the source of truth
-+//
-+// this is potentially dangerous as it might mean it uses ciphers
-+// which aren't supported
-+bool rama_ssl_create_raw_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
-+                                     const uint16_t *cipher_values, int num);
++// Creates a cipher preference whose raw values are the source of truth for
++// ClientHello serialization. Known ciphers are also retained for negotiation.
++bool rama_ssl_create_raw_cipher_list(
++    UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
++    const uint16_t *cipher_values, int num);
++
++const SSLCipherPreferenceList *ssl_get_cipher_preferences(const SSL *ssl);
 +
  // ssl_cipher_auth_mask_for_key returns the mask of cipher |algorithm_auth|
  // values suitable for use with |key| in TLS 1.2 and below. |sign_ok| indicates
@@ -308,14 +343,10 @@ index 682acbf23..9b2e89a99 100644
  };
  
  // From RFC 8446, used in determining PSK modes.
-@@ -3952,9 +3972,17 @@ struct ssl_ctx_st : public bssl::RefCounted<ssl_ctx_st> {
+@@ -3952,9 +3972,13 @@ struct ssl_ctx_st : public bssl::RefCounted<ssl_ctx_st> {
    // grease_enabled is whether GREASE (RFC 8701) is enabled.
    bool grease_enabled : 1;
  
-+  // rama: set to indicate that the cipher list should be preserved
-+  // as-is, besides the ephermal bits such as grease.
-+  bool rama_preserve_cipher_list : 1;
-+
    // permute_extensions is whether to permute extensions when sending messages.
    bool permute_extensions : 1;
  
@@ -327,52 +358,106 @@ index 682acbf23..9b2e89a99 100644
    // protocols from the peer.
    bool allow_unknown_alpn_protos : 1;
 diff --git a/ssl/ssl_cipher.cc b/ssl/ssl_cipher.cc
-index 724a0f272..75377f90c 100644
+index 1ef231c39..0838d52d8 100644
 --- a/ssl/ssl_cipher.cc
 +++ b/ssl/ssl_cipher.cc
-@@ -1139,6 +1139,73 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
+@@ -622,10 +622,15 @@ bool SSLCipherPreferenceList::Init(UniquePtr<STACK_OF(SSL_CIPHER)> ciphers_arg,
+   ciphers = std::move(ciphers_arg);
+   size_t unused_len;
+   copy.Release(&in_group_flags, &unused_len);
++  rama_raw_cipher_list.Reset();
    return true;
  }
  
-+// fork of `ssl_create_cipher_list` ^
-+// with the key difference that we respect the `rule_str` param
-+// as the source of truth
-+//
-+// this is potentially dangerous as it might mean it uses ciphers
-+// which aren't supported
+ bool SSLCipherPreferenceList::Init(const SSLCipherPreferenceList &other) {
++  Array<uint16_t> raw_cipher_list;
++  if (!raw_cipher_list.CopyFrom(other.rama_raw_cipher_list)) {
++    return false;
++  }
+   size_t size = sk_SSL_CIPHER_num(other.ciphers.get());
+   Span<const bool> other_flags(other.in_group_flags, size);
+   UniquePtr<STACK_OF(SSL_CIPHER)> other_ciphers(
+@@ -634,13 +639,41 @@ bool SSLCipherPreferenceList::Init(const SSLCipherPreferenceList &other) {
+   if (!other_ciphers) {
+     return false;
+   }
+-  return Init(std::move(other_ciphers), other_flags);
++  if (!Init(std::move(other_ciphers), other_flags)) {
++    return false;
++  }
++  rama_raw_cipher_list = std::move(raw_cipher_list);
++  return true;
+ }
+ 
+-void SSLCipherPreferenceList::Remove(const SSL_CIPHER *cipher) {
++bool SSLCipherPreferenceList::Remove(const SSL_CIPHER *cipher) {
+   size_t index;
+   if (!sk_SSL_CIPHER_find(ciphers.get(), &index, cipher)) {
+-    return;
++    return true;
++  }
++
++  Array<uint16_t> raw_cipher_list;
++  if (!rama_raw_cipher_list.empty()) {
++    size_t raw_index = SIZE_MAX;
++    size_t known_index = 0;
++    for (size_t i = 0; i < rama_raw_cipher_list.size(); i++) {
++      if (SSL_get_cipher_by_value(rama_raw_cipher_list[i]) == nullptr) {
++        continue;
++      }
++      if (known_index++ == index) {
++        raw_index = i;
++        break;
++      }
++    }
++    if (raw_index == SIZE_MAX ||
++        !raw_cipher_list.InitForOverwrite(rama_raw_cipher_list.size() - 1)) {
++      return false;
++    }
++    for (size_t src = 0, dst = 0; src < rama_raw_cipher_list.size(); src++) {
++      if (src != raw_index) {
++        raw_cipher_list[dst++] = rama_raw_cipher_list[src];
++      }
++    }
+   }
+   if (!in_group_flags[index] /* last element of group */ && index > 0) {
+     in_group_flags[index - 1] = false;
+@@ -650,6 +686,8 @@ void SSLCipherPreferenceList::Remove(const SSL_CIPHER *cipher) {
+     in_group_flags[i] = in_group_flags[i + 1];
+   }
+   sk_SSL_CIPHER_delete(ciphers.get(), index);
++  rama_raw_cipher_list = std::move(raw_cipher_list);
++  return true;
+ }
+ 
+ bool ssl_cipher_is_deprecated(const SSL_CIPHER *cipher) {
+@@ -1139,6 +1177,51 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
+   return true;
+ }
+ 
 +bool rama_ssl_create_raw_cipher_list(
 +    UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
 +    const uint16_t *cipher_values, int num) {
-+  // Return with error if nothing to do.
-+  if (out_cipher_list == nullptr || cipher_values == nullptr ||
-+      num <= 0) {
++  if (out_cipher_list == nullptr || cipher_values == nullptr || num <= 0) {
 +    return false;
 +  }
 +
-+  // Allocate new "cipherstack" for the result, return with error
-+  // if we cannot get one.
 +  UniquePtr<STACK_OF(SSL_CIPHER)> cipherstack(sk_SSL_CIPHER_new_null());
 +  if (cipherstack == nullptr) {
 +    return false;
 +  }
 +
-+  // for now we do not use groups as this is really only intended for client connectors,
-+  // where AFAIK the groups aren't used... but perhaps we're wrong and we should somehow support this...
++  // Raw cipher lists are intended for client fingerprints and have no groups.
 +  Array<bool> in_group_flags;
 +  size_t num_in_group_flags = 0;
 +  if (!in_group_flags.Init(num)) {
-+      return false;
++    return false;
 +  }
 +
-+  // Push the ciphers as-is
-+  //
-+  // TODO: we might need to do some verification here
-+  int i;
-+  const SSL_CIPHER* value;
-+  for (i = 0; i < num; i++) {
-+    value = SSL_get_cipher_by_value(cipher_values[i]);
++  for (int i = 0; i < num; i++) {
++    const SSL_CIPHER *value = SSL_get_cipher_by_value(cipher_values[i]);
 +    if (value == nullptr) {
-+        continue;
++      continue;
 +    }
 +    if (!sk_SSL_CIPHER_push(cipherstack.get(), value)) {
 +      return false;
@@ -385,19 +470,13 @@ index 724a0f272..75377f90c 100644
 +  if (!pref_list ||
 +      !pref_list->Init(
 +          std::move(cipherstack),
-+          MakeConstSpan(in_group_flags).subspan(0, num_in_group_flags))) {
++          MakeConstSpan(in_group_flags).subspan(0, num_in_group_flags)) ||
++      !pref_list->rama_raw_cipher_list.CopyFrom(
++          Span(cipher_values, static_cast<size_t>(num)))) {
 +    return false;
 +  }
 +
 +  *out_cipher_list = std::move(pref_list);
-+
-+  // Configuring an empty cipher list is an error but still updates the
-+  // output.
-+  if (sk_SSL_CIPHER_num((*out_cipher_list)->ciphers.get()) == 0) {
-+    OPENSSL_PUT_ERROR(SSL, SSL_R_NO_CIPHER_MATCH);
-+    return false;
-+  }
-+
 +  return true;
 +}
 +
@@ -405,54 +484,45 @@ index 724a0f272..75377f90c 100644
    switch (EVP_PKEY_id(key)) {
      case EVP_PKEY_RSA:
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index a1ba926fd..ef4084ca1 100644
+index a1ba926fd..10d6ed900 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
-@@ -393,6 +393,7 @@ ssl_ctx_st::ssl_ctx_st(const SSL_METHOD *ssl_method)
-       signed_cert_timestamps_enabled(false),
-       channel_id_enabled(false),
-       grease_enabled(false),
-+      rama_preserve_cipher_list(false),
-       permute_extensions(false),
-       allow_unknown_alpn_protos(false),
-       false_start_allowed_without_alpn(false),
-@@ -2130,6 +2131,20 @@ const char *SSL_get_cipher_list(const SSL *ssl, int n) {
- int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str) {
-   const bool has_aes_hw = ctx->aes_hw_override ? ctx->aes_hw_override_value
-                                                : EVP_has_aes_hardware();
--  return ssl_create_cipher_list(&ctx->cipher_list, has_aes_hw, str,
--                                false /* not strict */);
-+  const bool result = ssl_create_cipher_list(
-+      &ctx->cipher_list, has_aes_hw, str, false /* not strict */);
-+  if (result) {
-+    ctx->rama_preserve_cipher_list = false;
-+  }
-+  return result;
+@@ -358,6 +358,11 @@ void SSL_set_aes_hw_override_for_testing(SSL *ssl, bool override_value) {
+   ssl->config->aes_hw_override_value = override_value;
+ }
+ 
++const SSLCipherPreferenceList *ssl_get_cipher_preferences(const SSL *ssl) {
++  return ssl->config->cipher_list ? ssl->config->cipher_list.get()
++                                  : ssl->ctx->cipher_list.get();
 +}
 +
+ BSSL_NAMESPACE_END
+ 
+ using namespace bssl;
+@@ -2105,8 +2110,8 @@ STACK_OF(SSL_CIPHER) *SSL_get_ciphers(const SSL *ssl) {
+     return nullptr;
+   }
+ 
+-  return ssl->config->cipher_list ? ssl->config->cipher_list->ciphers.get()
+-                                  : ssl->ctx->cipher_list->ciphers.get();
++  const SSLCipherPreferenceList *preferences = ssl_get_cipher_preferences(ssl);
++  return preferences->ciphers.get();
+ }
+ 
+ const char *SSL_get_cipher_list(const SSL *ssl, int n) {
+@@ -2134,6 +2139,11 @@ int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str) {
+                                 false /* not strict */);
+ }
+ 
 +int RAMA_SSL_CTX_set_raw_cipher_list(SSL_CTX *ctx, const uint16_t *values,
 +                                     int num) {
-+  const bool result =
-+      rama_ssl_create_raw_cipher_list(&ctx->cipher_list, values, num);
-+  if (result) {
-+    ctx->rama_preserve_cipher_list = true;
-+  }
-+  return result;
- }
-@@ -2137,6 +2152,10 @@ int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx, const char *str) {
++  return rama_ssl_create_raw_cipher_list(&ctx->cipher_list, values, num);
++}
++
  int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx, const char *str) {
    const bool has_aes_hw = ctx->aes_hw_override ? ctx->aes_hw_override_value
                                                 : EVP_has_aes_hardware();
--  return ssl_create_cipher_list(&ctx->cipher_list, has_aes_hw, str,
--                                true /* strict */);
-+  const bool result = ssl_create_cipher_list(
-+      &ctx->cipher_list, has_aes_hw, str, true /* strict */);
-+  if (result) {
-+    ctx->rama_preserve_cipher_list = false;
-+  }
-+  return result;
- }
-@@ -2293,6 +2312,43 @@ void SSL_set_alps_use_new_codepoint(SSL *ssl, int use_new) {
+@@ -2293,6 +2303,43 @@ void SSL_set_alps_use_new_codepoint(SSL *ssl, int use_new) {
    ssl->config->alps_use_new_codepoint = !!use_new;
  }
  
@@ -508,3 +578,29 @@ index a1ba926fd..ef4084ca1 100644
  void SSL_set_permute_extensions(SSL *ssl, int enabled) {
    if (!ssl->config) {
      return;
+diff --git a/ssl/tls13_client.cc b/ssl/tls13_client.cc
+index bc653e960..999109a4e 100644
+--- a/ssl/tls13_client.cc
++++ b/ssl/tls13_client.cc
+@@ -207,9 +207,17 @@ static enum ssl_hs_wait_t do_read_hello_retry_request(SSL_HANDSHAKE *hs) {
+-  // The cipher suite must be one we offered. We currently offer all supported
+-  // TLS 1.3 ciphers unless policy controls limited it. So we check the version
+-  // and that it's ok per policy.
++  // The cipher suite must be one we offered. Standard cipher preferences offer
++  // every TLS 1.3 cipher allowed by policy, while raw preferences may not.
++  bool cipher_was_offered = true;
++  const SSLCipherPreferenceList *preferences = ssl_get_cipher_preferences(ssl);
++  if (!preferences->rama_raw_cipher_list.empty()) {
++    cipher_was_offered = std::find(preferences->rama_raw_cipher_list.begin(),
++                                   preferences->rama_raw_cipher_list.end(),
++                                   server_hello.cipher_suite) !=
++                         preferences->rama_raw_cipher_list.end();
++  }
++
+   const SSL_CIPHER *cipher = SSL_get_cipher_by_value(server_hello.cipher_suite);
+-  if (cipher == nullptr ||
++  if (cipher == nullptr || !cipher_was_offered ||
+       SSL_CIPHER_get_min_version(cipher) > ssl_protocol_version(ssl) ||
+       SSL_CIPHER_get_max_version(cipher) < ssl_protocol_version(ssl) ||
+       !ssl_tls13_cipher_meets_policy(SSL_CIPHER_get_protocol_id(cipher),
+                                      ssl->config->compliance_policy)) {

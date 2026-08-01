@@ -1552,9 +1552,13 @@ impl SslContextBuilder {
         }
     }
 
-    /// Sets the raw list of ciphers, regardless if they are supported or not.
+    /// Sets the exact cipher suite vector sent in the ClientHello.
     ///
-    /// Use [`set_cipher_list`] if you want to play safe instead and do not control the exact cipher list.
+    /// Unknown values and duplicates are preserved. The list is not filtered by
+    /// protocol version, authentication requirements, or local support. Configured
+    /// GREASE and fallback SCSV values may still be added around this list.
+    ///
+    /// Use [`set_cipher_list`] to configure only supported pre-TLS 1.3 ciphers.
     #[corresponds(RAMA_SSL_CTX_set_raw_cipher_list)]
     pub fn set_raw_cipher_list(&mut self, cipher_list: &[u16]) -> Result<(), ErrorStack> {
         unsafe {
