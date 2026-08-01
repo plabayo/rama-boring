@@ -44,6 +44,29 @@ fn ech() {
 }
 
 #[test]
+fn ech_with_raw_cipher_list() {
+    let key = HpkeKey::dhkem_p256_sha256(ECH_KEY).unwrap();
+    let mut ech_keys_builder = SslEchKeys::builder().unwrap();
+    ech_keys_builder.add_key(true, ECH_CONFIG, key).unwrap();
+    let ech_keys = ech_keys_builder.build();
+
+    let mut server = Server::builder();
+    server.ctx().set_ech_keys(&ech_keys).unwrap();
+    let captured = super::capture_client_hello_ciphers(&mut server);
+    let server = server.build();
+
+    let mut client = server.client_with_root_ca();
+    client.ctx().set_raw_cipher_list(&[0x1301]).unwrap();
+    let mut client = client.build().builder();
+    client.ssl().set_ech_config_list(ECH_CONFIG_LIST).unwrap();
+    client.ssl().set_hostname("foobar.com").unwrap();
+
+    let ssl_stream = client.connect();
+    assert!(ssl_stream.ssl().ech_accepted());
+    assert_eq!(*captured.lock().unwrap(), [[0x1301]]);
+}
+
+#[test]
 fn ech_rejection() {
     // Server is initialized using `ECH_CONFIG_2`, so using `ECH_CONFIG_LIST` instead of
     // `ECH_CONFIG_LIST_2` should trigger rejection.

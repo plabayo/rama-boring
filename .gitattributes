@@ -1,0 +1,4 @@
+# Patch files are fed to `git apply` verbatim by boring-sys/build/main.rs.
+# Under a CRLF checkout a blank context line becomes a lone CR, which
+# `git apply` rejects with "corrupt patch". Keep them LF on every platform.
+*.patch text eol=lf

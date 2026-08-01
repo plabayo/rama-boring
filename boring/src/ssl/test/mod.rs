@@ -5,6 +5,7 @@ use std::mem;
 use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use crate::error::ErrorStack;
@@ -14,7 +15,7 @@ use crate::srtp::SrtpProfileId;
 use crate::ssl::test::server::Server;
 use crate::ssl::{
     self, ExtensionType, ShutdownResult, ShutdownState, Ssl, SslAcceptor, SslAcceptorBuilder,
-    SslConnector, SslContext, SslCurve, SslFiletype, SslMethod, SslOptions, SslStream,
+    SslConnector, SslContext, SslCurve, SslFiletype, SslMethod, SslMode, SslOptions, SslStream,
     SslVerifyMode,
 };
 use crate::ssl::{HandshakeError, SslVersion};
@@ -37,6 +38,23 @@ mod verify;
 static ROOT_CERT: &[u8] = include_bytes!("../../../test/root-ca.pem");
 static CERT: &[u8] = include_bytes!("../../../test/cert.pem");
 static KEY: &[u8] = include_bytes!("../../../test/key.pem");
+
+fn capture_client_hello_ciphers(server: &mut server::Builder) -> Arc<Mutex<Vec<Vec<u16>>>> {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let callback_captured = Arc::clone(&captured);
+    server
+        .ctx()
+        .set_select_certificate_callback(move |client_hello| {
+            let ciphers = client_hello
+                .ciphers()
+                .chunks_exact(2)
+                .map(|cipher| u16::from_be_bytes([cipher[0], cipher[1]]))
+                .collect();
+            callback_captured.lock().unwrap().push(ciphers);
+            Ok(())
+        });
+    captured
+}
 
 #[test]
 fn get_ctx_options() {
@@ -70,6 +88,352 @@ fn test_connect_with_set_raw_cipher_list_client_ctx() {
         ])
         .unwrap();
     let _ = client.connect();
+}
+
+#[test]
+fn test_connect_with_set_raw_cipher_list_tls13_only() {
+    let mut server = Server::builder();
+    let captured = capture_client_hello_ciphers(&mut server);
+    let server = server.build();
+
+    let mut client = server.client();
+    client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client
+        .ctx()
+        .set_raw_cipher_list(&[0x1301, 0x1303, 0x1302])
+        .unwrap();
+    let _ = client.connect();
+
+    assert_eq!(*captured.lock().unwrap(), [[0x1301, 0x1303, 0x1302]]);
+}
+
+#[test]
+fn test_standard_cipher_list_resets_raw_cipher_mode() {
+    let mut server = Server::builder();
+    server.expected_connections_count(2);
+    let captured = capture_client_hello_ciphers(&mut server);
+    let server = server.build();
+
+    for strict in [false, true] {
+        let mut client = server.client();
+        client.ctx().set_raw_cipher_list(&[0x1301]).unwrap();
+        if strict {
+            client
+                .ctx()
+                .set_strict_cipher_list("ECDHE-RSA-AES128-GCM-SHA256")
+                .unwrap();
+        } else {
+            client
+                .ctx()
+                .set_cipher_list("ECDHE-RSA-AES128-GCM-SHA256")
+                .unwrap();
+        }
+        client
+            .ctx()
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        client
+            .ctx()
+            .set_max_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        let _ = client.connect();
+    }
+
+    let mut captured = captured.lock().unwrap().clone();
+    for ciphers in &mut captured {
+        ciphers.sort_unstable();
+    }
+    assert_eq!(captured, [[0x1301, 0x1302, 0x1303]; 2]);
+}
+
+#[test]
+fn test_per_ssl_compliance_policy_resets_raw_cipher_mode() {
+    let mut server = Server::builder();
+    let captured = capture_client_hello_ciphers(&mut server);
+    let server = server.build();
+
+    let mut client = server.client();
+    client.ctx().set_raw_cipher_list(&[0x1303]).unwrap();
+    let client = client.build();
+    let mut client = client.builder();
+    client
+        .ssl()
+        .set_compliance_policy(CompliancePolicy::FIPS_202205)
+        .unwrap();
+    let _ = client.connect();
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(&captured[0][..2], &[0x1301, 0x1302]);
+    assert!(!captured[0].contains(&0x1303));
+}
+
+#[test]
+fn test_failed_standard_cipher_list_resets_raw_cipher_mode() {
+    let mut server = Server::builder();
+    let captured = capture_client_hello_ciphers(&mut server);
+    let server = server.build();
+
+    let mut client = server.client();
+    client.ctx().set_raw_cipher_list(&[0x1301]).unwrap();
+    client.ctx().set_cipher_list("!ALL").unwrap_err();
+    client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    let _ = client.connect();
+
+    let mut captured = captured.lock().unwrap()[0].clone();
+    captured.sort_unstable();
+    assert_eq!(captured, [0x1301, 0x1302, 0x1303]);
+}
+
+#[test]
+fn test_raw_cipher_list_preserves_unknown_values_and_duplicates() {
+    let mut server = Server::builder();
+    let captured = capture_client_hello_ciphers(&mut server);
+    let server = server.build();
+
+    let raw_ciphers = [0x0a0a, 0x1301, 0xffff, 0x1301];
+    let mut client = server.client();
+    client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client.ctx().set_raw_cipher_list(&raw_ciphers).unwrap();
+    let _ = client.connect();
+
+    assert_eq!(*captured.lock().unwrap(), [raw_ciphers]);
+}
+
+#[test]
+fn test_raw_cipher_list_accepts_all_unknown_values() {
+    let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
+    ctx.set_raw_cipher_list(&[0x0a0a, 0xffff]).unwrap();
+    assert!(ctx.ciphers().unwrap().is_empty());
+}
+
+#[test]
+fn test_empty_raw_cipher_list_does_not_replace_previous_list() {
+    let mut server = Server::builder();
+    let captured = capture_client_hello_ciphers(&mut server);
+    let server = server.build();
+
+    let mut client = server.client();
+    client.ctx().set_raw_cipher_list(&[0x1301]).unwrap();
+    let error = client.ctx().set_raw_cipher_list(&[]).unwrap_err();
+    assert!(
+        error
+            .errors()
+            .iter()
+            .any(|error| error.reason() == Some("NO_CIPHER_MATCH")),
+        "unexpected error stack: {error:?}",
+    );
+    client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    let _ = client.connect();
+
+    assert_eq!(*captured.lock().unwrap(), [[0x1301]]);
+}
+
+#[test]
+fn test_raw_cipher_list_bypasses_version_filtering() {
+    let mut server = Server::builder();
+    server
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_2))
+        .unwrap();
+    let captured = capture_client_hello_ciphers(&mut server);
+    let server = server.build();
+
+    let mut client = server.client();
+    client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_2))
+        .unwrap();
+    client.ctx().set_raw_cipher_list(&[0x1301, 0xc02f]).unwrap();
+    let _ = client.connect();
+
+    assert_eq!(*captured.lock().unwrap(), [[0x1301, 0xc02f]]);
+}
+
+#[test]
+fn test_raw_cipher_list_keeps_protocol_signaling_values() {
+    let mut server = Server::builder();
+    let captured = capture_client_hello_ciphers(&mut server);
+    let server = server.build();
+
+    let mut client = server.client();
+    client.ctx().set_grease_enabled(true);
+    client.ctx().set_mode(SslMode::SEND_FALLBACK_SCSV);
+    client.ctx().set_raw_cipher_list(&[0x1301]).unwrap();
+    client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    let _ = client.connect();
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(captured[0].len(), 3);
+    assert_eq!(captured[0][0] & 0x0f0f, 0x0a0a);
+    assert_eq!(&captured[0][1..], &[0x1301, 0x5600]);
+}
+
+#[test]
+fn test_raw_cipher_list_deduplicates_configured_signaling_values() {
+    let mut server = Server::builder();
+    let captured = capture_client_hello_ciphers(&mut server);
+    let server = server.build();
+
+    // This matches Rama's emulation path: the captured raw vector already
+    // contains a GREASE placeholder, while GREASE is also enabled globally so
+    // BoringSSL can generate the other GREASE-bearing fields.
+    let raw_ciphers = [0x0a0a, 0x1301, 0x1303, 0xc02f, 0x5600];
+    let mut client = server.client();
+    client.ctx().set_raw_cipher_list(&raw_ciphers).unwrap();
+    client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_2))
+        .unwrap();
+    client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client.ctx().set_grease_enabled(true);
+    client.ctx().set_mode(SslMode::SEND_FALLBACK_SCSV);
+    let _ = client.connect();
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(
+        captured[0]
+            .iter()
+            .filter(|cipher| **cipher & 0x0f0f == 0x0a0a)
+            .count(),
+        1,
+    );
+    assert_eq!(
+        captured[0]
+            .iter()
+            .filter(|cipher| **cipher == 0x5600)
+            .count(),
+        1,
+    );
+    assert_eq!(captured[0][0] & 0x0f0f, 0x0a0a);
+    assert_eq!(&captured[0][1..], &raw_ciphers[1..]);
+}
+
+#[test]
+fn test_raw_cipher_list_survives_tls13_hello_retry_request() {
+    let mut server = Server::builder();
+    server.ctx().set_curves(&[SslCurve::SECP384R1]).unwrap();
+    let captured = capture_client_hello_ciphers(&mut server);
+    let server = server.build();
+
+    let raw_ciphers = [0x1301, 0x1303, 0x1302];
+    let mut client = server.client();
+    client
+        .ctx()
+        .set_curves(&[SslCurve::SECP256R1, SslCurve::SECP384R1])
+        .unwrap();
+    client.ctx().set_raw_cipher_list(&raw_ciphers).unwrap();
+    client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    let stream = client.connect();
+
+    // Only P-256 is sent as the initial classical key share. The P-384-only
+    // server therefore forces an HRR before the successful P-384 handshake.
+    assert_eq!(stream.ssl().curve(), Some(SslCurve::SECP384R1));
+    assert_eq!(*captured.lock().unwrap(), [raw_ciphers]);
+}
+
+#[test]
+fn test_tls13_rejects_unoffered_raw_cipher() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let mut socket = listener.accept().unwrap().0;
+        let mut record_header = [0; 5];
+        socket.read_exact(&mut record_header).unwrap();
+        assert_eq!(record_header[0], 22);
+        let record_len = u16::from_be_bytes([record_header[3], record_header[4]]) as usize;
+        let mut client_hello = vec![0; record_len];
+        socket.read_exact(&mut client_hello).unwrap();
+
+        assert_eq!(client_hello[0], 1);
+        // 4-byte handshake header + 2-byte legacy version + 32-byte random.
+        let session_id_len = client_hello[38] as usize;
+        let session_id = &client_hello[39..39 + session_id_len];
+
+        let mut body = Vec::new();
+        body.extend_from_slice(&[0x03, 0x03]);
+        body.extend_from_slice(&[1; 32]);
+        body.push(session_id_len as u8);
+        body.extend_from_slice(session_id);
+        body.extend_from_slice(&[0x13, 0x02, 0]);
+        body.extend_from_slice(&[0, 6, 0, 0x2b, 0, 2, 3, 4]);
+
+        let mut server_hello = vec![2];
+        server_hello.extend_from_slice(&[
+            ((body.len() >> 16) & 0xff) as u8,
+            ((body.len() >> 8) & 0xff) as u8,
+            (body.len() & 0xff) as u8,
+        ]);
+        server_hello.extend_from_slice(&body);
+
+        let mut response = vec![22, 3, 3];
+        response.extend_from_slice(&(server_hello.len() as u16).to_be_bytes());
+        response.extend_from_slice(&server_hello);
+        socket.write_all(&response).unwrap();
+    });
+
+    let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
+    ctx.set_min_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+    ctx.set_max_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+    ctx.set_raw_cipher_list(&[0x1301]).unwrap();
+    let ssl = Ssl::new(&ctx.build()).unwrap();
+    let error = ssl.connect(TcpStream::connect(addr).unwrap()).unwrap_err();
+    server.join().unwrap();
+
+    let HandshakeError::Failure(handshake) = error else {
+        panic!("expected a failed TLS handshake");
+    };
+    let errors = handshake.error().ssl_error().unwrap().errors();
+    assert!(
+        errors
+            .iter()
+            .any(|error| error.reason() == Some("WRONG_CIPHER_RETURNED")),
+        "unexpected error stack: {errors:?}",
+    );
 }
 
 #[test]
