@@ -2,14 +2,16 @@ diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
 index 7d9499dbc..96634160a 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -1682,6 +1682,13 @@ OPENSSL_EXPORT int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx,
+@@ -1682,6 +1682,15 @@ OPENSSL_EXPORT int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx,
  // garbage inputs, unless an empty cipher list results.
  OPENSSL_EXPORT int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str);
  
 +// RAMA_SSL_CTX_set_raw_cipher_list configures the exact cipher suite vector
 +// sent by clients created from |ctx|. The list is not filtered by protocol
 +// version, authentication requirements, or local support. Unknown values and
-+// duplicates are preserved. |num| must be positive.
++// duplicates are preserved. If GREASE or fallback SCSV are also enabled, raw
++// signaling values are replaced or deduplicated rather than added twice.
++// |num| must be positive.
 +OPENSSL_EXPORT int RAMA_SSL_CTX_set_raw_cipher_list(
 +    SSL_CTX *ctx, const uint16_t *values, int num);
 +
@@ -250,18 +252,25 @@ diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
 index 901040c2a..9493332fb 100644
 --- a/ssl/handshake_client.cc
 +++ b/ssl/handshake_client.cc
-@@ -108,6 +108,19 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+@@ -108,6 +108,26 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
      return false;
    }
 
 +  const SSLCipherPreferenceList *cipher_list = ssl_get_cipher_preferences(ssl);
 +  if (!cipher_list->rama_raw_cipher_list.empty()) {
++    bool raw_has_fallback_scsv = false;
 +    for (uint16_t cipher : cipher_list->rama_raw_cipher_list) {
++      // GREASE is generated above. Treat values in a raw fingerprint as
++      // placeholders rather than emitting a second GREASE cipher.
++      if (ssl->ctx->grease_enabled && (cipher & 0x0f0f) == 0x0a0a) {
++        continue;
++      }
++      raw_has_fallback_scsv |= cipher == SSL_CIPHER_FALLBACK_SCSV;
 +      if (!CBB_add_u16(&child, cipher)) {
 +        return false;
 +      }
 +    }
-+    if (ssl->mode & SSL_MODE_SEND_FALLBACK_SCSV &&
++    if (ssl->mode & SSL_MODE_SEND_FALLBACK_SCSV && !raw_has_fallback_scsv &&
 +        !CBB_add_u16(&child, SSL_CIPHER_FALLBACK_SCSV)) {
 +      return false;
 +    }
@@ -377,7 +386,7 @@ index 1ef231c39..0838d52d8 100644
    size_t size = sk_SSL_CIPHER_num(other.ciphers.get());
    Span<const bool> other_flags(other.in_group_flags, size);
    UniquePtr<STACK_OF(SSL_CIPHER)> other_ciphers(
-@@ -634,13 +639,41 @@ bool SSLCipherPreferenceList::Init(const SSLCipherPreferenceList &other) {
+@@ -634,13 +639,46 @@ bool SSLCipherPreferenceList::Init(const SSLCipherPreferenceList &other) {
    if (!other_ciphers) {
      return false;
    }
@@ -410,8 +419,13 @@ index 1ef231c39..0838d52d8 100644
 +        break;
 +      }
 +    }
-+    if (raw_index == SIZE_MAX ||
-+        !raw_cipher_list.InitForOverwrite(rama_raw_cipher_list.size() - 1)) {
++    assert(raw_index != SIZE_MAX);
++    if (raw_index == SIZE_MAX) {
++      OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++      return false;
++    }
++    if (!raw_cipher_list.InitForOverwrite(rama_raw_cipher_list.size() - 1)) {
++      OPENSSL_PUT_ERROR(SSL, ERR_R_MALLOC_FAILURE);
 +      return false;
 +    }
 +    for (size_t src = 0, dst = 0; src < rama_raw_cipher_list.size(); src++) {
@@ -422,7 +436,7 @@ index 1ef231c39..0838d52d8 100644
    }
    if (!in_group_flags[index] /* last element of group */ && index > 0) {
      in_group_flags[index - 1] = false;
-@@ -650,6 +686,8 @@ void SSLCipherPreferenceList::Remove(const SSL_CIPHER *cipher) {
+@@ -650,6 +691,8 @@ void SSLCipherPreferenceList::Remove(const SSL_CIPHER *cipher) {
      in_group_flags[i] = in_group_flags[i + 1];
    }
    sk_SSL_CIPHER_delete(ciphers.get(), index);
@@ -431,7 +445,7 @@ index 1ef231c39..0838d52d8 100644
  }
  
  bool ssl_cipher_is_deprecated(const SSL_CIPHER *cipher) {
-@@ -1139,6 +1177,51 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
+@@ -1139,6 +1182,52 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
    return true;
  }
  
@@ -439,6 +453,7 @@ index 1ef231c39..0838d52d8 100644
 +    UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
 +    const uint16_t *cipher_values, int num) {
 +  if (out_cipher_list == nullptr || cipher_values == nullptr || num <= 0) {
++    OPENSSL_PUT_ERROR(SSL, SSL_R_NO_CIPHER_MATCH);
 +    return false;
 +  }
 +
@@ -487,11 +502,12 @@ diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
 index a1ba926fd..10d6ed900 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
-@@ -358,6 +358,11 @@ void SSL_set_aes_hw_override_for_testing(SSL *ssl, bool override_value) {
+@@ -358,6 +358,12 @@ void SSL_set_aes_hw_override_for_testing(SSL *ssl, bool override_value) {
    ssl->config->aes_hw_override_value = override_value;
  }
  
 +const SSLCipherPreferenceList *ssl_get_cipher_preferences(const SSL *ssl) {
++  assert(ssl->config);
 +  return ssl->config->cipher_list ? ssl->config->cipher_list.get()
 +                                  : ssl->ctx->cipher_list.get();
 +}

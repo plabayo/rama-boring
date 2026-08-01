@@ -1556,7 +1556,12 @@ impl SslContextBuilder {
     ///
     /// Unknown values and duplicates are preserved. The list is not filtered by
     /// protocol version, authentication requirements, or local support. Configured
-    /// GREASE and fallback SCSV values may still be added around this list.
+    /// GREASE and fallback SCSV values may still be added around this list. If the
+    /// list already contains either signaling value, it is not added a second time.
+    ///
+    /// This is a cipher-list setter, so setter ordering matters: calling it after
+    /// [`SslContextBuilder::set_compliance_policy`] replaces the policy's TLS 1.2
+    /// cipher list. Apply the compliance policy last when it must take precedence.
     ///
     /// Use [`set_cipher_list`] to configure only supported pre-TLS 1.3 ciphers.
     #[corresponds(RAMA_SSL_CTX_set_raw_cipher_list)]

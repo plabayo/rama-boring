@@ -694,6 +694,10 @@ fn get_cpp_runtime_libs(config: &Config) -> Vec<String> {
 
 fn main() {
     let config = Config::from_env();
+    println!(
+        "cargo:rerun-if-changed={}",
+        config.manifest_dir.join("patches").display()
+    );
     ensure_patches_applied(&config).unwrap();
     if !config.env.docs_rs {
         emit_link_directives(&config);

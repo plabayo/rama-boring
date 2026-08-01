@@ -235,7 +235,14 @@ fn test_empty_raw_cipher_list_does_not_replace_previous_list() {
 
     let mut client = server.client();
     client.ctx().set_raw_cipher_list(&[0x1301]).unwrap();
-    client.ctx().set_raw_cipher_list(&[]).unwrap_err();
+    let error = client.ctx().set_raw_cipher_list(&[]).unwrap_err();
+    assert!(
+        error
+            .errors()
+            .iter()
+            .any(|error| error.reason() == Some("NO_CIPHER_MATCH")),
+        "unexpected error stack: {error:?}",
+    );
     client
         .ctx()
         .set_min_proto_version(Some(SslVersion::TLS1_3))
@@ -297,6 +304,79 @@ fn test_raw_cipher_list_keeps_protocol_signaling_values() {
 }
 
 #[test]
+fn test_raw_cipher_list_deduplicates_configured_signaling_values() {
+    let mut server = Server::builder();
+    let captured = capture_client_hello_ciphers(&mut server);
+    let server = server.build();
+
+    // This matches Rama's emulation path: the captured raw vector already
+    // contains a GREASE placeholder, while GREASE is also enabled globally so
+    // BoringSSL can generate the other GREASE-bearing fields.
+    let raw_ciphers = [0x0a0a, 0x1301, 0x1303, 0xc02f, 0x5600];
+    let mut client = server.client();
+    client.ctx().set_raw_cipher_list(&raw_ciphers).unwrap();
+    client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_2))
+        .unwrap();
+    client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client.ctx().set_grease_enabled(true);
+    client.ctx().set_mode(SslMode::SEND_FALLBACK_SCSV);
+    let _ = client.connect();
+
+    let captured = captured.lock().unwrap();
+    assert_eq!(
+        captured[0]
+            .iter()
+            .filter(|cipher| **cipher & 0x0f0f == 0x0a0a)
+            .count(),
+        1,
+    );
+    assert_eq!(
+        captured[0]
+            .iter()
+            .filter(|cipher| **cipher == 0x5600)
+            .count(),
+        1,
+    );
+    assert_eq!(captured[0][0] & 0x0f0f, 0x0a0a);
+    assert_eq!(&captured[0][1..], &raw_ciphers[1..]);
+}
+
+#[test]
+fn test_raw_cipher_list_survives_tls13_hello_retry_request() {
+    let mut server = Server::builder();
+    server.ctx().set_curves(&[SslCurve::SECP384R1]).unwrap();
+    let captured = capture_client_hello_ciphers(&mut server);
+    let server = server.build();
+
+    let raw_ciphers = [0x1301, 0x1303, 0x1302];
+    let mut client = server.client();
+    client
+        .ctx()
+        .set_curves(&[SslCurve::SECP256R1, SslCurve::SECP384R1])
+        .unwrap();
+    client.ctx().set_raw_cipher_list(&raw_ciphers).unwrap();
+    client
+        .ctx()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client
+        .ctx()
+        .set_max_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    let stream = client.connect();
+
+    // Only P-256 is sent as the initial classical key share. The P-384-only
+    // server therefore forces an HRR before the successful P-384 handshake.
+    assert_eq!(stream.ssl().curve(), Some(SslCurve::SECP384R1));
+    assert_eq!(*captured.lock().unwrap(), [raw_ciphers]);
+}
+
+#[test]
 fn test_tls13_rejects_unoffered_raw_cipher() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -310,6 +390,7 @@ fn test_tls13_rejects_unoffered_raw_cipher() {
         socket.read_exact(&mut client_hello).unwrap();
 
         assert_eq!(client_hello[0], 1);
+        // 4-byte handshake header + 2-byte legacy version + 32-byte random.
         let session_id_len = client_hello[38] as usize;
         let session_id = &client_hello[39..39 + session_id_len];
 
