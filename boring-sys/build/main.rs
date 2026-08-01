@@ -353,7 +353,19 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
                     boringssl_cmake.define("CMAKE_GENERATOR_PLATFORM", "x64");
                 }
 
-                boringssl_cmake.define("CMAKE_MSVC_RUNTIME_LIBRARY", "MultiThreadedDLL");
+                // Follow the Rust `crt-static` target feature so BoringSSL and the
+                // final Rust binary agree on the CRT flavor: static (/MT) when built
+                // with `-C target-feature=+crt-static`, dynamic (/MD) otherwise.
+                // Kept config-agnostic (no Debug variant) as Rust always links the
+                // release CRT, even for debug profiles.
+                boringssl_cmake.define(
+                    "CMAKE_MSVC_RUNTIME_LIBRARY",
+                    if config.crt_static {
+                        "MultiThreaded"
+                    } else {
+                        "MultiThreadedDLL"
+                    },
+                );
 
                 const CMAKE_MSVC_DEBUG_FLAGS: &str = "/Zi /Ob0 /Od /RTC1";
                 boringssl_cmake.define("CMAKE_C_FLAGS_DEBUG", CMAKE_MSVC_DEBUG_FLAGS);

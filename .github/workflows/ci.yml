@@ -88,6 +88,7 @@ jobs:
           - x86_64-mingw
           - i686-msvc
           - x86_64-msvc
+          - x86_64-msvc-crt-static
           - aarch64-msvc
         include:
           - check_only: false
@@ -207,6 +208,18 @@ jobs:
             custom_env:
               CC_x86_64-pc-windows-msvc: cl
               CXX_x86_64-pc-windows-msvc: cl
+            # CI's Windows doesn't have required root certs
+            extra_test_args: --workspace --exclude rama-boring-tokio
+          - thing: x86_64-msvc-crt-static
+            target: x86_64-pc-windows-msvc
+            rust: stable-x86_64-msvc
+            os: windows-latest
+            custom_env:
+              CC_x86_64-pc-windows-msvc: cl
+              CXX_x86_64-pc-windows-msvc: cl
+              # Statically link the CRT (/MT): BoringSSL must follow the
+              # `crt-static` target feature for the link to succeed.
+              RUSTFLAGS: -Dwarnings -C target-feature=+crt-static
             # CI's Windows doesn't have required root certs
             extra_test_args: --workspace --exclude rama-boring-tokio
           - thing: aarch64-msvc
@@ -394,7 +407,12 @@ jobs:
         with:
           go-version: ">=1.22.0"
       - name: Install ${{ matrix.target }} toolchain
-        run: brew tap messense/macos-cross-toolchains && brew install ${{ matrix.target }}
+        # Newer Homebrew refuses to install formulae from untrusted third-party
+        # taps; `brew trust` doesn't exist on older versions, hence `|| true`.
+        run: |
+          brew tap messense/macos-cross-toolchains
+          brew trust messense/macos-cross-toolchains || true
+          brew install ${{ matrix.target }}
       - name: Set BORING_BSSL_SYSROOT
         run: echo "BORING_BSSL_SYSROOT=$(brew --prefix ${{ matrix.target }})/toolchain/${{ matrix.target }}/sysroot" >> $GITHUB_ENV
         shell: bash

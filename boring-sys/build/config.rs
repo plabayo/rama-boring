@@ -10,6 +10,7 @@ pub(crate) struct Config {
     pub(crate) target: String,
     pub(crate) target_arch: String,
     pub(crate) target_os: String,
+    pub(crate) crt_static: bool,
     pub(crate) env: Env,
 }
 
@@ -39,6 +40,9 @@ impl Config {
         let target = env::var("TARGET").unwrap();
         let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap();
         let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap();
+        let crt_static = env::var("CARGO_CFG_TARGET_FEATURE")
+            .map(|features| features.split(',').any(|feature| feature == "crt-static"))
+            .unwrap_or(false);
 
         let env = Env::from_env(&host, &target);
 
@@ -55,6 +59,7 @@ impl Config {
             target,
             target_arch,
             target_os,
+            crt_static,
             env,
         };
 
