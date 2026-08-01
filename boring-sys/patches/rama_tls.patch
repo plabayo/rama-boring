@@ -255,7 +255,7 @@ index 901040c2a..9493332fb 100644
 @@ -108,6 +108,26 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
      return false;
    }
-
+ 
 +  const SSLCipherPreferenceList *cipher_list = ssl_get_cipher_preferences(ssl);
 +  if (!cipher_list->rama_raw_cipher_list.empty()) {
 +    bool raw_has_fallback_scsv = false;
