@@ -220,10 +220,8 @@ impl Pkcs12Builder {
 
 #[cfg(test)]
 mod test {
-    use crate::hash::MessageDigest;
-    use hex;
-
     use crate::asn1::Asn1Time;
+    use crate::hash::MessageDigest;
     use crate::nid::Nid;
     use crate::pkey::PKey;
     use crate::rsa::Rsa;
@@ -238,17 +236,16 @@ mod test {
         let pkcs12 = Pkcs12::from_der(der).unwrap();
         let parsed = pkcs12.parse("mypass").unwrap();
 
+        let expected_cert = X509::from_pem(include_bytes!("../test/cert.pem")).unwrap();
         assert_eq!(
-            hex::encode(parsed.cert.digest(MessageDigest::sha1()).unwrap()),
-            "59172d9313e84459bcff27f967e79e6e9217e584"
+            parsed.cert.to_der().unwrap(),
+            expected_cert.to_der().unwrap()
         );
 
         let chain = parsed.chain.unwrap();
         assert_eq!(chain.len(), 1);
-        assert_eq!(
-            hex::encode(chain[0].digest(MessageDigest::sha1()).unwrap()),
-            "c0cbdf7cdd03c9773e5468e1f6d2da7d5cbb1875"
-        );
+        let expected_root = X509::from_pem(include_bytes!("../test/root-ca.pem")).unwrap();
+        assert_eq!(chain[0].to_der().unwrap(), expected_root.to_der().unwrap());
     }
 
     #[test]

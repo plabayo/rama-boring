@@ -2,7 +2,6 @@ use super::server::Server;
 use crate::ssl::{ErrorCode, HandshakeError, SslAlert, SslVerifyMode};
 use crate::x509::X509StoreContext;
 use crate::{hash::MessageDigest, ssl::SslVerifyError};
-use hex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[test]
@@ -151,7 +150,7 @@ fn callback() {
     static CALLED_BACK: AtomicBool = AtomicBool::new(false);
     let server = Server::builder().build();
     let mut client = server.client();
-    let expected = "59172d9313e84459bcff27f967e79e6e9217e584";
+    let expected = super::test_certificate_sha1(super::CERT);
 
     client
         .ctx()
@@ -167,7 +166,7 @@ fn callback() {
             let cert = ssl.peer_certificate().unwrap();
             let digest = cert.digest(MessageDigest::sha1()).unwrap();
 
-            assert_eq!(hex::encode(digest), expected);
+            assert_eq!(&*digest, expected);
 
             Ok(())
         });
@@ -181,7 +180,7 @@ fn ssl_callback() {
     static CALLED_BACK: AtomicBool = AtomicBool::new(false);
     let server = Server::builder().build();
     let mut client = server.client().build().builder();
-    let expected = "59172d9313e84459bcff27f967e79e6e9217e584";
+    let expected = super::test_certificate_sha1(super::CERT);
 
     client
         .ssl()
@@ -197,7 +196,7 @@ fn ssl_callback() {
             let cert = ssl.peer_certificate().unwrap();
             let digest = cert.digest(MessageDigest::sha1()).unwrap();
 
-            assert_eq!(hex::encode(digest), expected);
+            assert_eq!(&*digest, expected);
 
             Ok(())
         });
@@ -219,7 +218,7 @@ fn both_callback() {
         });
 
     let mut client = client.build().builder();
-    let expected = "59172d9313e84459bcff27f967e79e6e9217e584";
+    let expected = super::test_certificate_sha1(super::CERT);
 
     client
         .ssl()
@@ -229,7 +228,7 @@ fn both_callback() {
             let cert = ssl.peer_certificate().unwrap();
             let digest = cert.digest(MessageDigest::sha1()).unwrap();
 
-            assert_eq!(hex::encode(digest), expected);
+            assert_eq!(&*digest, expected);
 
             Ok(())
         });

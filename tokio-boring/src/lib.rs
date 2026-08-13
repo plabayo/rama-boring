@@ -9,7 +9,8 @@
 //! `tokio-boring` exports this ability through [`accept`] and [`connect`]. `accept` should
 //! be used by servers, and `connect` by clients. These augment the functionality provided by the
 //! `rama-boring` crate, on which this crate is built. Configuration of TLS parameters is still
-//! primarily done through the `rama-boring` crate.
+//! primarily done through the `rama-boring` crate. DNS names and IP addresses
+//! are both verified as peer identities; IP addresses are not sent as SNI.
 #![warn(missing_docs)]
 
 use rama_boring::ssl::{
@@ -41,16 +42,17 @@ pub use rama_boring::ssl::{
 ///
 /// This function automatically sets the task waker on the `Ssl` from `config` to
 /// allow to make use of async callbacks provided by the boring crate.
+/// The peer identity follows [`ConnectConfiguration::into_ssl`] semantics.
 pub async fn connect<S>(
     config: ConnectConfiguration,
-    domain: Option<&str>,
+    peer_identity: Option<&str>,
     stream: S,
 ) -> Result<SslStream<S>, HandshakeError<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let mid_handshake = config
-        .setup_connect(domain, AsyncStreamBridge::new(stream))
+        .setup_connect(peer_identity, AsyncStreamBridge::new(stream))
         .map_err(|err| HandshakeError(ssl::HandshakeError::SetupFailure(err)))?;
 
     HandshakeFuture(Some(mid_handshake)).await
