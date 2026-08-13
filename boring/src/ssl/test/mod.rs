@@ -39,6 +39,14 @@ static ROOT_CERT: &[u8] = include_bytes!("../../../test/root-ca.pem");
 static CERT: &[u8] = include_bytes!("../../../test/cert.pem");
 static KEY: &[u8] = include_bytes!("../../../test/key.pem");
 
+fn test_certificate_sha1(pem: &[u8]) -> Vec<u8> {
+    X509::from_pem(pem)
+        .unwrap()
+        .digest(MessageDigest::sha1())
+        .unwrap()
+        .to_vec()
+}
+
 fn capture_client_hello_ciphers(server: &mut server::Builder) -> Arc<Mutex<Vec<Vec<u16>>>> {
     let captured = Arc::new(Mutex::new(Vec::new()));
     let callback_captured = Arc::clone(&captured);
@@ -515,10 +523,7 @@ fn peer_certificate() {
     let s = server.client().connect();
     let cert = s.ssl().peer_certificate().unwrap();
     let fingerprint = cert.digest(MessageDigest::sha1()).unwrap();
-    assert_eq!(
-        hex::encode(fingerprint),
-        "59172d9313e84459bcff27f967e79e6e9217e584"
-    );
+    assert_eq!(&*fingerprint, test_certificate_sha1(CERT));
 }
 
 #[test]

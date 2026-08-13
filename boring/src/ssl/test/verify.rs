@@ -3,7 +3,6 @@ use crate::hash::MessageDigest;
 use crate::ssl::SslVerifyMode;
 use crate::x509::store::X509StoreBuilder;
 use crate::x509::X509;
-use hex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[test]
@@ -112,14 +111,14 @@ fn callback() {
     let server = Server::builder().build();
 
     let mut client = server.client();
-    let expected = "59172d9313e84459bcff27f967e79e6e9217e584";
+    let expected = super::test_certificate_sha1(super::CERT);
     client
         .ctx()
         .set_verify_callback(SslVerifyMode::PEER, move |_, x509| {
             CALLED_BACK.store(true, Ordering::SeqCst);
             let cert = x509.current_cert().unwrap();
             let digest = cert.digest(MessageDigest::sha1()).unwrap();
-            assert_eq!(hex::encode(digest), expected);
+            assert_eq!(&*digest, expected);
             true
         });
 
@@ -134,14 +133,14 @@ fn ssl_callback() {
     let server = Server::builder().build();
 
     let mut client = server.client().build().builder();
-    let expected = "59172d9313e84459bcff27f967e79e6e9217e584";
+    let expected = super::test_certificate_sha1(super::CERT);
     client
         .ssl()
         .set_verify_callback(SslVerifyMode::PEER, move |_, x509| {
             CALLED_BACK.store(true, Ordering::SeqCst);
             let cert = x509.current_cert().unwrap();
             let digest = cert.digest(MessageDigest::sha1()).unwrap();
-            assert_eq!(hex::encode(digest), expected);
+            assert_eq!(&*digest, expected);
             true
         });
 
