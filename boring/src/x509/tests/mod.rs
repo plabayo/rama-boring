@@ -308,6 +308,8 @@ fn x509_builder() {
     builder.append_extension(&authority_key_identifier).unwrap();
     let subject_alternative_name = SubjectAlternativeName::new()
         .dns("example.com")
+        .ip("127.0.0.1")
+        .ip("::1")
         .build(&builder.x509v3_context(None, None))
         .unwrap();
     builder.append_extension(&subject_alternative_name).unwrap();
@@ -318,6 +320,14 @@ fn x509_builder() {
 
     assert!(pkey.public_eq(&x509.public_key().unwrap()));
     assert!(x509.verify(&pkey).unwrap());
+
+    let subject_alt_names = x509.subject_alt_names().unwrap();
+    assert_eq!(subject_alt_names[0].dnsname(), Some("example.com"));
+    assert_eq!(subject_alt_names[1].ipaddress(), Some(&[127, 0, 0, 1][..]));
+    assert_eq!(
+        subject_alt_names[2].ipaddress(),
+        Some(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1][..])
+    );
 
     let cn = x509
         .subject_name()

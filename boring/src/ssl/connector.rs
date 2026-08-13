@@ -98,33 +98,35 @@ impl SslConnector {
 
     /// Initiates a client-side TLS session on a stream.
     ///
-    /// The domain, if given, is used for SNI and hostname verification.
+    /// The peer identity, if given, is used for certificate verification when
+    /// enabled. DNS names are also sent as SNI; IP addresses are not.
     pub fn setup_connect<S>(
         &self,
-        domain: Option<&str>,
+        peer_identity: Option<&str>,
         stream: S,
     ) -> Result<MidHandshakeSslStream<S>, ErrorStack>
     where
         S: Read + Write,
     {
-        self.configure()?.setup_connect(domain, stream)
+        self.configure()?.setup_connect(peer_identity, stream)
     }
 
     /// Attempts a client-side TLS session on a stream.
     ///
-    /// The domain, if given, is used for SNI (if it is not an IP address) and hostname verification if enabled.
+    /// The peer identity, if given, is used for certificate verification when
+    /// enabled. DNS names are also sent as SNI; IP addresses are not.
     ///
     /// This is a convenience method which combines [`Self::setup_connect`] and
     /// [`MidHandshakeSslStream::handshake`].
     pub fn connect<S>(
         &self,
-        domain: Option<&str>,
+        peer_identity: Option<&str>,
         stream: S,
     ) -> Result<SslStream<S>, HandshakeError<S>>
     where
         S: Read + Write,
     {
-        self.setup_connect(domain, stream)
+        self.setup_connect(peer_identity, stream)
             .map_err(HandshakeError::SetupFailure)?
             .handshake()
     }
@@ -134,7 +136,7 @@ impl SslConnector {
         Ssl::new(&self.0).map(|ssl| ConnectConfiguration {
             ssl,
             sni: true,
-            verify_hostname: true,
+            verify_peer_identity: true,
         })
     }
 
@@ -180,7 +182,7 @@ impl DerefMut for SslConnectorBuilder {
 pub struct ConnectConfiguration {
     ssl: Ssl,
     sni: bool,
-    verify_hostname: bool,
+    verify_peer_identity: bool,
 }
 
 impl ConnectConfiguration {
@@ -200,12 +202,12 @@ impl ConnectConfiguration {
 
     /// A builder-style version of `set_verify_hostname`.
     #[must_use]
-    pub fn verify_hostname(mut self, verify_hostname: bool) -> ConnectConfiguration {
-        self.set_verify_hostname(verify_hostname);
+    pub fn verify_hostname(mut self, verify_peer_identity: bool) -> ConnectConfiguration {
+        self.set_verify_hostname(verify_peer_identity);
         self
     }
 
-    /// Configures the use of hostname verification when connecting.
+    /// Configures DNS or IP peer identity verification when connecting.
     ///
     /// Defaults to `true`.
     ///
@@ -214,22 +216,24 @@ impl ConnectConfiguration {
     /// You should think very carefully before you use this method. If hostname verification is not
     /// used, *any* valid certificate for *any* site will be trusted for use from any other. This
     /// introduces a significant vulnerability to man-in-the-middle attacks.
-    pub fn set_verify_hostname(&mut self, verify_hostname: bool) {
-        self.verify_hostname = verify_hostname;
+    pub fn set_verify_hostname(&mut self, verify_peer_identity: bool) {
+        self.verify_peer_identity = verify_peer_identity;
     }
 
-    /// Returns an [`Ssl`] configured to connect to the provided domain.
+    /// Returns an [`Ssl`] configured for the provided peer identity.
     ///
-    /// The domain, if given, is used for SNI (if it is not an IP address)
-    /// and hostname verification if enabled.
-    pub fn into_ssl(mut self, maybe_domain: Option<&str>) -> Result<Ssl, ErrorStack> {
-        if let Some(domain) = maybe_domain {
-            if self.sni && domain.parse::<IpAddr>().is_err() {
-                self.ssl.set_hostname(domain)?;
+    /// DNS identities are sent as SNI and matched as DNS names. IP identities
+    /// are matched against `iPAddress` subject alternative names and are not
+    /// sent as SNI. `None` performs no identity match; certificate-chain
+    /// verification is configured independently.
+    pub fn into_ssl(mut self, peer_identity: Option<&str>) -> Result<Ssl, ErrorStack> {
+        if let Some(peer_identity) = peer_identity {
+            if self.sni && peer_identity.parse::<IpAddr>().is_err() {
+                self.ssl.set_hostname(peer_identity)?;
             }
 
-            if self.verify_hostname {
-                setup_verify_hostname(&mut self.ssl, domain)?;
+            if self.verify_peer_identity {
+                setup_verify_peer_identity(&mut self.ssl, peer_identity)?;
             }
         }
 
@@ -238,36 +242,36 @@ impl ConnectConfiguration {
 
     /// Initiates a client-side TLS session on a stream.
     ///
-    /// The domain, if given, is used for SNI (if it is not an IP address) and hostname verification if enabled.
+    /// See [`Self::into_ssl`] for peer identity semantics.
     ///
     /// This is a convenience method which combines [`Self::into_ssl`] and
     /// [`Ssl::setup_connect`].
     pub fn setup_connect<S>(
         self,
-        domain: Option<&str>,
+        peer_identity: Option<&str>,
         stream: S,
     ) -> Result<MidHandshakeSslStream<S>, ErrorStack>
     where
         S: Read + Write,
     {
-        Ok(self.into_ssl(domain)?.setup_connect(stream))
+        Ok(self.into_ssl(peer_identity)?.setup_connect(stream))
     }
 
     /// Attempts a client-side TLS session on a stream.
     ///
-    /// The domain, if given, is used for SNI (if it is not an IP address) and hostname verification if enabled.
+    /// See [`Self::into_ssl`] for peer identity semantics.
     ///
     /// This is a convenience method which combines [`Self::setup_connect`] and
     /// [`MidHandshakeSslStream::handshake`].
     pub fn connect<S>(
         self,
-        domain: Option<&str>,
+        peer_identity: Option<&str>,
         stream: S,
     ) -> Result<SslStream<S>, HandshakeError<S>>
     where
         S: Read + Write,
     {
-        self.setup_connect(domain, stream)
+        self.setup_connect(peer_identity, stream)
             .map_err(HandshakeError::SetupFailure)?
             .handshake()
     }
@@ -430,13 +434,13 @@ fn setup_verify(ctx: &mut SslContextBuilder) {
     ctx.set_verify(SslVerifyMode::PEER);
 }
 
-fn setup_verify_hostname(ssl: &mut SslRef, domain: &str) -> Result<(), ErrorStack> {
+fn setup_verify_peer_identity(ssl: &mut SslRef, peer_identity: &str) -> Result<(), ErrorStack> {
     use crate::x509::verify::X509CheckFlags;
 
     let param = ssl.param_mut();
     param.set_hostflags(X509CheckFlags::NO_PARTIAL_WILDCARDS);
-    match domain.parse() {
+    match peer_identity.parse() {
         Ok(ip) => param.set_ip(ip),
-        Err(_) => param.set_host(domain),
+        Err(_) => param.set_host(peer_identity),
     }
 }
