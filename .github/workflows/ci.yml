@@ -299,6 +299,11 @@ jobs:
         run: cargo test --target ${{ matrix.target }} ${{ matrix.extra_test_args }}
         shell: bash
         env: ${{ matrix.custom_env }}
+      - name: Run Tokio unit tests on Windows
+        if: "!matrix.check_only && startsWith(matrix.os, 'windows')"
+        run: cargo test --target ${{ matrix.target }} -p rama-boring-tokio --lib
+        shell: bash
+        env: ${{ matrix.custom_env }}
       - name: Test rama-boring-sys cargo publish
         # Running `cargo publish --dry-run` tests two things:
         #

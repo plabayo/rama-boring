@@ -485,6 +485,7 @@ where
             }
             Err(ssl::HandshakeError::Failure(mut mid_handshake)) => {
                 mid_handshake.get_mut().set_waker(None);
+                mid_handshake.ssl_mut().set_task_waker(None);
 
                 Poll::Ready(Err(HandshakeError(ssl::HandshakeError::Failure(
                     mid_handshake,
@@ -494,5 +495,48 @@ where
                 Poll::Ready(Err(HandshakeError(err)))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rama_boring::ssl::{SslConnector, SslMethod};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    use std::task::{Wake, Waker};
+
+    struct CountingWake(AtomicUsize);
+
+    impl Wake for CountingWake {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn failed_handshake_releases_task_waker() {
+        let config = SslConnector::no_default_verify_builder(SslMethod::tls())
+            .unwrap()
+            .build()
+            .configure()
+            .unwrap();
+        let (stream, peer) = tokio::io::duplex(4096);
+        drop(peer);
+
+        let wake = Arc::new(CountingWake(AtomicUsize::new(0)));
+        let waker = Waker::from(Arc::clone(&wake));
+        let mut context = Context::from_waker(&waker);
+        let expected_count = Arc::strong_count(&wake);
+        let mut future = Box::pin(connect(config, None, stream));
+
+        let Poll::Ready(Err(error)) = future.as_mut().poll(&mut context) else {
+            panic!("closed peer must fail the handshake immediately");
+        };
+
+        assert_eq!(Arc::strong_count(&wake), expected_count);
+        drop(error);
     }
 }
