@@ -1570,7 +1570,7 @@ impl SslContextBuilder {
             cvt(ffi::RAMA_SSL_CTX_set_raw_cipher_list(
                 self.as_ptr(),
                 cipher_list.as_ptr() as *const _,
-                cipher_list.len() as i32,
+                cipher_list.len(),
             ))
         }
     }
@@ -2072,7 +2072,7 @@ impl SslContextBuilder {
             cvt(ffi::RAMA_SSL_CTX_set_extension_order(
                 self.as_ptr(),
                 ids.as_ptr() as *const _,
-                ids.len() as i32,
+                ids.len(),
             ))
             .map(|_| ())
         }
@@ -2539,6 +2539,12 @@ impl ClientHello<'_> {
     #[must_use]
     pub fn ciphers(&self) -> &[u8] {
         unsafe { slice::from_raw_parts(self.0.cipher_suites, self.0.cipher_suites_len) }
+    }
+
+    /// Returns the raw encoded ClientHello extension block.
+    #[must_use]
+    pub fn extensions(&self) -> &[u8] {
+        unsafe { slice::from_raw_parts(self.0.extensions, self.0.extensions_len) }
     }
 }
 

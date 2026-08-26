@@ -13,7 +13,7 @@ index 7d9499dbc..96634160a 100644
 +// signaling values are replaced or deduplicated rather than added twice.
 +// |num| must be positive.
 +OPENSSL_EXPORT int RAMA_SSL_CTX_set_raw_cipher_list(
-+    SSL_CTX *ctx, const uint16_t *values, int num);
++    SSL_CTX *ctx, const uint16_t *values, size_t num);
 +
  // SSL_set_strict_cipher_list configures the cipher list for |ssl|, evaluating
  // |str| as a cipher string and returning error if |str| contains anything
@@ -46,7 +46,7 @@ index 7d9499dbc..96634160a 100644
 +// should make use of the provided extensions to define the order,
 +// which is similar to SSL_CTX_set_permute_extensions but in a defined
 +// order instead of a random one.
-+OPENSSL_EXPORT int RAMA_SSL_CTX_set_extension_order(SSL_CTX *ctx, const uint16_t *ids, int num);
++OPENSSL_EXPORT int RAMA_SSL_CTX_set_extension_order(SSL_CTX *ctx, const uint16_t *ids, size_t num);
 +
  // SSL_set_permute_extensions configures whether sockets on |ssl| should
  // permute extensions. For now, this is only implemented for the ClientHello.
@@ -218,7 +218,7 @@ index daf643572..3f8a6003f 100644
 +            return false;
 +        }
 +        for (size_t i = kNumExtensions - 1; i > offset; i--) {
-+            size_t swap_idx = offset + (seeds[i - offset] % (i - offset));
++            size_t swap_idx = offset + (seeds[i - offset - 1] % (i - offset + 1));
 +            std::swap(permutation[i], permutation[swap_idx]);
 +        }
 +        OPENSSL_free(seeds);
@@ -320,7 +320,7 @@ index 682acbf23..3a37c9bbc 100644
 +// ClientHello serialization. Known ciphers are also retained for negotiation.
 +bool rama_ssl_create_raw_cipher_list(
 +    UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
-+    const uint16_t *cipher_values, int num);
++    const uint16_t *cipher_values, size_t num);
 +
 +const SSLCipherPreferenceList *ssl_get_cipher_preferences(const SSL *ssl);
 +
@@ -451,8 +451,8 @@ index 1ef231c39..0838d52d8 100644
  
 +bool rama_ssl_create_raw_cipher_list(
 +    UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
-+    const uint16_t *cipher_values, int num) {
-+  if (out_cipher_list == nullptr || cipher_values == nullptr || num <= 0) {
++    const uint16_t *cipher_values, size_t num) {
++  if (out_cipher_list == nullptr || cipher_values == nullptr || num == 0) {
 +    OPENSSL_PUT_ERROR(SSL, SSL_R_NO_CIPHER_MATCH);
 +    return false;
 +  }
@@ -469,7 +469,7 @@ index 1ef231c39..0838d52d8 100644
 +    return false;
 +  }
 +
-+  for (int i = 0; i < num; i++) {
++  for (size_t i = 0; i < num; i++) {
 +    const SSL_CIPHER *value = SSL_get_cipher_by_value(cipher_values[i]);
 +    if (value == nullptr) {
 +      continue;
@@ -531,7 +531,7 @@ index a1ba926fd..10d6ed900 100644
  }
  
 +int RAMA_SSL_CTX_set_raw_cipher_list(SSL_CTX *ctx, const uint16_t *values,
-+                                     int num) {
++                                     size_t num) {
 +  return rama_ssl_create_raw_cipher_list(&ctx->cipher_list, values, num);
 +}
 +
@@ -586,7 +586,7 @@ index a1ba926fd..10d6ed900 100644
    ctx->permute_extensions = !!enabled;
  }
  
-+int RAMA_SSL_CTX_set_extension_order(SSL_CTX *ctx, const uint16_t *ids, int ids_len) {
++int RAMA_SSL_CTX_set_extension_order(SSL_CTX *ctx, const uint16_t *ids, size_t ids_len) {
 +  return ctx->rama_ssl_extension_order.CopyFrom(
 +    MakeConstSpan(ids, ids_len));
 +}

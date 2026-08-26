@@ -1,4 +1,5 @@
 use foreign_types::{ForeignType, ForeignTypeRef};
+use proptest::prelude::*;
 use std::io;
 use std::io::prelude::*;
 use std::mem;
@@ -59,6 +60,36 @@ fn capture_client_hello_ciphers(server: &mut server::Builder) -> Arc<Mutex<Vec<V
                 .map(|cipher| u16::from_be_bytes([cipher[0], cipher[1]]))
                 .collect();
             callback_captured.lock().unwrap().push(ciphers);
+            Ok(())
+        });
+    captured
+}
+
+fn parse_client_hello_extension_order(mut extensions: &[u8]) -> Vec<u16> {
+    let mut order = Vec::new();
+    while !extensions.is_empty() {
+        assert!(extensions.len() >= 4, "truncated ClientHello extension");
+        let id = u16::from_be_bytes([extensions[0], extensions[1]]);
+        let len = u16::from_be_bytes([extensions[2], extensions[3]]) as usize;
+        assert!(extensions.len() >= 4 + len, "truncated extension data");
+        order.push(id);
+        extensions = &extensions[4 + len..];
+    }
+    order
+}
+
+fn capture_client_hello_extensions(server: &mut server::Builder) -> Arc<Mutex<Vec<Vec<u16>>>> {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let callback_captured = Arc::clone(&captured);
+    server
+        .ctx()
+        .set_select_certificate_callback(move |client_hello| {
+            callback_captured
+                .lock()
+                .unwrap()
+                .push(parse_client_hello_extension_order(
+                    client_hello.extensions(),
+                ));
             Ok(())
         });
     captured
@@ -470,6 +501,130 @@ fn test_connect_with_set_extension_order_client_ctx() {
         ])
         .unwrap();
     let _ = client.connect();
+}
+
+#[test]
+fn short_extension_order_with_suppressed_alps_is_safe_and_ordered() {
+    let mut server = Server::builder();
+    let captured = capture_client_hello_extensions(&mut server);
+    let server = server.build();
+
+    let mut client = server.client();
+    client.ctx().set_alpn_protos(b"\x08http/1.1").unwrap();
+    client.ctx().set_extension_order(&[16, 17_613]).unwrap();
+    let _ = client.connect();
+
+    let captured = captured.lock().unwrap();
+    let order = captured.first().unwrap();
+    assert_eq!(order.first(), Some(&16));
+    assert!(!order.contains(&17_613));
+}
+
+fn expected_emitted_prefix(requested: &[u16], emitted: &[u16]) -> Vec<u16> {
+    let mut prefix = Vec::new();
+    for id in requested {
+        if emitted.contains(id) && !prefix.contains(id) {
+            prefix.push(*id);
+        }
+    }
+    prefix
+}
+
+// Every extension ID in the patched BoringSSL kExtensions table, in a
+// deliberately scrambled order. Requesting all of them leaves no random
+// tail to shuffle (the rem == 0 early-return path).
+const ALL_KNOWN_EXTENSION_IDS: [u16; 29] = [
+    51, 16, 0, 43, 45, 13, 10, 35, 23, 5, 11, 18, 14, 42, 44, 57, 27, 28, 34, 17_613, 17_513, 47,
+    13_172, 30_032, 65_037, 65_281, 65_445, 35_387, 51_764,
+];
+
+#[test]
+fn complete_extension_order_is_emitted_verbatim() {
+    let mut server = Server::builder();
+    let captured = capture_client_hello_extensions(&mut server);
+    let server = server.build();
+
+    let mut client = server.client();
+    client.ctx().set_alpn_protos(b"\x02h2").unwrap();
+    client
+        .ctx()
+        .set_extension_order(&ALL_KNOWN_EXTENSION_IDS)
+        .unwrap();
+    let _ = client.connect();
+
+    let captured = captured.lock().unwrap();
+    let emitted = captured.first().unwrap();
+    let expected = expected_emitted_prefix(&ALL_KNOWN_EXTENSION_IDS, emitted);
+    assert_eq!(
+        emitted, &expected,
+        "a complete requested order must determine the entire emitted order"
+    );
+}
+
+#[test]
+fn nearly_complete_extension_order_is_an_emitted_prefix() {
+    // All but one known ID, so exactly one table entry is left over
+    // (the rem == 1 path: a random tail exists but is never shuffled).
+    let requested: Vec<u16> = ALL_KNOWN_EXTENSION_IDS
+        .iter()
+        .copied()
+        .filter(|id| *id != 51)
+        .collect();
+
+    let mut server = Server::builder();
+    let captured = capture_client_hello_extensions(&mut server);
+    let server = server.build();
+
+    let mut client = server.client();
+    client.ctx().set_alpn_protos(b"\x02h2").unwrap();
+    client.ctx().set_extension_order(&requested).unwrap();
+    let _ = client.connect();
+
+    let captured = captured.lock().unwrap();
+    let emitted = captured.first().unwrap();
+    let expected = expected_emitted_prefix(&requested, emitted);
+    assert!(
+        emitted.starts_with(&expected),
+        "requested {expected:?}, emitted {emitted:?}"
+    );
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(64))]
+
+    #[test]
+    fn requested_extension_order_is_an_emitted_prefix(
+        requested in prop::collection::vec(
+            prop_oneof![
+                Just(0_u16),
+                Just(10_u16),
+                Just(13_u16),
+                Just(16_u16),
+                Just(43_u16),
+                Just(45_u16),
+                Just(51_u16),
+                Just(17_513_u16),
+                Just(17_613_u16),
+                any::<u16>(),
+            ],
+            1..64,
+        ),
+    ) {
+        let mut server = Server::builder();
+        let captured = capture_client_hello_extensions(&mut server);
+        let server = server.build();
+
+        let mut client = server.client();
+        client.ctx().set_alpn_protos(b"\x02h2").unwrap();
+        client.ctx().set_extension_order(&requested).unwrap();
+        let _ = client.connect();
+
+        let captured = captured.lock().unwrap();
+        let emitted = captured.first().unwrap();
+        let expected_prefix = expected_emitted_prefix(&requested, emitted);
+        prop_assert!(emitted.starts_with(&expected_prefix),
+            "requested {expected_prefix:?}, emitted {emitted:?}");
+    }
 }
 
 #[test]

@@ -507,6 +507,7 @@ mod tests {
         Arc,
     };
     use std::task::{Wake, Waker};
+    use tokio::io::AsyncReadExt;
 
     struct CountingWake(AtomicUsize);
 
@@ -538,5 +539,41 @@ mod tests {
 
         assert_eq!(Arc::strong_count(&wake), expected_count);
         drop(error);
+    }
+
+    #[tokio::test]
+    async fn pending_handshake_then_closed_peer_is_safe() {
+        for iteration in 0..256 {
+            for alps in [false, true] {
+                let mut connector =
+                    SslConnector::no_default_verify_builder(SslMethod::tls()).unwrap();
+                connector.set_extension_order(&[16, 17_613]).unwrap();
+                let mut config = connector.build().configure().unwrap();
+                config.set_alps_use_new_codepoint(true);
+                if alps {
+                    config.set_alpn_protos(b"\x02h2").unwrap();
+                    config.add_application_settings(b"h2").unwrap();
+                } else {
+                    config.set_alpn_protos(b"\x08http/1.1").unwrap();
+                }
+
+                let (stream, mut peer) = tokio::io::duplex(64 * 1024);
+                let connect = tokio::spawn(connect(config, None, stream));
+
+                let mut first_byte = [0];
+                peer.read_exact(&mut first_byte).await.unwrap();
+                drop(peer);
+
+                let error = connect
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "iteration {iteration}, alps {alps}: handshake task panicked: {error}"
+                        )
+                    })
+                    .unwrap_err();
+                drop(error);
+            }
+        }
     }
 }
