@@ -21,12 +21,21 @@ pub enum EncryptionLevel {
 }
 
 impl EncryptionLevel {
+    fn as_raw(self) -> ffi::ssl_encryption_level_t {
+        match self {
+            Self::Initial => ffi::ssl_encryption_level_t::ssl_encryption_initial,
+            Self::EarlyData => ffi::ssl_encryption_level_t::ssl_encryption_early_data,
+            Self::Handshake => ffi::ssl_encryption_level_t::ssl_encryption_handshake,
+            Self::Application => ffi::ssl_encryption_level_t::ssl_encryption_application,
+        }
+    }
+
     fn from_raw(level: ffi::ssl_encryption_level_t) -> Self {
-        match level.0 {
-            0 => Self::Initial,
-            1 => Self::EarlyData,
-            2 => Self::Handshake,
-            3 => Self::Application,
+        match level {
+            ffi::ssl_encryption_level_t::ssl_encryption_initial => Self::Initial,
+            ffi::ssl_encryption_level_t::ssl_encryption_early_data => Self::EarlyData,
+            ffi::ssl_encryption_level_t::ssl_encryption_handshake => Self::Handshake,
+            ffi::ssl_encryption_level_t::ssl_encryption_application => Self::Application,
             _ => unreachable!("BoringSSL supplied an unknown encryption level"),
         }
     }
@@ -211,12 +220,7 @@ impl QuicConnection {
     }
 
     pub fn max_handshake_flight_len(&self, level: EncryptionLevel) -> usize {
-        unsafe {
-            ffi::SSL_quic_max_handshake_flight_len(
-                self.ssl.as_ptr(),
-                ffi::ssl_encryption_level_t(level as u32),
-            )
-        }
+        unsafe { ffi::SSL_quic_max_handshake_flight_len(self.ssl.as_ptr(), level.as_raw()) }
     }
 
     pub fn provide_data(&mut self, level: EncryptionLevel, data: &[u8]) -> Result<(), QuicError> {
@@ -227,12 +231,7 @@ impl QuicConnection {
             ffi::ERR_clear_error();
         }
         let ret = unsafe {
-            ffi::SSL_provide_quic_data(
-                self.ssl.as_ptr(),
-                ffi::ssl_encryption_level_t(level as u32),
-                data.as_ptr(),
-                data.len(),
-            )
+            ffi::SSL_provide_quic_data(self.ssl.as_ptr(), level.as_raw(), data.as_ptr(), data.len())
         };
         self.check_boolean_result(ret)
     }
