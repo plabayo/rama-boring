@@ -3652,6 +3652,17 @@ impl SslRef {
         label: &str,
         context: Option<&[u8]>,
     ) -> Result<(), ErrorStack> {
+        self.export_keying_material_bytes(out, label.as_bytes(), context)
+    }
+
+    /// Derive application keying material with a byte-oriented exporter label.
+    #[corresponds(SSL_export_keying_material)]
+    pub fn export_keying_material_bytes(
+        &self,
+        out: &mut [u8],
+        label: &[u8],
+        context: Option<&[u8]>,
+    ) -> Result<(), ErrorStack> {
         unsafe {
             let (context, contextlen, use_context) = match context {
                 Some(context) => (context.as_ptr(), context.len(), 1),

@@ -213,9 +213,23 @@ fn fragmented_handshake_and_resumption_deliver_directional_secrets() {
             .unwrap();
         server
             .ssl()
-            .export_keying_material(&mut b, "test", Some(b"context"))
+            .export_keying_material_bytes(&mut b, b"test", Some(b"context"))
             .unwrap();
         assert_eq!(a, b);
+        client
+            .ssl()
+            .export_keying_material_bytes(&mut a, &[b't', 0, 0xff], Some(b"context"))
+            .unwrap();
+        server
+            .ssl()
+            .export_keying_material_bytes(&mut b, &[b't', 0, 0xff], Some(b"context"))
+            .unwrap();
+        assert_eq!(a, b);
+        server
+            .ssl()
+            .export_keying_material_bytes(&mut b, &[b't', 0, 0xfe], Some(b"context"))
+            .unwrap();
+        assert_ne!(a, b);
     }
 }
 
