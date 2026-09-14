@@ -557,13 +557,8 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
     println!("cargo:info=applying post quantum crypto patch to boringssl");
     apply_patch(config, "rama_boring_pq.patch")?;
 
-    // disable fuzz/test/bench code (can give issues in some build configs)
-    println!("cargo:info=applying boringssl cmake cleanup patch");
+    apply_patch(config, "rama_symbols.patch")?;
     apply_patch(config, "rama_boringssl_cmake.patch")?;
-
-    // BoringSSL's `verify_boringssl_prefix` audit otherwise requires Go at
-    // cmake configure time whenever BORINGSSL_PREFIX is set.
-    println!("cargo:info=applying boringssl prefix patch (drop Go-dependent audit)");
     apply_patch(config, "rama_boring_prefix.patch")?;
 
     Ok(())

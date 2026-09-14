@@ -99,9 +99,13 @@ impl X509StoreBuilderRef {
     /// Sets certificate chain validation related flags.
     #[corresponds(X509_STORE_set_flags)]
     pub fn set_flags(&mut self, flags: X509VerifyFlags) {
-        unsafe {
-            cvt(ffi::X509_STORE_set_flags(self.as_ptr(), flags.bits())).unwrap();
-        }
+        self.try_set_flags(flags).expect("use try_set_flags");
+    }
+
+    /// Sets certificate verification flags without panicking on native failure.
+    #[corresponds(X509_STORE_set_flags)]
+    pub fn try_set_flags(&mut self, flags: X509VerifyFlags) -> Result<(), ErrorStack> {
+        unsafe { cvt(ffi::X509_STORE_set_flags(self.as_ptr(), flags.bits())) }
     }
 
     /// Returns a mutable reference to the X509 verification configuration.

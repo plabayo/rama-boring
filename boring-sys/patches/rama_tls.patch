@@ -1,11 +1,13 @@
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 7d9499dbc..96634160a 100644
+index 3b48c2a08..46a6094c6 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
-@@ -1682,6 +1682,15 @@ OPENSSL_EXPORT int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx,
+@@ -1739,8 +1739,17 @@ OPENSSL_EXPORT int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx,
  // garbage inputs, unless an empty cipher list results.
  OPENSSL_EXPORT int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str);
  
+-// SSL_set_strict_cipher_list configures the cipher list for `ssl`, evaluating
+-// `str` as a cipher string and returning error if `str` contains anything
 +// RAMA_SSL_CTX_set_raw_cipher_list configures the exact cipher suite vector
 +// sent by clients created from |ctx|. The list is not filtered by protocol
 +// version, authentication requirements, or local support. Unknown values and
@@ -15,10 +17,12 @@ index 7d9499dbc..96634160a 100644
 +OPENSSL_EXPORT int RAMA_SSL_CTX_set_raw_cipher_list(
 +    SSL_CTX *ctx, const uint16_t *values, size_t num);
 +
- // SSL_set_strict_cipher_list configures the cipher list for |ssl|, evaluating
- // |str| as a cipher string and returning error if |str| contains anything
++// SSL_set_strict_cipher_list configures the cipher list for |ssl|, evaluating
++// |str| as a cipher string and returning error if |str| contains anything
  // meaningless. It returns one on success and zero on failure.
-@@ -3364,6 +3368,8 @@ OPENSSL_EXPORT int SSL_CTX_add_cert_compression_alg(
+ OPENSSL_EXPORT int SSL_set_strict_cipher_list(SSL *ssl, const char *str);
+ 
+@@ -3601,6 +3610,8 @@ OPENSSL_EXPORT int SSL_CTX_add_cert_compression_alg(
      SSL_CTX *ctx, uint16_t alg_id, ssl_cert_compression_func_t compress,
      ssl_cert_decompression_func_t decompress);
  
@@ -27,7 +31,7 @@ index 7d9499dbc..96634160a 100644
  
  // Next protocol negotiation.
  //
-@@ -3785,6 +3791,10 @@ OPENSSL_EXPORT SSL_CREDENTIAL *SSL_CREDENTIAL_new_spake2plusv1_server(
+@@ -4200,6 +4211,10 @@ OPENSSL_EXPORT SSL_CREDENTIAL *SSL_CREDENTIAL_new_spake2plusv1_server(
      size_t w0_len, const uint8_t *registration_record,
      size_t registration_record_len);
  
@@ -38,24 +42,26 @@ index 7d9499dbc..96634160a 100644
  
  // QUIC integration.
  //
-@@ -5143,6 +5153,12 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_enabled(SSL_CTX *ctx, int enabled);
+@@ -5565,7 +5580,13 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
  
+-// SSL_set_permute_extensions configures whether sockets on `ssl` should
 +// RAMA_SSL_CTX_set_extension_order configures whether sockets on |ctx|
 +// should make use of the provided extensions to define the order,
 +// which is similar to SSL_CTX_set_permute_extensions but in a defined
 +// order instead of a random one.
 +OPENSSL_EXPORT int RAMA_SSL_CTX_set_extension_order(SSL_CTX *ctx, const uint16_t *ids, size_t num);
 +
- // SSL_set_permute_extensions configures whether sockets on |ssl| should
++// SSL_set_permute_extensions configures whether sockets on |ssl| should
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
+ 
 diff --git a/include/openssl/tls1.h b/include/openssl/tls1.h
-index 696ccfd4a..b4ec98209 100644
+index f4b348481..30cf14375 100644
 --- a/include/openssl/tls1.h
 +++ b/include/openssl/tls1.h
-@@ -89,6 +89,9 @@ extern "C" {
+@@ -93,6 +93,9 @@ extern "C" {
  // ExtensionType value from RFC 8879
  #define TLSEXT_TYPE_cert_compression 27
  
@@ -65,7 +71,7 @@ index 696ccfd4a..b4ec98209 100644
  // ExtensionType value from RFC 4507
  #define TLSEXT_TYPE_session_ticket 35
  
-@@ -166,6 +169,7 @@ extern "C" {
+@@ -174,6 +177,7 @@ extern "C" {
  // From https://www.rfc-editor.org/rfc/rfc8879.html#section-3
  #define TLSEXT_cert_compression_zlib 1
  #define TLSEXT_cert_compression_brotli 2
@@ -74,10 +80,10 @@ index 696ccfd4a..b4ec98209 100644
  #define TLSEXT_MAXLEN_host_name 255
  
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
-index daf643572..3f8a6003f 100644
+index 90238d912..2c3f3ad34 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
-@@ -2945,7 +2945,33 @@ static bool ext_quic_transport_params_add_serverhello_legacy(SSL_HANDSHAKE *hs,
+@@ -3303,6 +3303,32 @@ static bool ext_quic_transport_params_add_serverhello_legacy(SSL_HANDSHAKE *hs,
  static bool ext_delegated_credential_add_clienthello(
      const SSL_HANDSHAKE *hs, CBB *out, CBB *out_compressible,
      ssl_client_hello_type_t type) {
@@ -110,8 +116,7 @@ index daf643572..3f8a6003f 100644
    return true;
  }
  
- static bool ext_delegated_credential_parse_clienthello(SSL_HANDSHAKE *hs,
-@@ -2970,6 +2996,30 @@ static bool ext_delegated_credential_parse_clienthello(SSL_HANDSHAKE *hs,
+@@ -3328,6 +3354,30 @@ static bool ext_delegated_credential_parse_clienthello(SSL_HANDSHAKE *hs,
    return true;
  }
  
@@ -142,7 +147,7 @@ index daf643572..3f8a6003f 100644
  // Certificate compression
  
  static bool cert_compression_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
-@@ -3659,6 +3709,13 @@ static const struct tls_extension kExtensions[] = {
+@@ -4260,6 +4310,13 @@ static const struct tls_extension kExtensions[] = {
          cert_compression_parse_clienthello,
          cert_compression_add_serverhello,
      },
@@ -156,12 +161,12 @@ index daf643572..3f8a6003f 100644
      {
          TLSEXT_TYPE_delegated_credential,
          ext_delegated_credential_add_clienthello,
-@@ -3716,6 +3773,74 @@ static_assert(kNumExtensions <=
+@@ -4342,6 +4399,74 @@ static_assert(kNumExtensions <=
                    sizeof(((SSL_HANDSHAKE *)nullptr)->extensions.received) * 8,
                "too many extensions for received bitset");
  
 +bool rama_ssl_setup_extension_order(SSL_HANDSHAKE *hs) {
-+    SSL *const ssl = hs->ssl;
++    SSLImpl *const ssl = hs->ssl;
 +    if (ssl->ctx->rama_ssl_extension_order.empty()) {
 +        return ssl_setup_extension_permutation(hs);
 +    }
@@ -232,11 +237,10 @@ index daf643572..3f8a6003f 100644
    if (!hs->config->permute_extensions) {
      return true;
 diff --git a/ssl/handoff.cc b/ssl/handoff.cc
-index 9f56ca5c4..e44c3b265 100644
+index c8d989796..618bc2d78 100644
 --- a/ssl/handoff.cc
 +++ b/ssl/handoff.cc
-@@ -165,9 +165,11 @@ bool SSL_apply_handoff(SSL *ssl, Span<const uint8_t> handoff) {
-       return false;
+@@ -169,7 +169,9 @@ static bool apply_remote_features(SSLImpl *ssl, CBS *in) {
      }
    }
    for (const SSL_CIPHER *unsupported_cipher : unsupported.get()) {
@@ -247,9 +251,8 @@ index 9f56ca5c4..e44c3b265 100644
    }
    if (sk_SSL_CIPHER_num(SSL_get_ciphers(ssl)) == 0) {
      return false;
-   }
 diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
-index 901040c2a..9493332fb 100644
+index a4a53cda6..f0166914f 100644
 --- a/ssl/handshake_client.cc
 +++ b/ssl/handshake_client.cc
 @@ -108,6 +108,26 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
@@ -279,24 +282,20 @@ index 901040c2a..9493332fb 100644
    // Add TLS 1.3 ciphers. Order ChaCha20-Poly1305 relative to AES-GCM based on
    // hardware support.
    if (hs->max_version >= TLS1_3_VERSION) {
-@@ -419,7 +429,7 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
-   }
- 
-   if (!ssl_setup_key_shares(hs, /*override_group_id=*/0) ||
+@@ -444,7 +464,7 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
+   ssl_setup_client_certificate_type(hs);
+   if (!ssl_setup_pre_shared_keys(hs) ||  //
+       !ssl_setup_key_shares(hs, /*override_group_id=*/0) ||
 -      !ssl_setup_extension_permutation(hs) ||
 +      !rama_ssl_setup_extension_order(hs) ||
        !ssl_encrypt_client_hello(hs, Span(ech_enc, ech_enc_len)) ||
        !ssl_add_client_hello(hs)) {
      return ssl_hs_error;
 diff --git a/ssl/internal.h b/ssl/internal.h
-index 682acbf23..3a37c9bbc 100644
+index 96f6d3d3d..6b313687f 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
-@@ -287,14 +287,18 @@ struct SSLCipherPreferenceList {
-   SSLCipherPreferenceList() = default;
-   ~SSLCipherPreferenceList();
- 
-   bool Init(UniquePtr<STACK_OF(SSL_CIPHER)> ciphers,
+@@ -297,10 +297,14 @@ struct SSLCipherPreferenceList {
              Span<const bool> in_group_flags);
    bool Init(const SSLCipherPreferenceList &);
  
@@ -312,24 +311,30 @@ index 682acbf23..3a37c9bbc 100644
  };
  
  // AllCiphers returns an array of all supported ciphers, sorted by id.
-@@ -325,6 +325,14 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
+@@ -331,9 +335,17 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
                              const bool has_aes_hw, const char *rule_str,
                              bool strict);
  
+-// ssl_cipher_auth_mask_for_key returns the mask of cipher `algorithm_auth`
+-// values suitable for use with `key` in TLS 1.2 and below. `sign_ok` indicates
+-// whether `key` may be used for signing.
 +// Creates a cipher preference whose raw values are the source of truth for
 +// ClientHello serialization. Known ciphers are also retained for negotiation.
 +bool rama_ssl_create_raw_cipher_list(
 +    UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
 +    const uint16_t *cipher_values, size_t num);
 +
-+const SSLCipherPreferenceList *ssl_get_cipher_preferences(const SSL *ssl);
++const SSLCipherPreferenceList *ssl_get_cipher_preferences(const SSLImpl *ssl);
 +
- // ssl_cipher_auth_mask_for_key returns the mask of cipher |algorithm_auth|
- // values suitable for use with |key| in TLS 1.2 and below. |sign_ok| indicates
- // whether |key| may be used for signing.
-@@ -2077,6 +2086,11 @@ bool tls13_add_finished(SSL_HANDSHAKE *hs);
- bool tls13_process_new_session_ticket(SSL *ssl, const SSLMessage &msg);
- UniquePtr<SSL_SESSION> tls13_create_session_with_ticket(SSL *ssl, CBS *body);
++// ssl_cipher_auth_mask_for_key returns the mask of cipher |algorithm_auth|
++// values suitable for use with |key| in TLS 1.2 and below. |sign_ok| indicates
++// whether |key| may be used for signing.
+ uint32_t ssl_cipher_auth_mask_for_key(const EVP_PKEY *key, bool sign_ok);
+ 
+ // ssl_cipher_uses_certificate_auth returns whether `cipher` authenticates the
+@@ -2234,6 +2246,11 @@ bool tls13_process_new_session_ticket(SSLImpl *ssl, const SSLMessage &msg);
+ UniquePtr<SSL_SESSION> tls13_create_session_with_ticket(SSLImpl *ssl,
+                                                         CBS *body);
  
 +// rama_ssl_setup_extension_order uses the extension order as
 +// defined by the provided extension order, or falls back
@@ -337,13 +342,12 @@ index 682acbf23..3a37c9bbc 100644
 +bool rama_ssl_setup_extension_order(SSL_HANDSHAKE *hs);
 +
  // ssl_setup_extension_permutation computes a ClientHello extension permutation
- // for |hs|, if applicable. It returns true on success and false on error.
+ // for `hs`, if applicable. It returns true on success and false on error.
  bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs);
-@@ -3346,6 +3360,12 @@ struct SSL_CONFIG {
-   // alps_use_new_codepoint if set indicates we use new ALPS extension codepoint
-   // to negotiate and convey application settings.
-   bool alps_use_new_codepoint : 1;
-+
+@@ -3596,6 +3613,11 @@ struct SSL_CONFIG {
+   // server_padding_enabled is true iff the server is willing to send additional
+   // padding to clients that request it through the server padding extension.
+   bool server_padding_enabled : 1;
 +  // Value that will be used for record size extension
 +  uint16_t record_size_limit = 0;
 +
@@ -352,10 +356,7 @@ index 682acbf23..3a37c9bbc 100644
  };
  
  // From RFC 8446, used in determining PSK modes.
-@@ -3952,9 +3972,13 @@ struct ssl_ctx_st : public bssl::RefCounted<ssl_ctx_st> {
-   // grease_enabled is whether GREASE (RFC 8701) is enabled.
-   bool grease_enabled : 1;
- 
+@@ -4232,6 +4254,10 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
    // permute_extensions is whether to permute extensions when sending messages.
    bool permute_extensions : 1;
  
@@ -367,7 +368,7 @@ index 682acbf23..3a37c9bbc 100644
    // protocols from the peer.
    bool allow_unknown_alpn_protos : 1;
 diff --git a/ssl/ssl_cipher.cc b/ssl/ssl_cipher.cc
-index 1ef231c39..0838d52d8 100644
+index 7799d79f9..4bb8f4d4a 100644
 --- a/ssl/ssl_cipher.cc
 +++ b/ssl/ssl_cipher.cc
 @@ -622,10 +622,15 @@ bool SSLCipherPreferenceList::Init(UniquePtr<STACK_OF(SSL_CIPHER)> ciphers_arg,
@@ -386,7 +387,7 @@ index 1ef231c39..0838d52d8 100644
    size_t size = sk_SSL_CIPHER_num(other.ciphers.get());
    Span<const bool> other_flags(other.in_group_flags, size);
    UniquePtr<STACK_OF(SSL_CIPHER)> other_ciphers(
-@@ -634,13 +639,46 @@ bool SSLCipherPreferenceList::Init(const SSLCipherPreferenceList &other) {
+@@ -633,13 +638,46 @@ bool SSLCipherPreferenceList::Init(const SSLCipherPreferenceList &other) {
    if (!other_ciphers) {
      return false;
    }
@@ -436,7 +437,7 @@ index 1ef231c39..0838d52d8 100644
    }
    if (!in_group_flags[index] /* last element of group */ && index > 0) {
      in_group_flags[index - 1] = false;
-@@ -650,6 +691,8 @@ void SSLCipherPreferenceList::Remove(const SSL_CIPHER *cipher) {
+@@ -648,6 +686,8 @@ void SSLCipherPreferenceList::Remove(const SSL_CIPHER *cipher) {
      in_group_flags[i] = in_group_flags[i + 1];
    }
    sk_SSL_CIPHER_delete(ciphers.get(), index);
@@ -445,7 +446,7 @@ index 1ef231c39..0838d52d8 100644
  }
  
  bool ssl_cipher_is_deprecated(const SSL_CIPHER *cipher) {
-@@ -1139,6 +1182,52 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
+@@ -1148,6 +1188,52 @@ bool ssl_create_cipher_list(UniquePtr<SSLCipherPreferenceList> *out_cipher_list,
    return true;
  }
  
@@ -499,14 +500,14 @@ index 1ef231c39..0838d52d8 100644
    switch (EVP_PKEY_id(key)) {
      case EVP_PKEY_RSA:
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index a1ba926fd..10d6ed900 100644
+index a0c746b38..1113f1a91 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
-@@ -358,6 +358,12 @@ void SSL_set_aes_hw_override_for_testing(SSL *ssl, bool override_value) {
-   ssl->config->aes_hw_override_value = override_value;
+@@ -364,6 +364,12 @@ void SSL_set_aes_hw_override_for_testing(SSL *ssl, bool override_value) {
+   ssl_impl->config->aes_hw_override_value = override_value;
  }
  
-+const SSLCipherPreferenceList *ssl_get_cipher_preferences(const SSL *ssl) {
++const SSLCipherPreferenceList *ssl_get_cipher_preferences(const SSLImpl *ssl) {
 +  assert(ssl->config);
 +  return ssl->config->cipher_list ? ssl->config->cipher_list.get()
 +                                  : ssl->ctx->cipher_list.get();
@@ -515,34 +516,36 @@ index a1ba926fd..10d6ed900 100644
  BSSL_NAMESPACE_END
  
  using namespace bssl;
-@@ -2105,8 +2110,8 @@ STACK_OF(SSL_CIPHER) *SSL_get_ciphers(const SSL *ssl) {
+@@ -2184,9 +2190,8 @@ STACK_OF(SSL_CIPHER) *SSL_get_ciphers(const SSL *ssl) {
      return nullptr;
    }
  
--  return ssl->config->cipher_list ? ssl->config->cipher_list->ciphers.get()
--                                  : ssl->ctx->cipher_list->ciphers.get();
-+  const SSLCipherPreferenceList *preferences = ssl_get_cipher_preferences(ssl);
+-  return ssl_impl->config->cipher_list
+-             ? ssl_impl->config->cipher_list->ciphers.get()
+-             : ssl_impl->ctx->cipher_list->ciphers.get();
++  const SSLCipherPreferenceList *preferences = ssl_get_cipher_preferences(ssl_impl);
 +  return preferences->ciphers.get();
  }
  
  const char *SSL_get_cipher_list(const SSL *ssl, int n) {
-@@ -2134,6 +2139,11 @@ int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str) {
+@@ -2216,6 +2221,11 @@ int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str) {
                                  false /* not strict */);
  }
  
 +int RAMA_SSL_CTX_set_raw_cipher_list(SSL_CTX *ctx, const uint16_t *values,
 +                                     size_t num) {
-+  return rama_ssl_create_raw_cipher_list(&ctx->cipher_list, values, num);
++  return rama_ssl_create_raw_cipher_list(&FromOpaque(ctx)->cipher_list, values, num);
 +}
 +
  int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx, const char *str) {
-   const bool has_aes_hw = ctx->aes_hw_override ? ctx->aes_hw_override_value
-                                                : EVP_has_aes_hardware();
-@@ -2293,6 +2303,43 @@ void SSL_set_alps_use_new_codepoint(SSL *ssl, int use_new) {
-   ssl->config->alps_use_new_codepoint = !!use_new;
+   auto *ctx_impl = FromOpaque(ctx);
+   const bool has_aes_hw = ctx_impl->aes_hw_override
+@@ -2541,6 +2551,45 @@ void SSL_set_alps_use_new_codepoint(SSL *ssl, int use_new) {
+   ssl_impl->config->alps_use_new_codepoint = !!use_new;
  }
  
-+int SSL_set_record_size_limit(SSL *ssl, uint16_t limit) {
++int SSL_set_record_size_limit(SSL *ssl_opaque, uint16_t limit) {
++  auto *ssl = FromOpaque(ssl_opaque);
 +  if (!ssl->config) {
 +    return 0;
 +  }
@@ -569,8 +572,9 @@ index a1ba926fd..10d6ed900 100644
 +  return 1;
 +}
 +
-+int SSL_set_delegated_credential_schemes(SSL *ssl, const uint16_t *schemes,
++int SSL_set_delegated_credential_schemes(SSL *ssl_opaque, const uint16_t *schemes,
 +  size_t schemes_len) {
++  auto *ssl = FromOpaque(ssl_opaque);
 +  if (!ssl->config) {
 +    return 0;
 +  }
@@ -582,23 +586,26 @@ index a1ba926fd..10d6ed900 100644
  int SSL_CTX_add_cert_compression_alg(SSL_CTX *ctx, uint16_t alg_id,
                                       ssl_cert_compression_func_t compress,
                                       ssl_cert_decompression_func_t decompress) {
-@@ -2995,6 +3041,11 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
-   ctx->permute_extensions = !!enabled;
+@@ -3284,6 +3333,11 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
+   FromOpaque(ctx)->permute_extensions = !!enabled;
  }
  
 +int RAMA_SSL_CTX_set_extension_order(SSL_CTX *ctx, const uint16_t *ids, size_t ids_len) {
-+  return ctx->rama_ssl_extension_order.CopyFrom(
++  return FromOpaque(ctx)->rama_ssl_extension_order.CopyFrom(
 +    MakeConstSpan(ids, ids_len));
 +}
 +
  void SSL_set_permute_extensions(SSL *ssl, int enabled) {
-   if (!ssl->config) {
-     return;
+   auto *ssl_impl = FromOpaque(ssl);
+   if (!ssl_impl->config) {
 diff --git a/ssl/tls13_client.cc b/ssl/tls13_client.cc
-index bc653e960..999109a4e 100644
+index f134ebb57..403c69656 100644
 --- a/ssl/tls13_client.cc
 +++ b/ssl/tls13_client.cc
-@@ -207,9 +207,17 @@ static enum ssl_hs_wait_t do_read_hello_retry_request(SSL_HANDSHAKE *hs) {
+@@ -204,11 +204,19 @@ static enum ssl_hs_wait_t do_read_hello_retry_request(SSL_HANDSHAKE *hs) {
+     return ssl_hs_error;
+   }
+ 
 -  // The cipher suite must be one we offered. We currently offer all supported
 -  // TLS 1.3 ciphers unless policy controls limited it. So we check the version
 -  // and that it's ok per policy.
@@ -619,4 +626,3 @@ index bc653e960..999109a4e 100644
        SSL_CIPHER_get_min_version(cipher) > ssl_protocol_version(ssl) ||
        SSL_CIPHER_get_max_version(cipher) < ssl_protocol_version(ssl) ||
        !ssl_tls13_cipher_meets_policy(SSL_CIPHER_get_protocol_id(cipher),
-                                      ssl->config->compliance_policy)) {

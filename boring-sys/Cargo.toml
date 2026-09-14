@@ -43,6 +43,7 @@ include = [
     "/deps/boringssl/cmake/*.cmake",
     "/deps/boringssl/**/CMakeLists.txt",
     "/deps/boringssl/**/sources.cmake",
+    "/deps/boringssl/gen/sources.*",
     "/deps/boringssl/build.json",
     "/deps/boringssl/LICENSE",
     "/build/*",

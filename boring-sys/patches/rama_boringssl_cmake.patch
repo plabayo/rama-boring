@@ -1,8 +1,7 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 2296a0e41..bb16496d6 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -35,28 +35,10 @@ include(gen/sources.cmake)
+@@ -29,27 +29,10 @@
  enable_language(C)
  enable_language(CXX)
  
@@ -27,11 +26,10 @@ index 2296a0e41..bb16496d6 100644
 -    message("pkgconfig not found. Disabling unwind tests.")
 -  endif()
 -endif()
--
+ 
  string(TOLOWER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_LOWER)
  if(NOT FIPS)
-   if(CMAKE_BUILD_TYPE_LOWER STREQUAL "relwithassert" OR
-@@ -135,22 +117,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+@@ -129,21 +112,6 @@
    set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -D_XOPEN_SOURCE=700")
  endif()
  
@@ -50,11 +48,10 @@ index 2296a0e41..bb16496d6 100644
 -  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -fsanitize=address,fuzzer-no-link -fsanitize-coverage=edge,indirect-calls")
 -  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address,fuzzer-no-link -fsanitize-coverage=edge,indirect-calls")
 -endif()
--
+ 
  if(BUILD_SHARED_LIBS)
    add_definitions(-DBORINGSSL_SHARED_LIBRARY)
-   # Enable position-independent code globally. This is needed because
-@@ -377,59 +343,6 @@ if(USE_CUSTOM_LIBCXX)
+@@ -371,58 +339,7 @@
           FILE ${PROJECT_BINARY_DIR}/bssl_test_only.cmake)
  endif()
  
@@ -110,11 +107,11 @@ index 2296a0e41..bb16496d6 100644
 -    COMPILE_FLAGS "-fsanitize-coverage=0"
 -  )
 -endif()
--
++
+ 
  # Enable a suite of warnings. We do this here to avoid applying to external
  # dependencies, built above. Note this uses the list-based add_compile_options,
- # instead of CMAKE_*_FLAGS (string-based). Changes to CMAKE_*_FLAGS still apply
-@@ -702,77 +615,9 @@ if(MSVC)
+@@ -699,80 +616,12 @@
      "$<$<COMPILE_LANGUAGE:C,CXX>:${PKI_MSVC_DISABLED_WARNINGS_LIST}>")
  endif()
  
@@ -152,6 +149,7 @@ index 2296a0e41..bb16496d6 100644
 -  add_executable(ssl_test ${SSL_TEST_SOURCES})
 -  target_link_libraries(ssl_test test_support_lib boringssl_gtest ssl crypto)
 -  add_dependencies(boringssl_all_tests ssl_test)
+-
 -  add_executable(decrepit_test ${DECREPIT_TEST_SOURCES})
 -  target_link_libraries(decrepit_test test_support_lib boringssl_gtest
 -                        decrepit ssl crypto)
@@ -168,10 +166,8 @@ index 2296a0e41..bb16496d6 100644
 -  add_executable(jitter_deltas util/fipstools/entropy/jitter_deltas.cc)
 -  target_link_libraries(jitter_deltas crypto)
 -
--  if(BUILD_TESTING)
--    add_executable(bssl_bench ${BENCH_SOURCES})
--    target_link_libraries(bssl_bench ssl pki crypto benchmark::benchmark)
--  endif()
+-  add_executable(bssl_bench ${BENCH_SOURCES})
+-  target_link_libraries(bssl_bench ssl pki crypto benchmark::benchmark)
 -endif()
 -
 -if(FIPS)
@@ -180,19 +176,25 @@ index 2296a0e41..bb16496d6 100644
 -  add_executable(entropy_modulewrapper ${ENTROPY_MODULEWRAPPER_SOURCES})
 -  target_link_libraries(entropy_modulewrapper crypto)
 -endif()
--
++
+ 
  add_executable(bssl ${BSSL_SOURCES})
  target_link_libraries(bssl ssl crypto)
  
+-if(BUILD_TESTING)
+-  add_executable(generate_mldsa_certs pki/testdata/verify_unittest/generate_mldsa_certs.cc)
+-  target_link_libraries(generate_mldsa_certs crypto)
+-endif()
+-
 -if(FUZZ)
 -  # TODO(crbug.com/42290412): Drive this build with build.json and flatten.
 -  add_subdirectory(fuzz)
 -endif()
--
++
+ 
  if(RUST_BINDINGS)
    find_program(BINDGEN_EXECUTABLE bindgen REQUIRED)
-   add_subdirectory(rust)
-@@ -782,68 +627,6 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+@@ -783,80 +632,6 @@
    set(HANDSHAKER_ARGS "-handshaker-path" $<TARGET_FILE:handshaker>)
  endif()
  
@@ -234,22 +236,35 @@ index 2296a0e41..bb16496d6 100644
 -  if(PROJECT_IS_TOP_LEVEL AND NOT CMAKE_GENERATOR MATCHES "^Visual Studio ")
 -    if(GO_EXECUTABLE)
 -      add_custom_target(
--          run_tests
+-          run_unit_tests
+-          COMMAND ${CMAKE_COMMAND} -E echo
+-          COMMAND ${CMAKE_COMMAND} -E echo "Checking pregenerated files"
+-          COMMAND ${GO_EXECUTABLE} run ./util/pregenerate -check
+-          COMMAND ${CMAKE_COMMAND} -E echo
 -          COMMAND ${CMAKE_COMMAND} -E echo "Running Go tests"
 -          COMMAND ${GO_EXECUTABLE} test ${GO_TESTS}
 -          COMMAND ${CMAKE_COMMAND} -E echo
 -          COMMAND ${CMAKE_COMMAND} -E echo "Running unit tests"
 -          COMMAND ${GO_EXECUTABLE} run util/all_tests.go -build-dir
 -                  ${CMAKE_CURRENT_BINARY_DIR}
+-          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+-          DEPENDS boringssl_all_tests fips_specific_tests_if_any
+-          USES_TERMINAL)
+-      add_custom_target(
+-          run_tests
 -          COMMAND ${CMAKE_COMMAND} -E echo
 -          COMMAND ${CMAKE_COMMAND} -E echo "Running SSL tests"
 -          COMMAND cd ssl/test/runner &&
 -                  ${GO_EXECUTABLE} test -shim-path $<TARGET_FILE:bssl_shim>
 -                    ${HANDSHAKER_ARGS} ${RUNNER_ARGS}
 -          WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
--          DEPENDS boringssl_all_tests bssl_shim handshaker fips_specific_tests_if_any
+-          DEPENDS run_unit_tests bssl_shim handshaker
 -          USES_TERMINAL)
 -    else()
+-      add_custom_target(
+-          run_unit_tests
+-          COMMAND ${CMAKE_COMMAND} -E echo "Running tests requires Go"
+-          COMMAND ${CMAKE_COMMAND} -E false)
 -      add_custom_target(
 -          run_tests
 -          COMMAND ${CMAKE_COMMAND} -E echo "Running tests requires Go"
@@ -257,7 +272,6 @@ index 2296a0e41..bb16496d6 100644
 -    endif()
 -  endif()
 -endif()
--
+ 
  if(BORINGSSL_PREFIX)
    require_go()
-   add_custom_target(

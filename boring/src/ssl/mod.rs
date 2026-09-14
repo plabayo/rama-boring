@@ -118,6 +118,7 @@ mod credential;
 mod ech;
 mod error;
 mod mut_only;
+pub mod quic;
 #[cfg(test)]
 mod test;
 
@@ -743,6 +744,32 @@ impl SslSignatureAlgorithm {
         SslSignatureAlgorithm(ffi::SSL_SIGN_RSA_PSS_RSAE_SHA512 as _);
 
     pub const ED25519: SslSignatureAlgorithm = SslSignatureAlgorithm(ffi::SSL_SIGN_ED25519 as _);
+
+    pub const ML_DSA_44: Self = Self(0x0904);
+    pub const ML_DSA_65: Self = Self(0x0905);
+    pub const ML_DSA_87: Self = Self(0x0906);
+
+    /// TLS 1.3 signature scheme name, or `None` for an unknown scheme.
+    #[corresponds(SSL_get_signature_algorithm_name)]
+    pub fn name(&self) -> Option<&'static str> {
+        unsafe {
+            let ptr = ffi::SSL_get_signature_algorithm_name(self.0, 1);
+            if ptr.is_null() {
+                None
+            } else {
+                CStr::from_ptr(ptr).to_str().ok()
+            }
+        }
+    }
+}
+
+impl fmt::Display for SslSignatureAlgorithm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.name() {
+            Some(name) => f.write_str(name),
+            None => write!(f, "unknown ({:#06x})", self.0),
+        }
+    }
 }
 
 impl From<u16> for SslSignatureAlgorithm {
@@ -817,7 +844,7 @@ impl SslCurve {
             ffi::SSL_GROUP_X25519_KYBER512_DRAFT00 => Some(ffi::NID_X25519Kyber512Draft00),
             ffi::SSL_GROUP_X25519_KYBER768_DRAFT00_OLD => Some(ffi::NID_X25519Kyber768Draft00Old),
             ffi::SSL_GROUP_P256_KYBER768_DRAFT00 => Some(ffi::NID_P256Kyber768Draft00),
-            ffi::SSL_GROUP_MLKEM1024 => Some(ffi::NID_MLKEM1024),
+            ffi::SSL_GROUP_MLKEM1024 => Some(ffi::NID_ML_KEM_1024),
             _ => None,
         }
     }
@@ -2994,6 +3021,22 @@ impl SslRef {
         }
     }
 
+    /// Set per-connection verification schemes advertised in ClientHello or CertificateRequest.
+    #[corresponds(SSL_set_verify_algorithm_prefs)]
+    pub fn set_verify_algorithm_prefs(
+        &mut self,
+        prefs: &[SslSignatureAlgorithm],
+    ) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt_0i(ffi::SSL_set_verify_algorithm_prefs(
+                self.as_ptr(),
+                prefs.as_ptr().cast(),
+                prefs.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
     /// Returns the [`SslCurve`] used for this `SslRef`.
     #[corresponds(SSL_get_curve_id)]
     pub fn curve(&self) -> Option<SslCurve> {
@@ -3018,6 +3061,12 @@ impl SslRef {
 
             CStr::from_ptr(ptr).to_str().ok()
         }
+    }
+
+    /// Whether TLS 1.3 sent or received a HelloRetryRequest.
+    #[corresponds(SSL_used_hello_retry_request)]
+    pub fn used_hello_retry_request(&self) -> bool {
+        unsafe { ffi::SSL_used_hello_retry_request(self.as_ptr()) == 1 }
     }
 
     /// Returns an `ErrorCode` value for the most recent operation on this `SslRef`.
@@ -3207,6 +3256,21 @@ impl SslRef {
                 Some(SslCipherRef::from_ptr(ptr.cast_mut()))
             }
         }
+    }
+
+    /// Peer signature scheme, absent when no signature was produced (including resumption).
+    #[corresponds(SSL_get_peer_signature_algorithm)]
+    pub fn peer_signature_algorithm(&self) -> Option<SslSignatureAlgorithm> {
+        let scheme = unsafe { ffi::SSL_get_peer_signature_algorithm(self.as_ptr()) };
+        (scheme != 0).then_some(SslSignatureAlgorithm(scheme))
+    }
+
+    /// Local signature scheme during the handshake. To retain it, capture it
+    /// in the `HANDSHAKE_DONE` info callback before BoringSSL discards it.
+    #[corresponds(SSL_get_signature_algorithm_used)]
+    pub fn signature_algorithm_used(&self) -> Option<SslSignatureAlgorithm> {
+        let scheme = unsafe { ffi::SSL_get_signature_algorithm_used(self.as_ptr()) };
+        (scheme != 0).then_some(SslSignatureAlgorithm(scheme))
     }
 
     /// Returns a short string describing the state of the session.

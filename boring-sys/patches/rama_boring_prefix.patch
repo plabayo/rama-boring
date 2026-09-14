@@ -1,22 +1,12 @@
-Drop BoringSSL's BORINGSSL_PREFIX symbol-audit step.
-
-When BORINGSSL_PREFIX is set, upstream BoringSSL's CMakeLists.txt calls
-require_go() and adds a `verify_boringssl_prefix ALL` custom target that
-runs `util/audit_symbols.go` against libcrypto to check no unprefixed
-symbol slipped through. That makes Go a hard build-time dependency of
-rama-boring-sys at the cmake configure step — even though we never build
-the verify target (we only build `ssl`). We trust the prefix mechanism
-itself, so just delete the block.
-
-This patch is applied after rama_boringssl_cmake.patch, so line numbers
-reflect the post-cmake-patch view of CMakeLists.txt.
+Keep downstream source builds independent of Go. Symbol prefixes are pregenerated
+and audited when maintaining the native patches.
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
-@@ -627,19 +627,6 @@
-   set(HANDSHAKER_ARGS "-handshaker-path" $<TARGET_FILE:handshaker>)
+@@ -633,19 +633,6 @@
  endif()
+ 
  
 -if(BORINGSSL_PREFIX)
 -  require_go()

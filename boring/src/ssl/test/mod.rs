@@ -30,10 +30,44 @@ mod cert_compressor;
 mod cert_verify;
 mod custom_verify;
 mod ech;
+mod legacy;
 mod private_key_method;
 mod server;
 mod session;
 mod session_resumption;
+
+#[test]
+fn per_connection_signature_preferences_accept_matching_scheme() {
+    use super::SslSignatureAlgorithm;
+    let server = Server::builder().build();
+    let client = server.client().build();
+    let mut builder = client.builder();
+    builder
+        .ssl()
+        .set_verify_algorithm_prefs(&[SslSignatureAlgorithm::RSA_PSS_RSAE_SHA256])
+        .unwrap();
+    let stream = builder.connect();
+    assert_eq!(
+        stream.ssl().peer_signature_algorithm(),
+        Some(SslSignatureAlgorithm::RSA_PSS_RSAE_SHA256)
+    );
+    assert_eq!(stream.ssl().signature_algorithm_used(), None);
+}
+
+#[test]
+fn per_connection_signature_preferences_reject_incompatible_scheme() {
+    use super::SslSignatureAlgorithm;
+    let mut server = Server::builder();
+    server.should_error();
+    let server = server.build();
+    let client = server.client().build();
+    let mut builder = client.builder();
+    builder
+        .ssl()
+        .set_verify_algorithm_prefs(&[SslSignatureAlgorithm::ED25519])
+        .unwrap();
+    builder.connect_err();
+}
 mod verify;
 
 static ROOT_CERT: &[u8] = include_bytes!("../../../test/root-ca.pem");
@@ -412,6 +446,7 @@ fn test_raw_cipher_list_survives_tls13_hello_retry_request() {
     // Only P-256 is sent as the initial classical key share. The P-384-only
     // server therefore forces an HRR before the successful P-384 handshake.
     assert_eq!(stream.ssl().curve(), Some(SslCurve::SECP384R1));
+    assert!(stream.ssl().used_hello_retry_request());
     assert_eq!(*captured.lock().unwrap(), [raw_ciphers]);
 }
 
@@ -1638,6 +1673,38 @@ fn set_curves() {
     let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
     ctx.set_curves(&[SslCurve::SECP256R1, SslCurve::SECP384R1, SslCurve::X25519])
         .expect("Failed to set curves");
+}
+
+#[test]
+fn every_rama_group_completes_a_tls13_handshake() {
+    for group in [
+        SslCurve::SECP256R1,
+        SslCurve::SECP384R1,
+        SslCurve::SECP521R1,
+        SslCurve::X25519,
+        SslCurve::X25519_MLKEM768,
+        SslCurve::MLKEM1024,
+        SslCurve::X25519_KYBER768_DRAFT00,
+        SslCurve::X25519_KYBER512_DRAFT00,
+        SslCurve::X25519_KYBER768_DRAFT00_OLD,
+        SslCurve::P256_KYBER768_DRAFT00,
+    ] {
+        let mut server = Server::builder();
+        server.ctx().set_curves(&[group]).unwrap();
+        server
+            .ctx()
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        let server = server.build();
+        let mut client = server.client();
+        client.ctx().set_curves(&[group]).unwrap();
+        client
+            .ctx()
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        let stream = client.connect();
+        assert_eq!(stream.ssl().curve(), Some(group), "{group:?}");
+    }
 }
 
 #[test]

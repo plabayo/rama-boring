@@ -687,6 +687,33 @@ fn test_verify_fails() {
 }
 
 #[test]
+fn verification_context_owns_replacement_parameters() {
+    use crate::x509::verify::{X509VerifyFlags, X509VerifyParam};
+
+    let cert = X509::from_pem(include_bytes!("../../../test/cert.pem")).unwrap();
+    let ca = X509::from_pem(include_bytes!("../../../test/root-ca.pem")).unwrap();
+    let mut builder = X509StoreBuilder::new().unwrap();
+    builder.add_cert(&ca).unwrap();
+    let store = builder.build();
+    let chain = Stack::new().unwrap();
+    let mut context = X509StoreContext::new().unwrap();
+    context
+        .init(&store, &cert, &chain, |context| {
+            let mut params = X509VerifyParam::new()?;
+            params.try_set_flags(X509VerifyFlags::TRUSTED_FIRST)?;
+            params.set_depth(10);
+            context.set_verify_param(params);
+            assert!(context
+                .verify_param_mut()
+                .flags()
+                .contains(X509VerifyFlags::TRUSTED_FIRST));
+            assert!(context.verify_cert()?);
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
 fn test_save_subject_der() {
     let cert = include_bytes!("../../../test/cert.pem");
     let cert = X509::from_pem(cert).unwrap();
