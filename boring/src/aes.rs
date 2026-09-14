@@ -50,6 +50,36 @@ pub struct KeyError(());
 /// The key used to encrypt or decrypt cipher blocks.
 pub struct AesKey(ffi::AES_KEY);
 
+/// An encryption-only AES key schedule, erased when dropped.
+/// This primitive provides no authentication or message framing.
+pub struct AesEncryptKey(AesKey);
+
+impl AesEncryptKey {
+    pub fn new(key: &[u8]) -> Result<Self, KeyError> {
+        AesKey::new_encrypt(key).map(Self)
+    }
+
+    /// Encrypt exactly one block with the prepared encryption schedule.
+    pub fn encrypt_block(&self, input: &[u8; 16]) -> [u8; 16] {
+        let mut output = [0; 16];
+        unsafe {
+            ffi::AES_encrypt(input.as_ptr(), output.as_mut_ptr(), &self.0 .0);
+        }
+        output
+    }
+}
+
+impl Drop for AesEncryptKey {
+    fn drop(&mut self) {
+        unsafe {
+            ffi::OPENSSL_cleanse(
+                std::ptr::addr_of_mut!(self.0 .0).cast(),
+                std::mem::size_of::<ffi::AES_KEY>(),
+            );
+        }
+    }
+}
+
 impl AesKey {
     /// Prepares a key for encryption.
     ///
@@ -183,6 +213,32 @@ mod test {
     use hex::FromHex;
 
     use super::*;
+
+    #[test]
+    fn encrypt_block_known_answers() {
+        let block = <[u8; 16]>::from_hex("00112233445566778899aabbccddeeff").unwrap();
+        for (key, expected) in [
+            (
+                "000102030405060708090a0b0c0d0e0f",
+                "69c4e0d86a7b0430d8cdb78070b4c55a",
+            ),
+            (
+                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+                "8ea2b7ca516745bfeafc49904b496089",
+            ),
+        ] {
+            let key = AesEncryptKey::new(&Vec::from_hex(key).unwrap()).unwrap();
+            assert_eq!(
+                key.encrypt_block(&block),
+                <[u8; 16]>::from_hex(expected).unwrap()
+            );
+            assert_eq!(
+                key.encrypt_block(&block),
+                <[u8; 16]>::from_hex(expected).unwrap()
+            );
+        }
+        assert!(AesEncryptKey::new(&[0; 15]).is_err());
+    }
 
     // from the RFC https://tools.ietf.org/html/rfc3394#section-2.2.3
     #[test]
