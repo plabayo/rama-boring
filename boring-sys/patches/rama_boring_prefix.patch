@@ -24,3 +24,13 @@ diff --git a/CMakeLists.txt b/CMakeLists.txt
  
  if(INSTALL_ENABLED)
    install(TARGETS crypto ssl EXPORT OpenSSLTargets)
+diff --git a/util/audit_symbols.go b/util/audit_symbols.go
+--- a/util/audit_symbols.go
++++ b/util/audit_symbols.go
+@@ -59,5 +59,6 @@ var skipWeakSymbols = []*regexp.Regexp{
+ 	regexp.MustCompile(`^__\w+\.get_pc_thunk\..*`),       // PIC
+ 	regexp.MustCompile(`^___asan_.*`),                    // AddressSanitizer
++	regexp.MustCompile(`^__clang_call_terminate$`),       // Clang exception handling
+ 	regexp.MustCompile(`^__cxa_.*`),                      // libc++abi
+ 	regexp.MustCompile(`^__dynamic_cast$`),               // libc++abi
+ 	regexp.MustCompile(`^__emutls_get_address$`),         // emulated TLS

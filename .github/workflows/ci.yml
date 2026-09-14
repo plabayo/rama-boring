@@ -299,6 +299,10 @@ jobs:
         run: cargo test --target ${{ matrix.target }} ${{ matrix.extra_test_args }}
         shell: bash
         env: ${{ matrix.custom_env }}
+      - name: Audit native symbol prefixes
+        if: matrix.thing == 'stable' || endsWith(matrix.thing, '-macos')
+        run: cargo build -p rama-boring-sys --target ${{ matrix.target }} --message-format=json | python3 .github/scripts/audit-native-symbols.py
+        shell: bash
       - name: Run Tokio unit tests on Windows
         if: "!matrix.check_only && startsWith(matrix.os, 'windows')"
         run: cargo test --target ${{ matrix.target }} -p rama-boring-tokio --lib

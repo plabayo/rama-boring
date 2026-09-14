@@ -11,7 +11,7 @@ license = "MIT"
 description = "FFI bindings to BoringSSL for Rama"
 repository = { workspace = true }
 documentation = "https://docs.rs/rama-boring-sys"
-links = "boringssl"
+links = "rama_boringssl"
 build = "build/main.rs"
 readme = "README.md"
 categories = ["cryptography", "external-ffi-bindings"]

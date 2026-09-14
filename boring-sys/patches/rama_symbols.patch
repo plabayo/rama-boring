@@ -86,3 +86,17 @@ index 6e68c58d1..6b30e4f56 100644
  #define SSL_set_reject_unusable_ech_config BORINGSSL_ADD_PREFIX(SSL_set_reject_unusable_ech_config)
  #define SSL_set_renegotiate_mode BORINGSSL_ADD_PREFIX(SSL_set_renegotiate_mode)
  #define SSL_set_resumption_across_names_enabled BORINGSSL_ADD_PREFIX(SSL_set_resumption_across_names_enabled)
+diff --git a/include/openssl/base.h b/include/openssl/base.h
+--- a/include/openssl/base.h
++++ b/include/openssl/base.h
+@@ -343,6 +343,10 @@
+ typedef struct ssl_method_st SSL_METHOD;
+ typedef struct ssl_private_key_method_st SSL_PRIVATE_KEY_METHOD;
+ typedef struct ssl_quic_method_st SSL_QUIC_METHOD;
++// This opaque type has out-of-line C++ destructors outside the bssl namespace.
++#if defined(BORINGSSL_PREFIX)
++#define ssl_session_st BORINGSSL_ADD_PREFIX(ssl_session_st)
++#endif
+ typedef struct ssl_session_st SSL_SESSION;
+ typedef struct ssl_st SSL;
+ typedef struct ssl_ticket_aead_method_st SSL_TICKET_AEAD_METHOD;
