@@ -24,6 +24,7 @@ include = [
     "/cmake/*.cmake",
     "/deps/boringssl/util/32-bit-toolchain.cmake",
     "/deps/boringssl/util/go_tests.txt",
+    "/deps/boringssl/util/audit_symbols.go",
     "/deps/boringssl/**/*.[chS]",
     "/deps/boringssl/**/*.asm",
     "/deps/boringssl/sources.json",
