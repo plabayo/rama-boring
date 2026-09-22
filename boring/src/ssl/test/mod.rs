@@ -26,8 +26,10 @@ use crate::x509::{X509Name, X509};
 
 use super::CompliancePolicy;
 
+mod ca_names;
 mod cert_compressor;
 mod cert_verify;
+mod credentials;
 mod custom_verify;
 mod ech;
 mod legacy;
@@ -35,6 +37,7 @@ mod private_key_method;
 mod server;
 mod session;
 mod session_resumption;
+mod trust_anchors;
 
 #[test]
 fn per_connection_signature_preferences_accept_matching_scheme() {

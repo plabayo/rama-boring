@@ -112,6 +112,7 @@ pub use self::error::{Error, ErrorCode, HandshakeError};
 
 mod async_callbacks;
 mod bio;
+mod buffer;
 mod callbacks;
 mod connector;
 mod credential;
@@ -616,6 +617,7 @@ impl ExtensionType {
     pub const SUPPORTED_VERSIONS: Self = Self(ffi::TLSEXT_TYPE_supported_versions as u16);
     pub const COOKIE: Self = Self(ffi::TLSEXT_TYPE_cookie as u16);
     pub const PSK_KEY_EXCHANGE_MODES: Self = Self(ffi::TLSEXT_TYPE_psk_key_exchange_modes as u16);
+    pub const TRUST_ANCHORS: Self = Self(ffi::TLSEXT_TYPE_trust_anchors as u16);
     pub const CERTIFICATE_AUTHORITIES: Self = Self(ffi::TLSEXT_TYPE_certificate_authorities as u16);
     pub const SIGNATURE_ALGORITHMS_CERT: Self =
         Self(ffi::TLSEXT_TYPE_signature_algorithms_cert as u16);
@@ -2102,6 +2104,48 @@ impl SslContextBuilder {
                 ids.len(),
             ))
             .map(|_| ())
+        }
+    }
+
+    /// Sets the trust anchor IDs to request from the server.
+    ///
+    /// `ids` is a sequence of non-empty, 8-bit length-prefixed identifiers,
+    /// without the extension's outer 16-bit length prefix. An empty slice still
+    /// sends the `trust_anchors` extension, with an empty list. Invalid encodings
+    /// return an error.
+    ///
+    /// This only changes the list sent to the peer, not certificate verification.
+    /// Applications requesting a subset of their supported trust anchors (including
+    /// an empty list) should implement the trust anchor ID retry flow. Capture
+    /// [`SslRef::peer_available_trust_anchors`] during certificate verification to
+    /// choose an independently trusted alternative for a new connection.
+    #[corresponds(SSL_CTX_set1_requested_trust_anchors)]
+    pub fn set_requested_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt(ffi::SSL_CTX_set1_requested_trust_anchors(
+                self.as_ptr(),
+                ids.as_ptr(),
+                ids.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
+    /// Sets the server's available trust anchor IDs, in decreasing preference order.
+    ///
+    /// `ids` must be a non-empty sequence of non-empty, u8-length-prefixed IDs,
+    /// without an outer u16 length. This advertises alternatives for client retries;
+    /// it does not configure certificates or change verification. Usually BoringSSL
+    /// derives the list from configured credentials, so an override is only needed
+    /// when custom certificate selection hides some of the available credentials.
+    #[corresponds(SSL_CTX_set1_available_trust_anchors)]
+    pub fn set_available_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt(ffi::SSL_CTX_set1_available_trust_anchors(
+                self.as_ptr(),
+                ids.as_ptr(),
+                ids.len(),
+            ))
         }
     }
 
@@ -3894,6 +3938,135 @@ impl SslRef {
     #[corresponds(SSL_add1_chain_cert)]
     pub fn add_chain_cert(&mut self, cert: &X509Ref) -> Result<(), ErrorStack> {
         unsafe { cvt(ffi::SSL_add1_chain_cert(self.as_ptr(), cert.as_ptr())) }
+    }
+
+    /// Returns the server's stapled SignedCertificateTimestampList, including its
+    /// outer u16 length. Returns `None` if no list was received.
+    ///
+    /// Intended for clients after the handshake. These bytes are not guaranteed to
+    /// be well formed or valid; applications must validate them before relying on them.
+    #[corresponds(SSL_get0_signed_cert_timestamp_list)]
+    #[must_use]
+    pub fn signed_cert_timestamp_list(&self) -> Option<&[u8]> {
+        unsafe {
+            let mut data = ptr::null();
+            let mut len = 0;
+            ffi::SSL_get0_signed_cert_timestamp_list(self.as_ptr(), &mut data, &mut len);
+            if len == 0 {
+                None
+            } else {
+                Some(slice::from_raw_parts(data, len))
+            }
+        }
+    }
+
+    /// Sets the requested trust anchor IDs for this connection, overriding its context.
+    ///
+    /// See [`SslContextBuilder::set_requested_trust_anchors`] for the encoding and
+    /// retry requirements. An empty slice sends a present-empty extension. The
+    /// native API copies the input. Certificate verification is unchanged.
+    ///
+    /// Configure this before starting the handshake. If BoringSSL has discarded
+    /// the connection's handshake configuration, this returns an error without
+    /// adding a diagnostic to the native error queue; the error stack may be empty.
+    #[corresponds(SSL_set1_requested_trust_anchors)]
+    pub fn set_requested_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt(ffi::SSL_set1_requested_trust_anchors(
+                self.as_ptr(),
+                ids.as_ptr(),
+                ids.len(),
+            ))
+        }
+    }
+
+    /// Overrides the server's advertised available trust anchor IDs for this connection.
+    ///
+    /// See [`SslContextBuilder::set_available_trust_anchors`] for the wire encoding
+    /// and when an explicit list is needed.
+    ///
+    /// Configure this before starting the handshake. If BoringSSL has discarded
+    /// the connection's handshake configuration, this returns an error without
+    /// adding a diagnostic to the native error queue; the error stack may be empty.
+    #[corresponds(SSL_set1_available_trust_anchors)]
+    pub fn set_available_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt(ffi::SSL_set1_available_trust_anchors(
+                self.as_ptr(),
+                ids.as_ptr(),
+                ids.len(),
+            ))
+        }
+    }
+
+    /// Returns the server's available trust anchor IDs as a u8-length-prefixed list.
+    ///
+    /// This is available only during the handshake, normally in certificate
+    /// verification callbacks. Copy it there if it is needed to retry a failed
+    /// connection. An empty slice means no list is available. The list only guides
+    /// selection: retries must use an independently trusted anchor and still verify
+    /// the server's certificate and identity.
+    #[corresponds(SSL_get0_peer_available_trust_anchors)]
+    #[must_use]
+    pub fn peer_available_trust_anchors(&self) -> &[u8] {
+        unsafe {
+            let mut data = ptr::null();
+            let mut len = 0;
+            ffi::SSL_get0_peer_available_trust_anchors(self.as_ptr(), &mut data, &mut len);
+            if len == 0 {
+                &[]
+            } else {
+                slice::from_raw_parts(data, len)
+            }
+        }
+    }
+
+    /// Whether the peer reports that its chain matches a requested trust anchor.
+    ///
+    /// Available only during the handshake, typically in a verification callback;
+    /// returns false outside it. This is not a verification result. A verifier may
+    /// validate the supplied chain as a pre-built path, but must still validate its
+    /// signatures, trust anchor, identity, and other certificate policy.
+    #[corresponds(SSL_peer_matched_trust_anchor)]
+    #[must_use]
+    pub fn peer_matched_trust_anchor(&self) -> bool {
+        unsafe { ffi::SSL_peer_matched_trust_anchor(self.as_ptr()) != 0 }
+    }
+
+    /// Configures the CA distinguished names advertised in ClientHello's
+    /// `certificate_authorities` extension. An empty stack disables the extension.
+    ///
+    /// The names are copied. This is separate from the CA list a server sends when
+    /// requesting client certificates, and does not modify certificate verification.
+    #[corresponds(SSL_set0_CA_names)]
+    pub fn set_ca_names(&mut self, names: &StackRef<X509Name>) -> Result<(), ErrorStack> {
+        let mut buffers = Stack::<buffer::CryptoBuffer>::new()?;
+        for name in names {
+            buffers.push(buffer::CryptoBuffer::new(&name.to_der()?)?)?;
+        }
+        unsafe {
+            ffi::SSL_set0_CA_names(self.as_ptr(), buffers.as_ptr());
+        }
+        mem::forget(buffers); // Ownership is transferred even if native config was shed.
+        Ok(())
+    }
+
+    /// Returns the credential selected for the current handshake, if available.
+    ///
+    /// Intended for handshake callbacks, including custom private key methods, to
+    /// access credential-specific extra data. Legacy certificate configuration may
+    /// return an internal credential without application extra data.
+    #[corresponds(SSL_get0_selected_credential)]
+    #[must_use]
+    pub fn selected_credential(&self) -> Option<&SslCredentialRef> {
+        unsafe {
+            let cred = ffi::SSL_get0_selected_credential(self.as_ptr());
+            if cred.is_null() {
+                None
+            } else {
+                Some(SslCredentialRef::from_ptr(cred.cast_mut()))
+            }
+        }
     }
 
     /// Configures `ech_config_list` on `SSL` for offering ECH during handshakes. If the server
