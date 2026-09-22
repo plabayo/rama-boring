@@ -599,9 +599,15 @@ where
     let output = unsafe { slice::from_raw_parts_mut(out, max_out) };
     let out_len = unsafe { &mut *out_len };
 
+    // Keep native owners alive independently of `ssl` while the callback can
+    // mutate the connection. Credential-specific methods take precedence over
+    // the legacy context method.
+    let credential = ssl.selected_credential().map(ToOwned::to_owned);
     let ssl_context = ssl.ssl_context().to_owned();
-    let method = ssl_context
-        .ex_data(SslContext::cached_ex_index::<M>())
+    let method = credential
+        .as_ref()
+        .and_then(|cred| cred.ex_data(super::SslCredential::cached_ex_index::<M>()))
+        .or_else(|| ssl_context.ex_data(SslContext::cached_ex_index::<M>()))
         .expect("BUG: private key method missing");
 
     match callback(method, ssl, output) {
