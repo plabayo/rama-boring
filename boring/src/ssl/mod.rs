@@ -2105,6 +2105,28 @@ impl SslContextBuilder {
         }
     }
 
+    /// Sets the trust anchor IDs to request from the server.
+    ///
+    /// `ids` is a sequence of non-empty, 8-bit length-prefixed identifiers,
+    /// without the extension's outer 16-bit length prefix. An empty slice still
+    /// sends the `trust_anchors` extension, with an empty list. Invalid encodings
+    /// return an error.
+    ///
+    /// This only changes the list sent to the peer, not certificate verification.
+    /// Applications requesting a subset of their supported trust anchors may
+    /// need to implement the trust anchor ID retry flow.
+    #[corresponds(SSL_CTX_set1_requested_trust_anchors)]
+    pub fn set_requested_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt(ffi::SSL_CTX_set1_requested_trust_anchors(
+                self.as_ptr(),
+                ids.as_ptr(),
+                ids.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
     /// Sets the context's supported signature verification algorithms.
     #[corresponds(SSL_CTX_set_verify_algorithm_prefs)]
     pub fn set_verify_algorithm_prefs(

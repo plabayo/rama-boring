@@ -35,6 +35,7 @@ mod private_key_method;
 mod server;
 mod session;
 mod session_resumption;
+mod trust_anchors;
 
 #[test]
 fn per_connection_signature_preferences_accept_matching_scheme() {
