@@ -114,6 +114,9 @@ fn credential_owned_private_key_method_and_metadata_survive_the_builder() {
         .unwrap();
     let cred = builder.build();
     let mut server = Server::builder();
+    // The same server that exposed its selected credential during signing must
+    // stop exposing it after the handshake finishes.
+    server.io_cb(|stream| assert!(stream.ssl().selected_credential().is_none()));
     // Same Rust callback type on the context must not override credential state.
     server.ctx().set_private_key_method(Method::new());
     server.ctx().add_credential(&cred).unwrap();
@@ -137,7 +140,6 @@ fn credential_owned_private_key_method_and_metadata_survive_the_builder() {
         stream.ssl().signed_cert_timestamp_list(),
         Some(&[0, 3, 0, 1, 42][..])
     );
-    assert!(stream.ssl().selected_credential().is_none());
 }
 
 #[test]
@@ -200,4 +202,41 @@ fn credential_owned_private_key_method_survives_async_completion() {
         .unwrap();
     client.connect();
     assert_eq!(completed.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn multi_certificate_chains_are_retained_and_replacement_removes_old_entries() {
+    for replace_with_leaf in [false, true] {
+        let chain = X509::stack_from_pem(include_bytes!("../../../test/certs.pem")).unwrap();
+        assert!(chain.len() > 1);
+        let mut builder = credential(&[], false);
+        builder.set_certificate_chain(&chain).unwrap();
+        let expected_chain = if replace_with_leaf {
+            builder.set_certificate_chain(&chain[..1]).unwrap();
+            &chain[..1]
+        } else {
+            &chain[..]
+        };
+        let expected: Vec<_> = expected_chain
+            .iter()
+            .map(|cert| cert.to_der().unwrap())
+            .collect();
+        drop(chain);
+        let cred = builder.build();
+        let mut server = Server::builder();
+        server.ctx().add_credential(&cred).unwrap();
+        drop(cred);
+        let server = server.build();
+        let mut client = server.client_with_root_ca();
+        client.ctx().set_verify(SslVerifyMode::PEER);
+        let stream = client.connect();
+        let actual: Vec<_> = stream
+            .ssl()
+            .peer_cert_chain()
+            .unwrap()
+            .iter()
+            .map(|cert| cert.to_der().unwrap())
+            .collect();
+        assert_eq!(actual, expected);
+    }
 }

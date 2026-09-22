@@ -321,3 +321,38 @@ fn verification_failure_can_capture_alternatives_and_retry_on_the_same_endpoint(
     assert_eq!(captured.lock().unwrap()[1], (vec![1, 42, 1, 17], true));
     worker.join().unwrap();
 }
+
+#[test]
+fn clearing_a_trust_anchor_id_stops_matching_requests_for_that_id() {
+    use super::credentials::credential;
+    for clear in [false, true] {
+        let mut builder = credential(&[17], true);
+        if clear {
+            builder.set_trust_anchor_id(&[]).unwrap();
+        }
+        let mut server = Server::builder();
+        server.ctx().add_credential(&builder.build()).unwrap();
+        let server = server.build();
+        let observed = Arc::new(Mutex::new(None));
+        let output = observed.clone();
+        let mut client = server.client_with_root_ca();
+        client
+            .ctx()
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        client.ctx().set_requested_trust_anchors(&[1, 17]).unwrap();
+        client
+            .ctx()
+            .set_verify_callback(SslVerifyMode::PEER, move |valid, ctx| {
+                let ssl = ctx
+                    .ex_data(crate::x509::X509StoreContext::ssl_idx().unwrap())
+                    .unwrap();
+                *output.lock().unwrap() = Some(ssl.peer_matched_trust_anchor());
+                valid
+            });
+        // After clearing the ID, the matching-only credential is skipped and
+        // the harness's legacy certificate provides the verified fallback.
+        client.connect();
+        assert_eq!(*observed.lock().unwrap(), Some(!clear));
+    }
+}

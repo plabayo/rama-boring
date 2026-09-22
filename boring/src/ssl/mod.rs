@@ -3965,6 +3965,10 @@ impl SslRef {
     /// See [`SslContextBuilder::set_requested_trust_anchors`] for the encoding and
     /// retry requirements. An empty slice sends a present-empty extension. The
     /// native API copies the input. Certificate verification is unchanged.
+    ///
+    /// Configure this before starting the handshake. If BoringSSL has discarded
+    /// the connection's handshake configuration, this returns an error without
+    /// adding a diagnostic to the native error queue; the error stack may be empty.
     #[corresponds(SSL_set1_requested_trust_anchors)]
     pub fn set_requested_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
         unsafe {
@@ -3980,6 +3984,10 @@ impl SslRef {
     ///
     /// See [`SslContextBuilder::set_available_trust_anchors`] for the wire encoding
     /// and when an explicit list is needed.
+    ///
+    /// Configure this before starting the handshake. If BoringSSL has discarded
+    /// the connection's handshake configuration, this returns an error without
+    /// adding a diagnostic to the native error queue; the error stack may be empty.
     #[corresponds(SSL_set1_available_trust_anchors)]
     pub fn set_available_trust_anchors(&mut self, ids: &[u8]) -> Result<(), ErrorStack> {
         unsafe {
