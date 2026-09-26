@@ -641,3 +641,48 @@ fn async_session_lookup_without_a_waker_is_a_cache_miss_without_factory_side_eff
         assert_eq!(calls.load(SeqCst), usize::from(install_waker));
     }
 }
+
+#[test]
+fn incompatible_context_routing_preserves_the_original_connection() {
+    use foreign_types::{ForeignType, ForeignTypeRef};
+    let x509 = SslContext::builder(SslMethod::tls()).unwrap().build();
+    // No X.509 operations are performed on the buffer-only context or SSL.
+    let buffers = SslContext::builder(unsafe { SslMethod::tls_with_buffer() })
+        .unwrap()
+        .build();
+    for (original, destination) in [(&x509, &buffers), (&buffers, &x509)] {
+        let mut ssl = Ssl::new(original).unwrap();
+        let error = ssl.set_ssl_context(destination).unwrap_err();
+        assert!(error.to_string().contains("X.509 certificate support"));
+        assert_eq!(ssl.ssl_context().as_ptr(), original.as_ptr());
+        ssl.set_ssl_context(original).unwrap();
+    }
+}
+
+#[test]
+fn incompatible_context_routing_in_sni_fails_without_panicking() {
+    for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
+        // Routing is rejected before native code can mix X.509 and buffer methods.
+        let buffers = SslContext::builder(unsafe { SslMethod::tls_with_buffer() })
+            .unwrap()
+            .build();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let mut server = Server::builder();
+        server.ctx().set_min_proto_version(Some(version)).unwrap();
+        server.ctx().set_max_proto_version(Some(version)).unwrap();
+        server.ctx().set_servername_callback(move |ssl, _| {
+            count.fetch_add(1, SeqCst);
+            ssl.set_ssl_context(&buffers)
+                .map_err(|_| crate::ssl::SniError::ALERT_FATAL)
+        });
+        server.should_error();
+        let server = server.build();
+        let client = server.client().build();
+        let mut client = client.builder();
+        client.ssl().set_hostname("localhost").unwrap();
+        assert!(matches!(client.connect_err(), HandshakeError::Failure(_)));
+        drop(server);
+        assert_eq!(calls.load(SeqCst), 1);
+    }
+}

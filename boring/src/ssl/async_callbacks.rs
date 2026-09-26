@@ -349,6 +349,8 @@ impl SslRef {
         self.set_certificate_callback(async_certificate_callback(callback));
     }
 
+    /// Sets a per-connection asynchronous verifier with the same contract as
+    /// [`SslContextBuilder::set_async_custom_verify_callback`].
     pub fn set_async_custom_verify_callback<F>(&mut self, mode: SslVerifyMode, callback: F)
     where
         F: Fn(&mut SslRef) -> Result<BoxCustomVerifyFuture, SslAlert> + Send + Sync + 'static,

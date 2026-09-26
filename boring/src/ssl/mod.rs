@@ -3634,6 +3634,9 @@ impl SslRef {
     /// Verification mode and callbacks installed with `set_verify_callback` or
     /// `set_custom_verify_callback` are preserved. Re-apply them explicitly after
     /// routing when the destination requires a different client-auth policy.
+    /// Verification parameters (depth, X.509 flags, purpose and hostname) and
+    /// preferences for verifying peer signatures are also preserved. Apply the
+    /// destination's policy explicitly on the connection after routing.
     /// The context-level [`SslContextBuilder::set_cert_verify_callback`] hook instead
     /// follows `ctx`, as does its default certificate store. Routing also replaces
     /// the per-connection verification store and session ID context with `ctx`'s
@@ -3642,13 +3645,15 @@ impl SslRef {
     /// An active async certificate selection or custom verification is cancelled
     /// and the handshake will fail. Pending early ClientHello callbacks are also
     /// cancelled; route in their finish closure.
+    /// Returns an error without changing the connection if the contexts differ
+    /// in X.509 support.
     #[corresponds(SSL_set_SSL_CTX)]
     pub fn set_ssl_context(&mut self, ctx: &SslContextRef) -> Result<(), ErrorStack> {
-        assert_eq!(
-            self.ssl_context().has_x509_support(),
-            ctx.has_x509_support(),
-            "X.509 certificate support in old and new contexts doesn't match",
-        );
+        if self.ssl_context().has_x509_support() != ctx.has_x509_support() {
+            return Err(ErrorStack::internal_error_str(
+                "X.509 certificate support in old and new contexts doesn't match",
+            ));
+        }
         let changed = self.ssl_context().as_ptr() != ctx.as_ptr();
         let selected_owner = changed
             .then(|| credential::capture_selected_credential_context(self))

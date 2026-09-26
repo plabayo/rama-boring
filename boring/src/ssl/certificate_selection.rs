@@ -15,7 +15,7 @@ use std::{
 /// Copy request metadata before moving it into an asynchronous operation.
 /// Borrowed metadata prevents mutating the SSL while that metadata is still used:
 ///
-/// ```compile_fail
+/// ```compile_fail,E0502
 /// use rama_boring::ssl::CertificateSelection;
 /// fn change(mut selection: CertificateSelection<'_>) {
 ///     let algorithms = selection.peer_verify_algorithms();
@@ -26,10 +26,12 @@ use std::{
 pub struct CertificateSelection<'ssl>(pub(super) &'ssl mut SslRef);
 
 impl CertificateSelection<'_> {
+    /// Borrows the connection being configured by this selection callback.
     pub fn ssl(&self) -> &SslRef {
         self.0
     }
 
+    /// Mutably borrows the connection to configure credentials or handshake policy.
     pub fn ssl_mut(&mut self) -> &mut SslRef {
         self.0
     }
