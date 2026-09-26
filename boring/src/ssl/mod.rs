@@ -3620,6 +3620,9 @@ impl SslRef {
     /// Changes the context corresponding to the current connection.
     ///
     /// It is most commonly used in the Server Name Indication (SNI) callback.
+    /// A different context replaces the certificate callback and credentials,
+    /// including per-connection overrides. An active async certificate selection
+    /// is cancelled and the handshake will fail.
     #[corresponds(SSL_set_SSL_CTX)]
     pub fn set_ssl_context(&mut self, ctx: &SslContextRef) -> Result<(), ErrorStack> {
         assert_eq!(
@@ -3627,7 +3630,14 @@ impl SslRef {
             ctx.has_x509_support(),
             "X.509 certificate support in old and new contexts doesn't match",
         );
-        unsafe { cvt_p(ffi::SSL_set_SSL_CTX(self.as_ptr(), ctx.as_ptr())).map(|_| ()) }
+        let changed = self.ssl_context().as_ptr() != ctx.as_ptr();
+        unsafe {
+            cvt_p(ffi::SSL_set_SSL_CTX(self.as_ptr(), ctx.as_ptr()))?;
+        }
+        if changed {
+            async_callbacks::invalidate_certificate_selection(self);
+        }
+        Ok(())
     }
 
     /// Returns the context corresponding to the current connection.

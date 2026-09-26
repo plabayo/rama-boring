@@ -90,10 +90,14 @@ impl SslContextBuilder {
     /// Selects the local certificate after peer extensions have been processed.
     /// On clients, runs only when the server requests a client certificate.
     /// Resumed client sessions do not request a fresh certificate. On servers,
-    /// runs before the resumption decision.
+    /// runs before the resumption decision. Rejected ECH skips client selection.
+    /// Callback errors produce a native `internal_error` alert.
     ///
     /// Configure credentials through [`CertificateSelection::ssl_mut`]. `Ok(())`
-    /// continues with the configured credentials (a client may leave them empty).
+    /// continues with the configured credentials. To omit a client certificate or
+    /// replace all candidates, first call [`SslRef::clear_certificates`]; otherwise
+    /// inherited credentials remain eligible as fallbacks. An empty list permits
+    /// an anonymous response, while a nonempty list with no usable credential fails.
     /// [`SelectCertError::ERROR`] aborts; [`SelectCertError::RETRY`] pauses with
     /// [`super::ErrorCode::WANT_X509_LOOKUP`]. This does not replace peer verification.
     #[corresponds(SSL_CTX_set_cert_cb)]
@@ -113,6 +117,8 @@ impl SslContextBuilder {
 
 impl SslRef {
     /// Overrides this connection's certificate-selection callback.
+    /// Changing SSL contexts replaces this override and the credential configuration.
+    /// Replacing an active async selection aborts the handshake.
     /// See [`SslContextBuilder::set_certificate_callback`].
     #[corresponds(SSL_set_cert_cb)]
     pub fn set_certificate_callback<F>(&mut self, callback: F)
@@ -129,6 +135,16 @@ impl SslRef {
                 Some(connection_callback::<F>),
                 ptr::null_mut(),
             );
+        }
+        super::async_callbacks::invalidate_certificate_selection(self);
+    }
+
+    /// Removes all credential candidates, including the inherited legacy
+    /// certificate chain and private key. The SSL context is unchanged.
+    #[corresponds(SSL_certs_clear)]
+    pub fn clear_certificates(&mut self) {
+        unsafe {
+            ffi::SSL_certs_clear(self.as_ptr());
         }
     }
 }

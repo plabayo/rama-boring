@@ -95,3 +95,111 @@ fn connection_callback_can_replace_itself_without_dropping_its_captures() {
     drop(stream);
     assert_eq!(dropped.load(SeqCst), 2);
 }
+
+struct NoopWake;
+impl std::task::Wake for NoopWake {
+    fn wake(self: Arc<Self>) {}
+}
+
+#[test]
+fn pending_selection_is_cancelled_by_every_callback_and_context_replacement() {
+    use crate::ssl::{AsyncSelectCertError, BoxCertificateFinish};
+    for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
+        for replacement in 0..6 {
+            let mut server = Server::builder();
+            server.ctx().set_min_proto_version(Some(version)).unwrap();
+            server.ctx().set_max_proto_version(Some(version)).unwrap();
+            server.ctx().set_verify(SslVerifyMode::PEER);
+            if replacement != 4 {
+                server.should_error();
+            }
+            let server = server.build();
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let finishes = Arc::new(AtomicUsize::new(0));
+            let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (drop_count, finish_count, gate) =
+                (dropped.clone(), finishes.clone(), ready.clone());
+            let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
+            ctx.set_async_certificate_callback(move |_| {
+                let probe = DropProbe(drop_count.clone());
+                let (finish_count, gate) = (finish_count.clone(), gate.clone());
+                Ok(Box::pin(std::future::poll_fn(move |_| {
+                    let _keep_alive = &probe;
+                    if !gate.load(SeqCst) {
+                        return std::task::Poll::Pending;
+                    }
+                    let count = finish_count.clone();
+                    std::task::Poll::Ready(Ok(Box::new(move |_: CertificateSelection<'_>| {
+                        count.fetch_add(1, SeqCst);
+                        Ok(())
+                    }) as BoxCertificateFinish))
+                })))
+            });
+            let ctx = ctx.build();
+            let mut ssl = Ssl::new(&ctx).unwrap();
+            ssl.set_task_waker(Some(Arc::new(NoopWake).into()));
+            let socket = server.connect_tcp();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut mid = match ssl.connect(socket) {
+                Err(HandshakeError::WouldBlock(mid)) => mid,
+                _ => panic!("selection did not pause"),
+            };
+            assert_eq!(mid.error().code(), ErrorCode::WANT_X509_LOOKUP);
+            assert_eq!(dropped.load(SeqCst), 0);
+            match replacement {
+                0 => mid
+                    .ssl_mut()
+                    .set_async_certificate_callback(|_| Err(AsyncSelectCertError)),
+                1 => {
+                    mid.ssl_mut().set_certificate_callback(|_| Ok(()));
+                    assert_eq!(dropped.load(SeqCst), 1);
+                    mid.ssl_mut()
+                        .set_async_certificate_callback(|_| Err(AsyncSelectCertError));
+                }
+                2 | 3 => {
+                    let mut replacement_ctx = SslContext::builder(SslMethod::tls()).unwrap();
+                    if replacement == 3 {
+                        replacement_ctx
+                            .set_async_certificate_callback(|_| Err(AsyncSelectCertError));
+                    }
+                    mid.ssl_mut()
+                        .set_ssl_context(&replacement_ctx.build())
+                        .unwrap();
+                }
+                4 => mid.ssl_mut().set_ssl_context(&ctx).unwrap(),
+                _ => mid.get_ref().shutdown(std::net::Shutdown::Both).unwrap(),
+            }
+            ready.store(true, SeqCst);
+            if replacement == 4 {
+                // Setting the identical context is a native no-op, not reconfiguration.
+                assert_eq!(dropped.load(SeqCst), 0);
+                let mut stream = mid.handshake().unwrap();
+                stream.read_exact(&mut [0]).unwrap();
+                assert_eq!(finishes.load(SeqCst), 1);
+            } else if replacement == 5 {
+                let error = mid.handshake().unwrap_err();
+                assert!(
+                    matches!(&error, HandshakeError::Failure(mid) if mid.error().io_error().is_some())
+                );
+                // The error still owns the SSL. Completion must release the future
+                // even when the next transport operation fails independently.
+                assert_eq!(dropped.load(SeqCst), 1);
+                assert_eq!(finishes.load(SeqCst), 1);
+            } else {
+                assert_eq!(
+                    dropped.load(SeqCst),
+                    1,
+                    "pending future retained after replacement {replacement}"
+                );
+                assert!(matches!(mid.handshake(), Err(HandshakeError::Failure(_))));
+                assert_eq!(finishes.load(SeqCst), 0);
+            }
+            assert_eq!(dropped.load(SeqCst), 1);
+        }
+    }
+}
