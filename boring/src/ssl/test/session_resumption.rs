@@ -240,3 +240,96 @@ fn test_success_tickey_key_callback(
 
     TicketKeyCallbackResult::Success
 }
+
+// Fixed test-only keys. Captures deliberately share a closure type across contexts.
+fn install_routing_ticket_callback(
+    ctx: &mut crate::ssl::SslContextBuilder,
+    calls: std::sync::Arc<[std::sync::atomic::AtomicUsize; 2]>,
+    key: u8,
+) {
+    unsafe {
+        ctx.set_ticket_key_callback(move |_, name, iv, cipher_ctx, hmac_ctx, encrypt| {
+            calls[usize::from(!encrypt)].fetch_add(1, Ordering::SeqCst);
+            if encrypt {
+                *name = [key; 16];
+                *iv = [1; 16];
+            } else if *name != [key; 16] {
+                return TicketKeyCallbackResult::Noop;
+            }
+            let cipher = Cipher::aes_128_cbc();
+            let result = if encrypt {
+                cipher_ctx.init_encrypt(&cipher, &[key; 16], iv)
+            } else {
+                cipher_ctx.init_decrypt(&cipher, &[key; 16], iv)
+            };
+            if result.is_err() || hmac_ctx.init(&[key; 32], &MessageDigest::sha256()).is_err() {
+                return TicketKeyCallbackResult::Error;
+            }
+            TicketKeyCallbackResult::Success
+        });
+    }
+}
+
+#[test]
+fn routed_tickets_use_original_context_for_issuance_and_resumption() {
+    use crate::ssl::{SslContext, SslFiletype, SslMethod, SslVersion};
+    use std::sync::{atomic::AtomicUsize, Arc, Mutex};
+    for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
+        for different_instance in [false, true] {
+            let original = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+            let routed_calls = Arc::new([AtomicUsize::new(0), AtomicUsize::new(0)]);
+            let routes = Arc::new(AtomicUsize::new(0));
+            let count = routes.clone();
+            let mut routed = SslContext::builder(SslMethod::tls()).unwrap();
+            routed.set_certificate_chain_file("test/cert.pem").unwrap();
+            routed
+                .set_private_key_file("test/key.pem", SslFiletype::PEM)
+                .unwrap();
+            routed.set_session_id_context(b"routed").unwrap();
+            if different_instance {
+                install_routing_ticket_callback(&mut routed, routed_calls.clone(), 7);
+            }
+            let routed = routed.build();
+            let mut server = Server::builder();
+            server.expected_connections_count(2);
+            server.ctx().set_min_proto_version(Some(version)).unwrap();
+            server.ctx().set_max_proto_version(Some(version)).unwrap();
+            install_routing_ticket_callback(server.ctx(), original.clone(), 5);
+            server.ctx().set_servername_callback(move |ssl, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+                ssl.set_ssl_context(&routed)
+                    .map_err(|_| crate::ssl::SniError::ALERT_FATAL)
+            });
+            let server = server.build();
+            let session = Arc::new(Mutex::new(None));
+            let captured = session.clone();
+            let mut client = server.client();
+            client
+                .ctx()
+                .set_session_cache_mode(SslSessionCacheMode::CLIENT);
+            client.ctx().set_new_session_callback(move |_, session| {
+                *captured.lock().unwrap() = Some(session);
+            });
+            let client = client.build();
+            let mut first = client.builder();
+            first.ssl().set_hostname("localhost").unwrap();
+            let first = first.connect();
+            assert!(!first.ssl().session_reused());
+            drop(first);
+            let ticket = session.lock().unwrap().take().expect("no ticket received");
+            let mut second = client.builder();
+            second.ssl().set_hostname("localhost").unwrap();
+            // The session was obtained with this same client context and server.
+            unsafe {
+                second.ssl().set_session(&ticket).unwrap();
+            }
+            let second = second.connect();
+            assert!(second.ssl().session_reused(), "version={version:?}");
+            assert_eq!(routes.load(Ordering::SeqCst), 2);
+            assert!(original[0].load(Ordering::SeqCst) > 0);
+            assert_eq!(original[1].load(Ordering::SeqCst), 1);
+            assert_eq!(routed_calls[0].load(Ordering::SeqCst), 0);
+            assert_eq!(routed_calls[1].load(Ordering::SeqCst), 0);
+        }
+    }
+}

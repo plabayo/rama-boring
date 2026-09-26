@@ -334,11 +334,12 @@ fn pending_early_selection_cannot_be_bypassed_by_context_routing() {
         for replacement in 0..4 {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
+            // Connect before spawning: a failed connect must not leave accept waiting.
+            let socket = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).unwrap();
             let client = std::thread::spawn(move || {
                 let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
                 ctx.set_min_proto_version(Some(version)).unwrap();
                 ctx.set_max_proto_version(Some(version)).unwrap();
-                let socket = TcpStream::connect(addr).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(5)))
                     .unwrap();

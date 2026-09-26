@@ -166,10 +166,14 @@ where
         unsafe { slice::from_raw_parts_mut(identity.cast::<u8>(), max_identity_len as usize) };
     let psk_sl = unsafe { slice::from_raw_parts_mut(psk, max_psk_len as usize) };
 
-    let ssl_context = ssl.ssl_context().to_owned();
-    let callback = ssl_context
-        .ex_data(SslContext::cached_ex_index::<F>())
-        .expect("BUG: psk callback missing");
+    // SSL_new copies this callback; routing does not replace it.
+    let ssl_context = ssl.ex_data(*SESSION_CTX_INDEX).cloned();
+    let Some(callback) = ssl_context
+        .as_ref()
+        .and_then(|ctx| ctx.ex_data(SslContext::cached_ex_index::<F>()))
+    else {
+        return 0;
+    };
 
     match callback(ssl, hint, identity_sl, psk_sl) {
         Ok(psk_len) => psk_len as u32,
@@ -205,10 +209,14 @@ where
     // Give the callback mutable slices into which it can write the psk.
     let psk_sl = unsafe { slice::from_raw_parts_mut(psk, max_psk_len as usize) };
 
-    let ssl_context = ssl.ssl_context().to_owned();
-    let callback = ssl_context
-        .ex_data(SslContext::cached_ex_index::<F>())
-        .expect("BUG: psk callback missing");
+    // SSL_new copies this callback; routing does not replace it.
+    let ssl_context = ssl.ex_data(*SESSION_CTX_INDEX).cloned();
+    let Some(callback) = ssl_context
+        .as_ref()
+        .and_then(|ctx| ctx.ex_data(SslContext::cached_ex_index::<F>()))
+    else {
+        return 0;
+    };
 
     match callback(ssl, identity, psk_sl) {
         Ok(psk_len) => psk_len as u32,
@@ -304,10 +312,14 @@ where
     // SAFETY: boring provides valid inputs.
     let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
 
-    let ssl_context = ssl.ssl_context().to_owned();
-    let callback = ssl_context
-        .ex_data::<F>(SslContext::cached_ex_index::<F>())
-        .expect("expected session resumption callback");
+    // BoringSSL invokes the ticket callback from the original session context.
+    let ssl_context = ssl.ex_data(*SESSION_CTX_INDEX).cloned();
+    let Some(callback) = ssl_context
+        .as_ref()
+        .and_then(|ctx| ctx.ex_data(SslContext::cached_ex_index::<F>()))
+    else {
+        return -1;
+    };
 
     // SAFETY: the callback guarantees that key_name is 16 bytes
     let key_name =
@@ -616,13 +628,12 @@ where
     };
 
     match callback(method, ssl, output) {
-        Ok(written) => {
-            assert!(written <= max_out);
-
+        Ok(written) if written <= max_out => {
             *out_len = written;
 
             ffi::ssl_private_key_result_t::ssl_private_key_success
         }
+        Ok(_) => ffi::ssl_private_key_result_t::ssl_private_key_failure,
         Err(err) => err.0,
     }
 }

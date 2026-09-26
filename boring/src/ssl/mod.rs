@@ -504,7 +504,7 @@ static INDEXES: LazyLock<Mutex<HashMap<TypeId, c_int>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static SSL_INDEXES: LazyLock<Mutex<HashMap<TypeId, c_int>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-// Retain the initial context for sessions and verification callbacks copied at SSL_new.
+// Retain the initial context for sessions and callbacks copied at SSL_new.
 static SESSION_CTX_INDEX: LazyLock<Index<Ssl, SslContext>> =
     LazyLock::new(|| Ssl::new_ex_index().unwrap());
 static X509_FLAG_INDEX: LazyLock<Index<SslContext, bool>> =
@@ -3635,7 +3635,10 @@ impl SslRef {
     /// `set_custom_verify_callback` are preserved. Re-apply them explicitly after
     /// routing when the destination requires a different client-auth policy.
     /// The context-level [`SslContextBuilder::set_cert_verify_callback`] hook instead
-    /// follows `ctx`, as does its default certificate store.
+    /// follows `ctx`, as does its default certificate store. Routing also replaces
+    /// the per-connection verification store and session ID context with `ctx`'s
+    /// values. Apply any per-connection trust-store override after routing.
+    /// Ticket-key and PSK callbacks retain their original context.
     /// An active async certificate selection or custom verification is cancelled
     /// and the handshake will fail. Pending early ClientHello callbacks are also
     /// cancelled; route in their finish closure.

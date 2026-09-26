@@ -184,3 +184,14 @@ async fn with_async_private_key_method_error(method: Method) {
 
     future::join(server, client).await;
 }
+
+#[tokio::test]
+async fn oversized_async_signature_fails_without_panicking() {
+    with_async_private_key_method_error(Method::new().sign(|_, _, _, _| {
+        Ok(Box::pin(async {
+            yield_now().await;
+            Ok(Box::new(|_: &mut SslRef, _: &mut [u8]| Ok(usize::MAX)) as Box<_>)
+        }))
+    }))
+    .await;
+}

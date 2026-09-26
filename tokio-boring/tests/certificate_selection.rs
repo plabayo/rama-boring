@@ -1898,3 +1898,134 @@ async fn incompatible_first_credential_falls_back_to_the_second() {
         c.unwrap();
     }
 }
+
+fn install_client_psk(
+    ctx: &mut rama_boring::ssl::SslContextBuilder,
+    calls: Arc<AtomicUsize>,
+    key: u8,
+) {
+    ctx.set_psk_client_callback(move |_, _, identity, psk| {
+        calls.fetch_add(1, SeqCst);
+        identity[..7].copy_from_slice(b"client\0");
+        psk[..16].fill(key);
+        Ok(16)
+    });
+}
+fn install_server_psk(
+    ctx: &mut rama_boring::ssl::SslContextBuilder,
+    calls: Arc<AtomicUsize>,
+    key: u8,
+) {
+    ctx.set_psk_server_callback(move |_, identity, psk| {
+        calls.fetch_add(1, SeqCst);
+        if identity != Some(b"client".as_slice()) {
+            return Ok(0);
+        }
+        psk[..16].fill(key);
+        Ok(16)
+    });
+}
+
+#[tokio::test]
+async fn routed_psk_callbacks_keep_original_instances_on_both_peers() {
+    for different_instance in [false, true] {
+        let (client_calls, server_calls, wrong_calls, routes) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        let mut s = server(SslVersion::TLS1_2, SslVerifyMode::NONE);
+        s.set_cipher_list("PSK-AES128-CBC-SHA").unwrap();
+        install_server_psk(&mut s, server_calls.clone(), 5);
+        let mut routed = server(SslVersion::TLS1_2, SslVerifyMode::NONE);
+        routed.set_cipher_list("PSK-AES128-CBC-SHA").unwrap();
+        if different_instance {
+            install_server_psk(&mut routed, wrong_calls.clone(), 7);
+        }
+        let routed = routed.build();
+        let count = routes.clone();
+        s.set_servername_callback(move |ssl, _| {
+            count.fetch_add(1, SeqCst);
+            ssl.set_ssl_context(routed.context())
+                .map_err(|_| rama_boring::ssl::SniError::ALERT_FATAL)
+        });
+        let mut c = client(SslVersion::TLS1_2);
+        c.set_cipher_list("PSK-AES128-CBC-SHA").unwrap();
+        install_client_psk(&mut c, client_calls.clone(), 5);
+        let mut routed = client(SslVersion::TLS1_2);
+        routed.set_cipher_list("PSK-AES128-CBC-SHA").unwrap();
+        if different_instance {
+            install_client_psk(&mut routed, wrong_calls.clone(), 7);
+        }
+        let routed = routed.build();
+        let mut ssl = client_ssl(c);
+        ssl.set_ssl_context(routed.context()).unwrap();
+        let (s, c) = pair(s.build(), ssl, None).await;
+        s.unwrap();
+        c.unwrap();
+        assert_eq!(routes.load(SeqCst), 1);
+        assert_eq!(client_calls.load(SeqCst), 1);
+        assert_eq!(server_calls.load(SeqCst), 1);
+        assert_eq!(wrong_calls.load(SeqCst), 0);
+    }
+}
+
+fn restrictive_store() -> rama_boring::x509::store::X509Store {
+    let mut store = rama_boring::x509::store::X509StoreBuilder::new().unwrap();
+    store.add_cert(material().other_ca.cert.clone()).unwrap();
+    store.build()
+}
+
+#[tokio::test]
+async fn routing_requires_reapplying_per_connection_trust_store() {
+    for version in VERSIONS {
+        // Baseline rejects; routing resets trust; reapplying restores rejection.
+        for (route, reapply) in [(false, false), (true, false), (true, true)] {
+            let mode = SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT;
+            let mut s = server(version, mode);
+            let routes = Arc::new(AtomicUsize::new(0));
+            if route {
+                let routed = server(version, mode).build();
+                let count = routes.clone();
+                s.set_servername_callback(move |ssl, _| {
+                    count.fetch_add(1, SeqCst);
+                    ssl.set_ssl_context(routed.context())
+                        .map_err(|_| rama_boring::ssl::SniError::ALERT_FATAL)?;
+                    if reapply {
+                        ssl.set_verify_cert_store(restrictive_store())
+                            .map_err(|_| rama_boring::ssl::SniError::ALERT_FATAL)?;
+                    }
+                    Ok(())
+                });
+            }
+            let mut ssl = Ssl::new(s.build().context()).unwrap();
+            ssl.set_verify_cert_store(restrictive_store()).unwrap();
+            let mut c = client(version);
+            c.add_credential(&material().client.credential()).unwrap();
+            let (a, b) = transport();
+            let (s, c) = bounded(async {
+                tokio::join!(
+                    async {
+                        let mut stream = SslStreamBuilder::new(ssl, a)
+                            .accept()
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        stream.write_all(b"accepted").await?;
+                        Ok::<_, Box<dyn Error + Send + Sync>>(())
+                    },
+                    connect(b, client_ssl(c))
+                )
+            })
+            .await;
+            let accepted = route && !reapply;
+            assert_eq!(
+                s.is_ok(),
+                accepted,
+                "{version:?}, route={route}, reapply={reapply}"
+            );
+            assert_eq!(c.is_ok(), accepted);
+            assert_eq!(routes.load(SeqCst), usize::from(route));
+        }
+    }
+}

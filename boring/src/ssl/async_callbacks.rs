@@ -551,14 +551,7 @@ impl PrivateKeyMethod for AsyncPrivateKeyMethodBridge {
         output: &mut [u8],
     ) -> Result<usize, PrivateKeyMethodError> {
         with_private_key_method(ssl, output, |_, _| {
-            // This should never be reached, if it does, that's a bug on boring's side,
-            // which called `complete` without having been returned to with a pending
-            // future from `sign` or `decrypt`.
-
-            if cfg!(debug_assertions) {
-                panic!("BUG: boring called complete without a pending operation");
-            }
-
+            // Fail closed if native code requests completion without a pending future.
             Err(AsyncPrivateKeyMethodError)
         })
     }
@@ -636,5 +629,48 @@ fn with_ex_data_future<H, R, T, E>(
                 Poll::Pending
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct UnusedSigner;
+    impl std::task::Wake for UnusedSigner {
+        fn wake(self: std::sync::Arc<Self>) {}
+    }
+    impl AsyncPrivateKeyMethod for UnusedSigner {
+        fn sign(
+            &self,
+            _: &mut SslRef,
+            _: &[u8],
+            _: SslSignatureAlgorithm,
+            _: &mut [u8],
+        ) -> Result<BoxPrivateKeyMethodFuture, AsyncPrivateKeyMethodError> {
+            panic!("completion must not initiate a new signature")
+        }
+        fn decrypt(
+            &self,
+            _: &mut SslRef,
+            _: &[u8],
+            _: &mut [u8],
+        ) -> Result<BoxPrivateKeyMethodFuture, AsyncPrivateKeyMethodError> {
+            panic!("completion must not initiate decryption")
+        }
+    }
+
+    #[test]
+    fn signing_completion_without_pending_future_fails() {
+        let ctx = super::super::SslContext::builder(super::super::SslMethod::tls())
+            .unwrap()
+            .build();
+        let mut ssl = Ssl::new(&ctx).unwrap();
+        ssl.set_task_waker(Some(std::sync::Arc::new(UnusedSigner).into()));
+        let bridge = AsyncPrivateKeyMethodBridge(Box::new(UnusedSigner));
+        assert!(matches!(
+            bridge.complete(&mut ssl, &mut [0; 256]),
+            Err(PrivateKeyMethodError::FAILURE)
+        ));
     }
 }

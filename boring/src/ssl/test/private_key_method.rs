@@ -277,3 +277,40 @@ fn sign_with_default_config(input: &[u8], output: &mut [u8]) -> usize {
 
     signer.sign(output).unwrap()
 }
+
+#[test]
+fn oversized_signer_output_fails_without_panicking() {
+    for complete in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let method = if complete {
+            Method::new()
+                .sign(|_, _, _, _| Err(PrivateKeyMethodError::RETRY))
+                .complete(move |_, _| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    Ok(usize::MAX)
+                })
+        } else {
+            Method::new().sign(move |_, _, _, _| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(usize::MAX)
+            })
+        };
+        let mut server = builder_with_private_key_method(method);
+        server.err_cb(move |error| {
+            let error = if complete {
+                let HandshakeError::WouldBlock(mid) = error else {
+                    panic!("signer did not pause");
+                };
+                mid.handshake().unwrap_err()
+            } else {
+                error
+            };
+            assert!(matches!(error, HandshakeError::Failure(_)));
+        });
+        let server = server.build();
+        server.client_with_root_ca().connect_err();
+        drop(server);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+}
