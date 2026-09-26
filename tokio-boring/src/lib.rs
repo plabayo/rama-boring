@@ -97,14 +97,14 @@ where
         }
     }
 
-    /// Initiates a client-side TLS handshake.
+    /// Initiates a server-side TLS handshake. See [`HandshakeFuture`] for cancellation.
     pub async fn accept(self) -> Result<SslStream<S>, HandshakeError<S>> {
         let mid_handshake = self.inner.setup_accept();
 
         HandshakeFuture(Some(mid_handshake)).await
     }
 
-    /// Initiates a server-side TLS handshake.
+    /// Initiates a client-side TLS handshake. See [`HandshakeFuture`] for cancellation.
     pub async fn connect(self) -> Result<SslStream<S>, HandshakeError<S>> {
         let mid_handshake = self.inner.setup_connect();
 
@@ -450,6 +450,13 @@ where
 }
 
 /// Future for an ongoing TLS handshake.
+///
+/// Dropping this future drops the SSL and pending callback futures. An owned
+/// transport is dropped; a borrowed transport remains with its caller, but TLS
+/// bytes already exchanged are not rolled back.
+/// Retaining this same future after a cancelled wait (for example, a timeout on
+/// `&mut future`) permits resuming the handshake. Cancellation does not undo
+/// external effects or abort tasks spawned independently by callbacks.
 ///
 /// See [`connect`] and [`accept`].
 pub struct HandshakeFuture<S>(Option<MidHandshakeSslStream<AsyncStreamBridge<S>>>);

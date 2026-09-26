@@ -1502,3 +1502,100 @@ async fn rejected_ech_skips_selection_and_sends_no_inherited_identity() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn cancelling_a_wait_preserves_a_retained_handshake_and_its_selection() {
+    use std::sync::Mutex;
+    for version in VERSIONS {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let receiver = Mutex::new(Some(receiver));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let notify = entered.clone();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let factories = Arc::new(AtomicUsize::new(0));
+        let finishes = Arc::new(AtomicUsize::new(0));
+        let (drops, starts, ends) = (dropped.clone(), factories.clone(), finishes.clone());
+        let mut c = client(version);
+        c.set_async_certificate_callback(move |_| {
+            starts.fetch_add(1, SeqCst);
+            let receiver = receiver.lock().unwrap().take().unwrap();
+            let probe = DropProbe(drops.clone());
+            let ends = ends.clone();
+            notify.notify_one();
+            Ok(Box::pin(async move {
+                let _probe = probe;
+                receiver.await.unwrap();
+                Ok(Box::new(move |selection: CertificateSelection<'_>| {
+                    ends.fetch_add(1, SeqCst);
+                    install(material().client.credential())(selection)
+                }) as BoxCertificateFinish)
+            }))
+        });
+        let (a, b) = transport();
+        let mut server = Box::pin(accept(
+            a,
+            server(version, SslVerifyMode::PEER).build(),
+            Some(material().client.cert.to_der().unwrap()),
+        ));
+        let mut client = Box::pin(connect(b, client_ssl(c)));
+        bounded(async {
+            tokio::select! {
+                _ = entered.notified() => {},
+                result = &mut server => panic!("server finished early: {result:?}"),
+                result = &mut client => panic!("client finished early: {result:?}"),
+            }
+            assert!(tokio::time::timeout(Duration::from_millis(2), &mut client)
+                .await
+                .is_err());
+            assert_eq!(dropped.load(SeqCst), 0);
+            assert_eq!(finishes.load(SeqCst), 0);
+            sender.send(()).unwrap();
+            let (s, c) = tokio::join!(server, client);
+            s.unwrap();
+            c.unwrap();
+        })
+        .await;
+        assert_eq!(factories.load(SeqCst), 1);
+        assert_eq!(finishes.load(SeqCst), 1);
+        assert_eq!(dropped.load(SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn cancelling_handshake_drops_selection_but_not_a_borrowed_transport() {
+    for version in VERSIONS {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let drops = dropped.clone();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let notify = entered.clone();
+        let mut c = client(version);
+        c.set_async_certificate_callback(move |_| {
+            let probe = DropProbe(drops.clone());
+            notify.notify_one();
+            Ok(Box::pin(async move {
+                let _probe = probe;
+                std::future::pending().await
+            }))
+        });
+        let (a, mut b) = transport();
+        let mut server = Box::pin(accept(
+            a,
+            server(version, SslVerifyMode::PEER).build(),
+            None,
+        ));
+        bounded(async {
+            let mut client = Box::pin(SslStreamBuilder::new(client_ssl(c), &mut b).connect());
+            tokio::select! {
+                _ = entered.notified() => {},
+                result = &mut server => panic!("server finished early: {result:?}"),
+                result = &mut client => panic!("client finished early: {result:?}"),
+            }
+            drop(client);
+            assert_eq!(dropped.load(SeqCst), 1);
+            assert!(futures::poll!(&mut server).is_pending());
+            drop(b);
+            assert!(server.await.is_err());
+        })
+        .await;
+    }
+}

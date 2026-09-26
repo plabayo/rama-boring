@@ -19,9 +19,22 @@ pub type BoxSelectCertFuture = ExDataFuture<Result<BoxSelectCertFinish, AsyncSel
 pub type BoxSelectCertFinish = Box<dyn FnOnce(ClientHello<'_>) -> Result<(), AsyncSelectCertError>>;
 
 /// Future returned by [`SslContextBuilder::set_async_certificate_callback`].
+/// It owns its inputs; it cannot retain a borrow of the TLS connection or request:
+///
+/// ```compile_fail
+/// use rama_boring::ssl::{AsyncSelectCertError, BoxCertificateFuture, CertificateSelection};
+/// fn retain(selection: &CertificateSelection<'_>) -> BoxCertificateFuture {
+///     let algorithms = selection.peer_verify_algorithms();
+///     Box::pin(async move {
+///         assert!(!algorithms.is_empty());
+///         Err(AsyncSelectCertError)
+///     })
+/// }
+/// ```
 pub type BoxCertificateFuture = ExDataFuture<Result<BoxCertificateFinish, AsyncSelectCertError>>;
 
 /// Installs the credentials once a [`BoxCertificateFuture`] completes.
+/// Runs synchronously on the polling thread, at most once; never after cancellation.
 pub type BoxCertificateFinish =
     Box<dyn FnOnce(CertificateSelection<'_>) -> Result<(), AsyncSelectCertError>>;
 
@@ -67,10 +80,11 @@ static CUSTOM_VERIFY_STATE_INDEX: LazyLock<
     Index<Ssl, MutOnly<CallbackState<BoxCustomVerifyFuture>>>,
 > = LazyLock::new(|| Ssl::new_ex_index().unwrap());
 
-struct CallbackState<F> {
-    future: Option<F>,
-    active: bool,
-    invalidated: bool,
+enum CallbackState<F> {
+    Idle,
+    Running,
+    Pending(F),
+    Invalidated,
 }
 
 fn invalidate<F: Send + 'static>(
@@ -80,11 +94,13 @@ fn invalidate<F: Send + 'static>(
     let Some(state) = ssl.ex_data_mut(index).map(MutOnly::get_mut) else {
         return false;
     };
-    if state.active || state.invalidated {
-        state.invalidated = true;
-        state.future = None;
+    match state {
+        CallbackState::Idle => false,
+        _ => {
+            *state = CallbackState::Invalidated;
+            true
+        }
     }
-    state.invalidated
 }
 
 // Reject even when a replacement context/callback would otherwise skip the hook.
@@ -92,7 +108,7 @@ pub(super) fn invalidate_certificate_selection(ssl: &mut SslRef) {
     let invalidated = invalidate(ssl, *CERTIFICATE_SELECTION_STATE_INDEX);
     let early_invalidated = ssl
         .ex_data_mut(*SELECT_CERT_STATE_INDEX)
-        .is_some_and(|state| state.get_mut().invalidated);
+        .is_some_and(|state| matches!(state.get_mut(), CallbackState::Invalidated));
     if invalidated || early_invalidated {
         unsafe {
             ffi::SSL_set_cert_cb(
@@ -173,7 +189,8 @@ impl SslContextBuilder {
                 &callback,
                 |hello, finish| {
                     // Context routing is the early callback's job, unlike late selection.
-                    callback_state(hello.ssl_mut(), *SELECT_CERT_STATE_INDEX).active = false;
+                    *callback_state(hello.ssl_mut(), *SELECT_CERT_STATE_INDEX) =
+                        CallbackState::Idle;
                     finish(ClientHello(hello.0))
                 },
                 AsyncSelectCertError,
@@ -194,6 +211,27 @@ impl SslContextBuilder {
     ///
     /// A task waker must be installed with [`SslRef::set_task_waker`];
     /// `rama-boring-tokio` handles this automatically.
+    /// Dropping the SSL drops its pending future without calling the finish closure.
+    /// This does not undo external effects or cancel independently spawned tasks.
+    ///
+    /// Install an authoritative credential after asynchronous work:
+    /// ```
+    /// use rama_boring::ssl::{AsyncSelectCertError, BoxCertificateFinish,
+    ///     CertificateSelection, SslContextBuilder, SslCredential};
+    /// fn configure(ctx: &mut SslContextBuilder, credential: SslCredential) {
+    ///     ctx.set_async_certificate_callback(move |_| {
+    ///         let credential = credential.clone();
+    ///         Ok(Box::pin(async move {
+    ///             // Await credential lookup or ingress authentication here.
+    ///             Ok(Box::new(move |mut selection: CertificateSelection<'_>| {
+    ///                 let ssl = selection.ssl_mut();
+    ///                 ssl.clear_certificates();
+    ///                 ssl.add_credential(&credential).map_err(|_| AsyncSelectCertError)
+    ///             }) as BoxCertificateFinish)
+    ///         }))
+    ///     });
+    /// }
+    /// ```
     pub fn set_async_certificate_callback<F>(&mut self, callback: F)
     where
         F: Fn(&mut CertificateSelection<'_>) -> Result<BoxCertificateFuture, AsyncSelectCertError>
@@ -324,14 +362,7 @@ fn callback_state<F: Send + 'static>(
     index: Index<Ssl, MutOnly<CallbackState<F>>>,
 ) -> &mut CallbackState<F> {
     if ssl.ex_data(index).is_none() {
-        ssl.set_ex_data(
-            index,
-            MutOnly::new(CallbackState {
-                future: None,
-                active: false,
-                invalidated: false,
-            }),
-        );
+        ssl.set_ex_data(index, MutOnly::new(CallbackState::Idle));
     }
     ssl.ex_data_mut(index).unwrap().get_mut()
 }
@@ -348,45 +379,48 @@ fn with_callback_state<H, T: 'static, E: Copy + 'static>(
     invalidated_error: E,
 ) -> Poll<Result<(), E>> {
     let state = callback_state(ssl_mut(handle), index);
-    if state.invalidated {
-        return Poll::Ready(Err(invalidated_error));
-    }
-    state.active = true;
-    let future = state.future.take();
-    let mut future = match future.map(Ok).unwrap_or_else(|| create(handle)) {
-        Ok(future) => future,
-        Err(error) => {
-            callback_state(ssl_mut(handle), index).active = false;
-            return Poll::Ready(Err(error));
+    let future = match std::mem::replace(state, CallbackState::Running) {
+        CallbackState::Idle => create(handle),
+        CallbackState::Pending(future) => Ok(future),
+        CallbackState::Running | CallbackState::Invalidated => {
+            *state = CallbackState::Invalidated;
+            return Poll::Ready(Err(invalidated_error));
         }
     };
-    if callback_state(ssl_mut(handle), index).invalidated {
-        return Poll::Ready(Err(invalidated_error));
-    }
-    let Some(waker) = ssl_mut(handle)
-        .ex_data(*TASK_WAKER_INDEX)
-        .cloned()
-        .flatten()
-    else {
-        callback_state(ssl_mut(handle), index).active = false;
-        return Poll::Ready(Err(invalidated_error));
-    };
-    match future.as_mut().poll(&mut Context::from_waker(&waker)) {
-        Poll::Pending => {
-            callback_state(ssl_mut(handle), index).future = Some(future);
-            Poll::Pending
+    let result = (|| {
+        let mut future = future?;
+        if matches!(
+            callback_state(ssl_mut(handle), index),
+            CallbackState::Invalidated
+        ) {
+            return Poll::Ready(Err(invalidated_error));
         }
-        Poll::Ready(result) => {
-            drop(future);
-            let result = result.and_then(|value| finish(handle, value));
-            let state = callback_state(ssl_mut(handle), index);
-            state.active = false;
-            Poll::Ready(if state.invalidated {
-                Err(invalidated_error)
-            } else {
-                result
-            })
+        let Some(waker) = ssl_mut(handle)
+            .ex_data(*TASK_WAKER_INDEX)
+            .cloned()
+            .flatten()
+        else {
+            return Poll::Ready(Err(invalidated_error));
+        };
+        match future.as_mut().poll(&mut Context::from_waker(&waker)) {
+            Poll::Pending => {
+                *callback_state(ssl_mut(handle), index) = CallbackState::Pending(future);
+                Poll::Pending
+            }
+            Poll::Ready(result) => {
+                drop(future);
+                Poll::Ready(result.and_then(|value| finish(handle, value)))
+            }
         }
+    })();
+    let state = callback_state(ssl_mut(handle), index);
+    if matches!(state, CallbackState::Invalidated) {
+        Poll::Ready(Err(invalidated_error))
+    } else {
+        if result.is_ready() {
+            *state = CallbackState::Idle;
+        }
+        result
     }
 }
 

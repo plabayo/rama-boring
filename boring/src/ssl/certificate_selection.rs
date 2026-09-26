@@ -2,17 +2,27 @@ use super::{
     buffer::CryptoBuffer, SelectCertError, Ssl, SslContext, SslContextBuilder, SslRef,
     SslSignatureAlgorithm,
 };
-use crate::{ffi, stack::StackRef};
+use crate::{ex_data::Index, ffi, stack::StackRef};
 use foreign_types::ForeignTypeRef;
 use openssl_macros::corresponds;
 use std::{
     ffi::{c_int, c_void},
     ptr, slice,
-    sync::Arc,
+    sync::{Arc, LazyLock},
 };
 
 /// Certificate-selection state, available only while the selection callback runs.
 /// Copy request metadata before moving it into an asynchronous operation.
+/// Borrowed metadata prevents mutating the SSL while that metadata is still used:
+///
+/// ```compile_fail
+/// use rama_boring::ssl::CertificateSelection;
+/// fn change(mut selection: CertificateSelection<'_>) {
+///     let algorithms = selection.peer_verify_algorithms();
+///     selection.ssl_mut().clear_certificates();
+///     assert!(!algorithms.is_empty());
+/// }
+/// ```
 pub struct CertificateSelection<'ssl>(pub(super) &'ssl mut SslRef);
 
 impl CertificateSelection<'_> {
@@ -90,8 +100,13 @@ type CertificateCallback =
 struct ConnectionCallback(Option<CertificateCallback>);
 struct ContextCallback(CertificateCallback);
 
+static CONNECTION_CALLBACK_INDEX: LazyLock<Index<Ssl, ConnectionCallback>> =
+    LazyLock::new(|| Ssl::new_ex_index().unwrap());
+static CONTEXT_CALLBACK_INDEX: LazyLock<Index<SslContext, ContextCallback>> =
+    LazyLock::new(|| SslContext::new_ex_index().unwrap());
+
 pub(super) fn clear_connection_callback(ssl: &mut SslRef) {
-    if let Some(callback) = ssl.ex_data_mut(Ssl::cached_ex_index::<ConnectionCallback>()) {
+    if let Some(callback) = ssl.ex_data_mut(*CONNECTION_CALLBACK_INDEX) {
         callback.0 = None;
     }
 }
@@ -116,10 +131,7 @@ impl SslContextBuilder {
     where
         F: Fn(CertificateSelection<'_>) -> Result<(), SelectCertError> + Send + Sync + 'static,
     {
-        self.replace_ex_data(
-            SslContext::cached_ex_index::<ContextCallback>(),
-            ContextCallback(Arc::new(callback)),
-        );
+        self.replace_ex_data(*CONTEXT_CALLBACK_INDEX, ContextCallback(Arc::new(callback)));
         unsafe {
             ffi::SSL_CTX_set_cert_cb(self.as_ptr(), Some(context_callback), ptr::null_mut());
         }
@@ -137,7 +149,7 @@ impl SslRef {
         F: Fn(CertificateSelection<'_>) -> Result<(), SelectCertError> + Send + Sync + 'static,
     {
         self.replace_ex_data(
-            Ssl::cached_ex_index::<ConnectionCallback>(),
+            *CONNECTION_CALLBACK_INDEX,
             ConnectionCallback(Some(Arc::new(callback))),
         );
         unsafe {
@@ -161,7 +173,7 @@ unsafe extern "C" fn context_callback(ssl: *mut ffi::SSL, _: *mut c_void) -> c_i
     let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
     let callback = ssl
         .ssl_context()
-        .ex_data(SslContext::cached_ex_index::<ContextCallback>())
+        .ex_data(*CONTEXT_CALLBACK_INDEX)
         .expect("BUG: certificate callback missing")
         .0
         .clone();
@@ -171,7 +183,7 @@ unsafe extern "C" fn context_callback(ssl: *mut ffi::SSL, _: *mut c_void) -> c_i
 unsafe extern "C" fn connection_callback(ssl: *mut ffi::SSL, _: *mut c_void) -> c_int {
     let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
     let callback = ssl
-        .ex_data(Ssl::cached_ex_index::<ConnectionCallback>())
+        .ex_data(*CONNECTION_CALLBACK_INDEX)
         .and_then(|callback| callback.0.clone())
         .expect("BUG: connection certificate callback missing");
     callback_result(callback(CertificateSelection(ssl)))
