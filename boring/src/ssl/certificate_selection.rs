@@ -116,7 +116,8 @@ impl SslContextBuilder {
     /// On clients, runs only when the server requests a client certificate.
     /// Resumed client sessions do not request a fresh certificate. On servers,
     /// runs before the resumption decision. Rejected ECH skips client selection.
-    /// Callback errors produce a native `internal_error` alert.
+    /// Fatal callback errors generate `internal_error`; delivery to the peer is
+    /// best-effort and may fail under transport backpressure.
     ///
     /// Configure credentials through [`CertificateSelection::ssl_mut`]. `Ok(())`
     /// continues with the configured credentials. To omit a client certificate or

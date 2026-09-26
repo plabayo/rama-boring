@@ -491,65 +491,72 @@ async fn cancelling_pending_selection_or_signature_drops_future_and_transport() 
     }
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_connections_keep_separate_pending_selections() {
-    for version in VERSIONS {
-        let id_index = Ssl::new_ex_index::<usize>().unwrap();
-        let starts = Arc::new(AtomicUsize::new(0));
-        let finishes = Arc::new(AtomicUsize::new(0));
-        let count = starts.clone();
-        let done = finishes.clone();
-        let mut c = client(version);
-        c.set_async_certificate_callback(move |selection| {
-            let id = *selection.ssl().ex_data(id_index).unwrap();
-            count.fetch_add(1, SeqCst);
-            let done = done.clone();
-            Ok(Box::pin(async move {
-                for _ in 0..id + 1 {
-                    tokio::task::yield_now().await;
-                }
-                tokio::time::sleep(Duration::from_millis((id % 3) as u64)).await;
-                Ok(Box::new(move |mut selection: CertificateSelection<'_>| {
-                    assert_eq!(*selection.ssl().ex_data(id_index).unwrap(), id);
-                    done.fetch_add(1, SeqCst);
-                    let identity = if id % 2 == 0 {
-                        &material().client
-                    } else {
-                        &material().other_client
-                    };
-                    selection
-                        .ssl_mut()
-                        .add_credential(&identity.credential())
-                        .unwrap();
-                    Ok(())
-                }) as BoxCertificateFinish)
-            }))
-        });
-        let c = c.build();
-        let mut s = server(
-            version,
-            SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
-        );
-        s.cert_store_mut()
-            .add_cert(material().other_ca.cert.clone())
-            .unwrap();
-        let s = s.build();
-        let work = (0..8).map(|id| {
-            let mut ssl = c.configure().unwrap().into_ssl(Some("localhost")).unwrap();
-            ssl.set_ex_data(id_index, id);
-            let expected = if id % 2 == 0 {
-                &material().client.cert
-            } else {
-                &material().other_client.cert
+    for independent_contexts in [false, true] {
+        for version in VERSIONS {
+            let id_index = Ssl::new_ex_index::<usize>().unwrap();
+            let starts = Arc::new(AtomicUsize::new(0));
+            let finishes = Arc::new(AtomicUsize::new(0));
+            let configure = || {
+                let count = starts.clone();
+                let done = finishes.clone();
+                let mut c = client(version);
+                c.set_async_certificate_callback(move |selection| {
+                    let id = *selection.ssl().ex_data(id_index).unwrap();
+                    count.fetch_add(1, SeqCst);
+                    let done = done.clone();
+                    Ok(Box::pin(async move {
+                        for _ in 0..id + 1 {
+                            tokio::task::yield_now().await;
+                        }
+                        tokio::time::sleep(Duration::from_millis((id % 3) as u64)).await;
+                        Ok(Box::new(move |mut selection: CertificateSelection<'_>| {
+                            assert_eq!(*selection.ssl().ex_data(id_index).unwrap(), id);
+                            done.fetch_add(1, SeqCst);
+                            let identity = if id % 2 == 0 {
+                                &material().client
+                            } else {
+                                &material().other_client
+                            };
+                            selection
+                                .ssl_mut()
+                                .add_credential(&identity.credential())
+                                .unwrap();
+                            Ok(())
+                        }) as BoxCertificateFinish)
+                    }))
+                });
+                c.build()
             };
-            pair(s.clone(), ssl, Some(expected))
-        });
-        for (s, c) in bounded(futures::future::join_all(work)).await {
-            s.unwrap();
-            c.unwrap();
+            let shared = (!independent_contexts).then(&configure);
+            let mut s = server(
+                version,
+                SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
+            );
+            s.cert_store_mut()
+                .add_cert(material().other_ca.cert.clone())
+                .unwrap();
+            let s = s.build();
+            let work = (0..32).map(|id| {
+                let c = shared.clone().unwrap_or_else(&configure);
+                let mut ssl = c.configure().unwrap().into_ssl(Some("localhost")).unwrap();
+                ssl.set_ex_data(id_index, id);
+                let expected = if id % 2 == 0 {
+                    &material().client.cert
+                } else {
+                    &material().other_client.cert
+                };
+                tokio::spawn(pair(s.clone(), ssl, Some(expected)))
+            });
+            for result in bounded(futures::future::join_all(work)).await {
+                let (s, c) = result.unwrap();
+                s.unwrap();
+                c.unwrap();
+            }
+            assert_eq!(starts.load(SeqCst), 32);
+            assert_eq!(finishes.load(SeqCst), 32);
         }
-        assert_eq!(starts.load(SeqCst), 8);
-        assert_eq!(finishes.load(SeqCst), 8);
     }
 }
 
@@ -593,6 +600,8 @@ async fn paused_egress_waits_for_ingress_verification_and_maps_identity() {
             let bad_signature = failure == 2;
             let must_fail = failure != 0;
             let (request_tx, request_rx) = oneshot::channel();
+            let ingress_started = Arc::new(tokio::sync::Notify::new());
+            let ready = ingress_started.clone();
             let (identity_tx, identity_rx) = oneshot::channel::<SslCredential>();
             let exchange = Mutex::new(Some((request_tx, identity_rx)));
             let resolved = Arc::new(AtomicUsize::new(0));
@@ -605,9 +614,12 @@ async fn paused_egress_waits_for_ingress_verification_and_maps_identity() {
                     .collect::<Vec<_>>();
                 let (request, identity) =
                     exchange.lock().unwrap().take().expect("factory ran twice");
-                request.send(names).unwrap();
                 let count = count.clone();
+                let ready = ready.clone();
                 Ok(Box::pin(async move {
+                    ready.notified().await;
+                    tokio::task::yield_now().await;
+                    request.send(names).map_err(|_| AsyncSelectCertError)?;
                     let credential = identity.await.map_err(|_| AsyncSelectCertError)?;
                     count.fetch_add(1, SeqCst);
                     Ok(install(credential))
@@ -649,11 +661,6 @@ async fn paused_egress_waits_for_ingress_verification_and_maps_identity() {
                 }))
             });
             let driver = async {
-                let names = request_rx.await.unwrap();
-                assert_eq!(
-                    names,
-                    vec![material().other_ca.cert.subject_name().to_der().unwrap()]
-                );
                 let checked = Arc::new(AtomicUsize::new(0));
                 let count = checked.clone();
                 let mut ingress = server(
@@ -681,6 +688,27 @@ async fn paused_egress_waits_for_ingress_verification_and_maps_identity() {
                         }))
                     },
                 );
+                // Both handshakes now pause in their own selection callbacks. The
+                // ingress request policy is installed only after egress requests it.
+                ingress.set_verify(SslVerifyMode::NONE);
+                let request = Mutex::new(Some(request_rx));
+                ingress.set_async_certificate_callback(move |_| {
+                    let request = request.lock().unwrap().take().ok_or(AsyncSelectCertError)?;
+                    ingress_started.notify_one();
+                    Ok(Box::pin(async move {
+                        let names = request.await.map_err(|_| AsyncSelectCertError)?;
+                        if names != vec![material().other_ca.cert.subject_name().to_der().unwrap()]
+                        {
+                            return Err(AsyncSelectCertError);
+                        }
+                        Ok(Box::new(|mut selection: CertificateSelection<'_>| {
+                            selection.ssl_mut().set_verify(
+                                SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
+                            );
+                            Ok(())
+                        }) as BoxCertificateFinish)
+                    }))
+                });
                 let result = accept(
                     ingress_io,
                     ingress.build(),
@@ -1597,5 +1625,276 @@ async fn cancelling_handshake_drops_selection_but_not_a_borrowed_transport() {
             assert!(server.await.is_err());
         })
         .await;
+    }
+}
+
+fn configure_routing_verifier(
+    ctx: &mut rama_boring::ssl::SslContextBuilder,
+    kind: u8,
+    calls: Arc<AtomicUsize>,
+    allow: bool,
+) {
+    use rama_boring::ssl::{BoxCustomVerifyFinish, SslAlert, SslVerifyError};
+    let mode = SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT;
+    match kind {
+        0 => ctx.set_custom_verify_callback(mode, move |_| {
+            calls.fetch_add(1, SeqCst);
+            if allow {
+                Ok(())
+            } else {
+                Err(SslVerifyError::Invalid(SslAlert::BAD_CERTIFICATE))
+            }
+        }),
+        1 => ctx.set_async_custom_verify_callback(mode, move |_| {
+            calls.fetch_add(1, SeqCst);
+            Ok(Box::pin(async move {
+                tokio::task::yield_now().await;
+                Ok(Box::new(move |_: &mut rama_boring::ssl::SslRef| {
+                    if allow {
+                        Ok(())
+                    } else {
+                        Err(SslAlert::BAD_CERTIFICATE)
+                    }
+                }) as BoxCustomVerifyFinish)
+            }))
+        }),
+        _ => ctx.set_verify_callback(mode, move |valid, _| {
+            calls.fetch_add(1, SeqCst);
+            valid && allow
+        }),
+    }
+}
+
+#[tokio::test]
+async fn sni_routing_preserves_the_original_verifier_and_its_captures() {
+    for version in VERSIONS {
+        for kind in 0..3 {
+            for allow in [false, true] {
+                for different_instance in [false, true] {
+                    let original_calls = Arc::new(AtomicUsize::new(0));
+                    let routed_calls = Arc::new(AtomicUsize::new(0));
+                    let mut routed = server(version, SslVerifyMode::NONE);
+                    if different_instance {
+                        configure_routing_verifier(&mut routed, kind, routed_calls.clone(), !allow);
+                    }
+                    let routed = routed.build();
+                    let mut s = server(version, SslVerifyMode::NONE);
+                    configure_routing_verifier(&mut s, kind, original_calls.clone(), allow);
+                    s.set_servername_callback(move |ssl, _| {
+                        ssl.set_ssl_context(routed.context())
+                            .map_err(|_| rama_boring::ssl::SniError::ALERT_FATAL)
+                    });
+                    let mut c = client(version);
+                    c.add_credential(&material().client.credential()).unwrap();
+                    let (s, c) =
+                        pair(s.build(), client_ssl(c), Some(&material().client.cert)).await;
+                    assert_eq!(
+                        s.is_ok(),
+                        allow,
+                        "version={version:?}, kind={kind}, new callback={different_instance}"
+                    );
+                    assert_eq!(c.is_ok(), allow);
+                    assert!(original_calls.load(SeqCst) > 0);
+                    assert_eq!(routed_calls.load(SeqCst), 0);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn routed_client_auth_policy_requires_explicit_per_connection_configuration() {
+    for version in VERSIONS {
+        for apply in [false, true] {
+            let mode = SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT;
+            let routed = server(version, mode).build();
+            let calls = Arc::new(AtomicUsize::new(0));
+            let count = calls.clone();
+            let mut s = server(version, SslVerifyMode::NONE);
+            s.set_servername_callback(move |ssl, _| {
+                ssl.set_ssl_context(routed.context())
+                    .map_err(|_| rama_boring::ssl::SniError::ALERT_FATAL)?;
+                count.fetch_add(1, SeqCst);
+                if apply {
+                    ssl.set_verify(mode);
+                }
+                Ok(())
+            });
+            let (s, c) = pair(s.build(), client_ssl(client(version)), None).await;
+            assert_eq!(s.is_err(), apply);
+            assert_eq!(c.is_err(), apply);
+            assert_eq!(calls.load(SeqCst), 1);
+        }
+    }
+}
+
+struct RoutingSigner {
+    key: PKey<Private>,
+    calls: Arc<AtomicUsize>,
+    finishes: Arc<AtomicUsize>,
+    route: Option<rama_boring::ssl::SslContext>,
+}
+impl rama_boring::ssl::AsyncPrivateKeyMethod for RoutingSigner {
+    fn sign(
+        &self,
+        ssl: &mut rama_boring::ssl::SslRef,
+        input: &[u8],
+        _: SslSignatureAlgorithm,
+        _: &mut [u8],
+    ) -> Result<
+        rama_boring::ssl::BoxPrivateKeyMethodFuture,
+        rama_boring::ssl::AsyncPrivateKeyMethodError,
+    > {
+        use rama_boring::ssl::{AsyncPrivateKeyMethodError, BoxPrivateKeyMethodFinish};
+        self.calls.fetch_add(1, SeqCst);
+        if let Some(ctx) = &self.route {
+            ssl.set_ssl_context(ctx)
+                .map_err(|_| AsyncPrivateKeyMethodError)?;
+            // Repeated routing must not replace the selected credential's owner.
+            let other = server(ssl.version().unwrap(), SslVerifyMode::NONE).build();
+            ssl.set_ssl_context(other.context())
+                .map_err(|_| AsyncPrivateKeyMethodError)?;
+        }
+        let (key, input, finishes) = (self.key.clone(), input.to_vec(), self.finishes.clone());
+        Ok(Box::pin(async move {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            Ok(
+                Box::new(move |_: &mut rama_boring::ssl::SslRef, out: &mut [u8]| {
+                    let mut signer = rama_boring::sign::Signer::new(MessageDigest::sha256(), &key)
+                        .map_err(|_| AsyncPrivateKeyMethodError)?;
+                    signer
+                        .update(&input)
+                        .map_err(|_| AsyncPrivateKeyMethodError)?;
+                    let written = signer.sign(out).map_err(|_| AsyncPrivateKeyMethodError)?;
+                    finishes.fetch_add(1, SeqCst);
+                    Ok(written)
+                }) as BoxPrivateKeyMethodFinish,
+            )
+        }))
+    }
+    fn decrypt(
+        &self,
+        _: &mut rama_boring::ssl::SslRef,
+        _: &[u8],
+        _: &mut [u8],
+    ) -> Result<
+        rama_boring::ssl::BoxPrivateKeyMethodFuture,
+        rama_boring::ssl::AsyncPrivateKeyMethodError,
+    > {
+        Err(rama_boring::ssl::AsyncPrivateKeyMethodError)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn selected_signer_keeps_its_owner_across_context_switches() {
+    for version in VERSIONS {
+        for credential_level in [false, true] {
+            for in_signer in [false, true] {
+                for replacement_signer in [false, true] {
+                    let (calls, finishes, wrong_calls) = (
+                        Arc::new(AtomicUsize::new(0)),
+                        Arc::new(AtomicUsize::new(0)),
+                        Arc::new(AtomicUsize::new(0)),
+                    );
+                    let mut routed = server(version, SslVerifyMode::NONE);
+                    if replacement_signer {
+                        routed
+                            .set_certificate(&material().other_client.cert)
+                            .unwrap();
+                        routed
+                            .set_private_key(&material().other_client.key)
+                            .unwrap();
+                        routed.set_async_private_key_method(RoutingSigner {
+                            key: material().other_client.key.clone(),
+                            calls: wrong_calls.clone(),
+                            finishes: Arc::new(AtomicUsize::new(0)),
+                            route: None,
+                        });
+                    }
+                    let routed = routed.build();
+                    let signer = RoutingSigner {
+                        key: material().server.key.clone(),
+                        calls: calls.clone(),
+                        finishes: finishes.clone(),
+                        route: in_signer.then(|| routed.context().to_owned()),
+                    };
+                    let mut s = server(version, SslVerifyMode::NONE);
+                    if credential_level {
+                        let mut cred = SslCredential::builder().unwrap();
+                        cred.set_certificate_chain([&material().server.cert])
+                            .unwrap();
+                        cred.set_async_private_key_method(signer).unwrap();
+                        s.add_credential(&cred.build()).unwrap();
+                    } else {
+                        s.set_async_private_key_method(signer);
+                    }
+                    if !in_signer {
+                        s.set_alpn_select_callback(move |ssl, offered| {
+                            ssl.set_ssl_context(routed.context())
+                                .map_err(|_| rama_boring::ssl::AlpnError::ALERT_FATAL)?;
+                            rama_boring::ssl::select_next_proto(b"\x02h2", offered)
+                                .ok_or(rama_boring::ssl::AlpnError::ALERT_FATAL)
+                        });
+                    }
+                    let (s, c) = pair(s.build(), client_ssl(client(version)), None).await;
+                    s.unwrap();
+                    c.unwrap();
+                    assert_eq!(calls.load(SeqCst), 1);
+                    assert_eq!(finishes.load(SeqCst), 1);
+                    assert_eq!(wrong_calls.load(SeqCst), 0);
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn routing_before_selection_uses_the_destination_signer() {
+    for version in VERSIONS {
+        let (calls, finishes) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let mut routed = server(version, SslVerifyMode::NONE);
+        routed.set_async_private_key_method(RoutingSigner {
+            key: material().server.key.clone(),
+            calls: calls.clone(),
+            finishes: finishes.clone(),
+            route: None,
+        });
+        let routed = routed.build();
+        let mut s = server(version, SslVerifyMode::NONE);
+        s.set_select_certificate_callback(move |mut hello| {
+            hello
+                .ssl_mut()
+                .set_ssl_context(routed.context())
+                .map_err(|_| rama_boring::ssl::SelectCertError::ERROR)
+        });
+        let (s, c) = pair(s.build(), client_ssl(client(version)), None).await;
+        s.unwrap();
+        c.unwrap();
+        assert_eq!(calls.load(SeqCst), 1);
+        assert_eq!(finishes.load(SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn incompatible_first_credential_falls_back_to_the_second() {
+    for version in VERSIONS {
+        let mut c = client(version);
+        c.set_certificate_callback(|mut selection| {
+            let ssl = selection.ssl_mut();
+            ssl.clear_certificates();
+            ssl.add_credential(&issuer_constrained_credential())
+                .map_err(|_| rama_boring::ssl::SelectCertError::ERROR)?;
+            ssl.add_credential(&material().client.credential())
+                .map_err(|_| rama_boring::ssl::SelectCertError::ERROR)
+        });
+        let (s, c) = pair(
+            server(version, SslVerifyMode::PEER).build(),
+            client_ssl(c),
+            Some(&material().client.cert),
+        )
+        .await;
+        s.unwrap();
+        c.unwrap();
     }
 }

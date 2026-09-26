@@ -504,6 +504,7 @@ static INDEXES: LazyLock<Mutex<HashMap<TypeId, c_int>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static SSL_INDEXES: LazyLock<Mutex<HashMap<TypeId, c_int>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+// Retain the initial context for sessions and verification callbacks copied at SSL_new.
 static SESSION_CTX_INDEX: LazyLock<Index<Ssl, SslContext>> =
     LazyLock::new(|| Ssl::new_ex_index().unwrap());
 static X509_FLAG_INDEX: LazyLock<Index<SslContext, bool>> =
@@ -1180,6 +1181,9 @@ impl SslContextBuilder {
     /// Some useful alerts include [`SslAlert::CERTIFICATE_EXPIRED`], [`SslAlert::CERTIFICATE_REVOKED`],
     /// [`SslAlert::UNKNOWN_CA`], [`SslAlert::BAD_CERTIFICATE`], [`SslAlert::CERTIFICATE_UNKNOWN`],
     /// and [`SslAlert::INTERNAL_ERROR`]. See RFC 5246 section 7.2.2 for their precise meanings.
+    ///
+    /// Acceptance here does not prove possession of the peer's private key. Wait
+    /// for the complete handshake before relying on the authenticated identity.
     ///
     /// To verify a certificate asynchronously, the callback may return `Err(SslVerifyError::Retry)`.
     /// The handshake will then pause with an error with code [`ErrorCode::WANT_CERTIFICATE_VERIFY`].
@@ -3623,10 +3627,18 @@ impl SslRef {
     /// Changes the context corresponding to the current connection.
     ///
     /// It is most commonly used in the Server Name Indication (SNI) callback.
-    /// A different context replaces the certificate callback and credentials,
-    /// including per-connection overrides. An active async certificate selection
-    /// or custom verification is cancelled and the handshake will fail. Pending
-    /// early ClientHello callbacks are also cancelled; route in their finish closure.
+    /// A different context replaces the certificate callback and configured credentials,
+    /// including their per-connection overrides. An already selected credential and
+    /// its signer stay selected for the current handshake.
+    ///
+    /// Verification mode and callbacks installed with `set_verify_callback` or
+    /// `set_custom_verify_callback` are preserved. Re-apply them explicitly after
+    /// routing when the destination requires a different client-auth policy.
+    /// The context-level [`SslContextBuilder::set_cert_verify_callback`] hook instead
+    /// follows `ctx`, as does its default certificate store.
+    /// An active async certificate selection or custom verification is cancelled
+    /// and the handshake will fail. Pending early ClientHello callbacks are also
+    /// cancelled; route in their finish closure.
     #[corresponds(SSL_set_SSL_CTX)]
     pub fn set_ssl_context(&mut self, ctx: &SslContextRef) -> Result<(), ErrorStack> {
         assert_eq!(
@@ -3635,10 +3647,16 @@ impl SslRef {
             "X.509 certificate support in old and new contexts doesn't match",
         );
         let changed = self.ssl_context().as_ptr() != ctx.as_ptr();
+        let selected_owner = changed
+            .then(|| credential::capture_selected_credential_context(self))
+            .flatten();
         unsafe {
             cvt_p(ffi::SSL_set_SSL_CTX(self.as_ptr(), ctx.as_ptr()))?;
         }
         if changed {
+            if let Some(owner) = selected_owner {
+                self.set_ex_data(*credential::SELECTED_CREDENTIAL_CONTEXT_INDEX, owner);
+            }
             certificate_selection::clear_connection_callback(self);
             async_callbacks::context_changed(self);
         }

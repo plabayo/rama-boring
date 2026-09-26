@@ -32,12 +32,13 @@ where
     let ssl_idx = X509StoreContext::ssl_idx().expect("BUG: store context ssl index missing");
     let verify_idx = SslContext::cached_ex_index::<F>();
 
-    let verify = ctx
+    let Some(verify) = ctx
         .ex_data(ssl_idx)
-        .expect("BUG: store context missing ssl")
-        .ssl_context()
-        .ex_data(verify_idx)
-        .expect("BUG: verify callback missing");
+        .and_then(|ssl| ssl.ex_data(*SESSION_CTX_INDEX))
+        .and_then(|ctx| ctx.ex_data(verify_idx))
+    else {
+        return 0;
+    };
 
     // SAFETY: The callback won't outlive the context it's associated with
     // because there is no `X509StoreContextRef::ssl_mut(&mut self)` method.
@@ -56,10 +57,12 @@ where
     let callback = |ssl: &mut SslRef| {
         let custom_verify_idx = SslContext::cached_ex_index::<F>();
 
-        let ssl_context = ssl.ssl_context().to_owned();
+        // SSL_set_SSL_CTX preserves the verification callback installed at SSL_new.
+        let ssl_context = ssl.ex_data(*SESSION_CTX_INDEX).cloned();
         let callback = ssl_context
-            .ex_data(custom_verify_idx)
-            .expect("BUG: custom verify callback missing");
+            .as_ref()
+            .and_then(|ctx| ctx.ex_data(custom_verify_idx))
+            .ok_or(SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR))?;
 
         callback(ssl)
     };
@@ -105,8 +108,8 @@ where
     let callback = |ssl: &mut SslRef| {
         let callback = ssl
             .ex_data(Ssl::cached_ex_index::<Arc<F>>())
-            .expect("BUG: ssl verify callback missing")
-            .clone();
+            .cloned()
+            .ok_or(SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR))?;
 
         callback(ssl)
     };
@@ -603,12 +606,14 @@ where
     // mutate the connection. Credential-specific methods take precedence over
     // the legacy context method.
     let credential = ssl.selected_credential().map(ToOwned::to_owned);
-    let ssl_context = ssl.ssl_context().to_owned();
-    let method = credential
+    let ssl_context = super::credential::selected_credential_context(ssl).to_owned();
+    let Some(method) = credential
         .as_ref()
         .and_then(|cred| cred.ex_data(super::SslCredential::cached_ex_index::<M>()))
         .or_else(|| ssl_context.ex_data(SslContext::cached_ex_index::<M>()))
-        .expect("BUG: private key method missing");
+    else {
+        return ffi::ssl_private_key_result_t::ssl_private_key_failure;
+    };
 
     match callback(method, ssl, output) {
         Ok(written) => {

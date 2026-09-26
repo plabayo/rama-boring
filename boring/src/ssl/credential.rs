@@ -1,4 +1,4 @@
-use super::{buffer::CryptoBuffer, SslSignatureAlgorithm};
+use super::{buffer::CryptoBuffer, Ssl, SslContext, SslContextRef, SslRef, SslSignatureAlgorithm};
 use crate::error::ErrorStack;
 use crate::ex_data::Index;
 use crate::pkey::{PKeyRef, Private};
@@ -18,6 +18,45 @@ use std::sync::{LazyLock, Mutex};
 
 static SSL_CREDENTIAL_INDEXES: LazyLock<Mutex<HashMap<TypeId, c_int>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+// A selected legacy credential outlives context routing. Its method must keep
+// resolving through the context that supplied it, even before the first sign call.
+pub(super) struct SelectedCredentialContext {
+    credential: SslCredential,
+    context: SslContext,
+}
+
+pub(super) static SELECTED_CREDENTIAL_CONTEXT_INDEX: LazyLock<
+    Index<Ssl, SelectedCredentialContext>,
+> = LazyLock::new(|| Ssl::new_ex_index().unwrap());
+
+pub(super) fn selected_credential_context(ssl: &SslRef) -> &SslContextRef {
+    if let Some(owner) = ssl.ex_data(*SELECTED_CREDENTIAL_CONTEXT_INDEX) {
+        if ssl
+            .selected_credential()
+            .is_some_and(|cred| cred.as_ptr() == owner.credential.as_ptr())
+        {
+            return &owner.context;
+        }
+    }
+    ssl.ssl_context()
+}
+
+pub(super) fn capture_selected_credential_context(
+    ssl: &SslRef,
+) -> Option<SelectedCredentialContext> {
+    let credential = ssl.selected_credential()?;
+    if ssl
+        .ex_data(*SELECTED_CREDENTIAL_CONTEXT_INDEX)
+        .is_some_and(|owner| owner.credential.as_ptr() == credential.as_ptr())
+    {
+        return None;
+    }
+    Some(SelectedCredentialContext {
+        credential: credential.to_owned(),
+        context: ssl.ssl_context().to_owned(),
+    })
+}
 
 foreign_type_and_impl_send_sync! {
     type CType = ffi::SSL_CREDENTIAL;

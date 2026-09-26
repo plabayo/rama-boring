@@ -210,7 +210,8 @@ impl SslContextBuilder {
     /// selection does no transport I/O; callers should enforce a deadline.
     ///
     /// A task waker must be installed with [`SslRef::set_task_waker`];
-    /// `rama-boring-tokio` handles this automatically.
+    /// `rama-boring-tokio` handles this automatically. Without a waker the callback
+    /// fails before running its factory.
     /// Dropping the SSL drops its pending future without calling the finish closure.
     /// This does not undo external effects or cancel independently spawned tasks.
     ///
@@ -243,6 +244,7 @@ impl SslContextBuilder {
     }
 
     /// Configures a custom private key method on the context.
+    /// Without a task waker, signing fails without calling the signer.
     ///
     /// A task waker must be set on `Ssl` values associated with the resulting
     /// `SslContext` with [`SslRef::set_task_waker`].
@@ -260,7 +262,8 @@ impl SslContextBuilder {
     /// only used for servers, not clients.
     ///
     /// A task waker must be set on `Ssl` values associated with the resulting
-    /// `SslContext` with [`SslRef::set_task_waker`].
+    /// `SslContext` with [`SslRef::set_task_waker`]. Without one, the callback is
+    /// skipped and lookup reports a cache miss, allowing a full handshake.
     ///
     /// See [`SslContextBuilder::set_get_session_callback`] for the sync setter
     /// of this callback.
@@ -281,6 +284,7 @@ impl SslContextBuilder {
                 |ssl| ssl,
                 |ssl| callback(ssl, id).ok_or(()),
                 |option| option.ok_or(()),
+                (),
             );
 
             match fut_poll_result {
@@ -322,6 +326,7 @@ impl SslContextBuilder {
 
 impl super::SslCredentialBuilder {
     /// Configures an asynchronous signer on this credential.
+    /// Without a task waker, signing fails without calling the signer.
     /// See [`AsyncPrivateKeyMethod`] and [`SslRef::set_task_waker`].
     pub fn set_async_private_key_method(
         &mut self,
@@ -351,7 +356,10 @@ impl SslRef {
         self.set_custom_verify_callback(mode, async_custom_verify_callback(callback));
     }
 
-    /// Sets the task waker to be used in async callbacks installed on this `Ssl`.
+    /// Sets the task waker for async callbacks. `rama-boring-tokio` sets it per poll.
+    /// Without one, async factories and finish closures are not called, and pending
+    /// futures are dropped. Selection, verification and signing report failure;
+    /// async session lookup reports a cache miss, allowing a full handshake.
     pub fn set_task_waker(&mut self, waker: Option<Waker>) {
         self.replace_ex_data(*TASK_WAKER_INDEX, waker);
     }
@@ -378,6 +386,13 @@ fn with_callback_state<H, T: 'static, E: Copy + 'static>(
     finish: impl FnOnce(&mut H, T) -> Result<(), E>,
     invalidated_error: E,
 ) -> Poll<Result<(), E>> {
+    let ssl = ssl_mut(handle);
+    let Some(waker) = ssl.ex_data(*TASK_WAKER_INDEX).cloned().flatten() else {
+        if let Some(state) = ssl.ex_data_mut(index).map(MutOnly::get_mut) {
+            *state = CallbackState::Invalidated;
+        }
+        return Poll::Ready(Err(invalidated_error));
+    };
     let state = callback_state(ssl_mut(handle), index);
     let future = match std::mem::replace(state, CallbackState::Running) {
         CallbackState::Idle => create(handle),
@@ -395,13 +410,6 @@ fn with_callback_state<H, T: 'static, E: Copy + 'static>(
         ) {
             return Poll::Ready(Err(invalidated_error));
         }
-        let Some(waker) = ssl_mut(handle)
-            .ex_data(*TASK_WAKER_INDEX)
-            .cloned()
-            .flatten()
-        else {
-            return Poll::Ready(Err(invalidated_error));
-        };
         match future.as_mut().poll(&mut Context::from_waker(&waker)) {
             Poll::Pending => {
                 *callback_state(ssl_mut(handle), index) = CallbackState::Pending(future);
@@ -576,6 +584,7 @@ fn with_private_key_method(
         |ssl| ssl,
         |ssl| create_fut(ssl, output),
         identity,
+        AsyncPrivateKeyMethodError,
     );
 
     let fut_result = match fut_poll_result {
@@ -598,13 +607,15 @@ fn with_ex_data_future<H, R, T, E>(
     get_ssl_mut: impl Fn(&mut H) -> &mut SslRef,
     create_fut: impl FnOnce(&mut H) -> Result<ExDataFuture<R>, E>,
     into_result: impl Fn(R) -> Result<T, E>,
+    missing_waker_error: E,
 ) -> Poll<Result<T, E>> {
     let ssl = get_ssl_mut(ssl_handle);
-    let waker = ssl
-        .ex_data(*TASK_WAKER_INDEX)
-        .cloned()
-        .flatten()
-        .expect("task waker should be set");
+    let Some(waker) = ssl.ex_data(*TASK_WAKER_INDEX).cloned().flatten() else {
+        if let Some(data) = ssl.ex_data_mut(index).map(MutOnly::get_mut) {
+            *data = None;
+        }
+        return Poll::Ready(Err(missing_waker_error));
+    };
 
     let mut ctx = Context::from_waker(&waker);
 

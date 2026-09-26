@@ -427,7 +427,12 @@ fn async_certificate_selection_without_a_waker_fails_without_panicking() {
     server.should_error();
     let server = server.build();
     let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
-    ctx.set_async_certificate_callback(|_| Ok(Box::pin(std::future::pending())));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    ctx.set_async_certificate_callback(move |_| {
+        count.fetch_add(1, SeqCst);
+        Ok(Box::pin(std::future::pending()))
+    });
     let socket = server.connect_tcp();
     socket
         .set_read_timeout(Some(Duration::from_secs(5)))
@@ -439,6 +444,7 @@ fn async_certificate_selection_without_a_waker_fails_without_panicking() {
         Ssl::new(&ctx.build()).unwrap().connect(socket),
         Err(HandshakeError::Failure(_))
     ));
+    assert_eq!(calls.load(SeqCst), 0);
 }
 
 #[test]
@@ -484,5 +490,153 @@ fn selection_errors_send_internal_error_when_transport_is_writable() {
                 Err(HandshakeError::Failure(_))
             ));
         }
+    }
+}
+
+struct PendingSigner {
+    calls: Arc<AtomicUsize>,
+    drops: Arc<AtomicUsize>,
+}
+impl crate::ssl::AsyncPrivateKeyMethod for PendingSigner {
+    fn sign(
+        &self,
+        _: &mut crate::ssl::SslRef,
+        _: &[u8],
+        _: crate::ssl::SslSignatureAlgorithm,
+        _: &mut [u8],
+    ) -> Result<crate::ssl::BoxPrivateKeyMethodFuture, crate::ssl::AsyncPrivateKeyMethodError> {
+        self.calls.fetch_add(1, SeqCst);
+        let probe = DropProbe(self.drops.clone());
+        Ok(Box::pin(async move {
+            let _probe = probe;
+            std::future::pending().await
+        }))
+    }
+    fn decrypt(
+        &self,
+        _: &mut crate::ssl::SslRef,
+        _: &[u8],
+        _: &mut [u8],
+    ) -> Result<crate::ssl::BoxPrivateKeyMethodFuture, crate::ssl::AsyncPrivateKeyMethodError> {
+        Err(crate::ssl::AsyncPrivateKeyMethodError)
+    }
+}
+
+#[test]
+fn async_signing_requires_a_waker_before_factory_and_resume() {
+    for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
+        for credential_level in [false, true] {
+            for remove_while_pending in [false, true] {
+                let (calls, drops) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+                let signer = PendingSigner {
+                    calls: calls.clone(),
+                    drops: drops.clone(),
+                };
+                let mut server = Server::builder();
+                server.ctx().set_min_proto_version(Some(version)).unwrap();
+                server.ctx().set_max_proto_version(Some(version)).unwrap();
+                if credential_level {
+                    let cert =
+                        crate::x509::X509::from_pem(include_bytes!("../../../test/cert.pem"))
+                            .unwrap();
+                    let mut credential = crate::ssl::SslCredential::builder().unwrap();
+                    credential.set_certificate_chain([&cert]).unwrap();
+                    credential.set_async_private_key_method(signer).unwrap();
+                    server.ctx().add_credential(&credential.build()).unwrap();
+                } else {
+                    server.ctx().set_async_private_key_method(signer);
+                }
+                if remove_while_pending {
+                    server.ssl_cb(|ssl| ssl.set_task_waker(Some(Arc::new(NoopWake).into())));
+                    let drops = drops.clone();
+                    server.err_cb(move |error| {
+                        let mut mid = match error {
+                            HandshakeError::WouldBlock(mid) => mid,
+                            other => panic!("signature did not pause: {other}"),
+                        };
+                        assert_eq!(drops.load(SeqCst), 0);
+                        mid.ssl_mut().set_task_waker(None);
+                        let error = mid.handshake().unwrap_err();
+                        assert!(matches!(error, HandshakeError::Failure(_)));
+                        assert_eq!(drops.load(SeqCst), 1);
+                    });
+                } else {
+                    server.should_error();
+                }
+                let server = server.build();
+                let ctx = SslContext::builder(SslMethod::tls()).unwrap().build();
+                let socket = server.connect_tcp();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                assert!(Ssl::new(&ctx).unwrap().connect(socket).is_err());
+                drop(server);
+                assert_eq!(calls.load(SeqCst), usize::from(remove_while_pending));
+                assert_eq!(drops.load(SeqCst), usize::from(remove_while_pending));
+            }
+        }
+    }
+}
+
+#[test]
+fn async_session_lookup_without_a_waker_is_a_cache_miss_without_factory_side_effects() {
+    use crate::ssl::{SslOptions, SslSessionCacheMode};
+    for install_waker in [false, true] {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let mut server = Server::builder();
+        server.expected_connections_count(2);
+        server
+            .ctx()
+            .set_max_proto_version(Some(SslVersion::TLS1_2))
+            .unwrap();
+        server.ctx().set_options(SslOptions::NO_TICKET);
+        server
+            .ctx()
+            .set_session_id_context(b"async-lookup-waker")
+            .unwrap();
+        server
+            .ctx()
+            .set_session_cache_mode(SslSessionCacheMode::SERVER | SslSessionCacheMode::NO_INTERNAL);
+        unsafe {
+            // Always returns a miss, so no foreign session can be installed.
+            server.ctx().set_async_get_session_callback(move |_, _| {
+                count.fetch_add(1, SeqCst);
+                Some(Box::pin(async { None }))
+            });
+        }
+        if install_waker {
+            server.ssl_cb(|ssl| ssl.set_task_waker(Some(Arc::new(NoopWake).into())));
+        }
+        let server = server.build();
+        let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
+        ctx.set_max_proto_version(Some(SslVersion::TLS1_2)).unwrap();
+        let ctx = ctx.build();
+        let mut session: Option<crate::ssl::SslSession> = None;
+        for _ in 0..2 {
+            let mut ssl = Ssl::new(&ctx).unwrap();
+            if let Some(session) = &session {
+                // The session comes from the same context and server.
+                unsafe {
+                    ssl.set_session(session).unwrap();
+                }
+            }
+            let socket = server.connect_tcp();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut stream = ssl.connect(socket).unwrap();
+            stream.read_exact(&mut [0]).unwrap();
+            assert!(!stream.ssl().session_reused());
+            session = Some(stream.ssl().session().unwrap().to_owned());
+        }
+        drop(server);
+        assert_eq!(calls.load(SeqCst), usize::from(install_waker));
     }
 }
