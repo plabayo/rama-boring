@@ -1,8 +1,8 @@
 use super::mut_only::MutOnly;
 use super::{
-    ClientHello, GetSessionPendingError, PrivateKeyMethod, PrivateKeyMethodError, SelectCertError,
-    Ssl, SslAlert, SslContextBuilder, SslRef, SslSession, SslSignatureAlgorithm, SslVerifyError,
-    SslVerifyMode,
+    CertificateSelection, ClientHello, GetSessionPendingError, PrivateKeyMethod,
+    PrivateKeyMethodError, SelectCertError, Ssl, SslAlert, SslContextBuilder, SslRef, SslSession,
+    SslSignatureAlgorithm, SslVerifyError, SslVerifyMode,
 };
 use crate::ex_data::Index;
 use std::convert::identity;
@@ -16,6 +16,13 @@ pub type BoxSelectCertFuture = ExDataFuture<Result<BoxSelectCertFinish, AsyncSel
 
 /// The type of callbacks returned by [`BoxSelectCertFuture`] methods.
 pub type BoxSelectCertFinish = Box<dyn FnOnce(ClientHello<'_>) -> Result<(), AsyncSelectCertError>>;
+
+/// Future returned by [`SslContextBuilder::set_async_certificate_callback`].
+pub type BoxCertificateFuture = ExDataFuture<Result<BoxCertificateFinish, AsyncSelectCertError>>;
+
+/// Installs the credentials once a [`BoxCertificateFuture`] completes.
+pub type BoxCertificateFinish =
+    Box<dyn FnOnce(CertificateSelection<'_>) -> Result<(), AsyncSelectCertError>>;
 
 /// The type of futures returned by [`AsyncPrivateKeyMethod`] methods.
 pub type BoxPrivateKeyMethodFuture =
@@ -47,6 +54,8 @@ pub(crate) static TASK_WAKER_INDEX: LazyLock<Index<Ssl, Option<Waker>>> =
 pub(crate) static SELECT_CERT_FUTURE_INDEX: LazyLock<
     Index<Ssl, MutOnly<Option<BoxSelectCertFuture>>>,
 > = LazyLock::new(|| Ssl::new_ex_index().unwrap());
+static CERTIFICATE_FUTURE_INDEX: LazyLock<Index<Ssl, MutOnly<Option<BoxCertificateFuture>>>> =
+    LazyLock::new(|| Ssl::new_ex_index().unwrap());
 pub(crate) static SELECT_PRIVATE_KEY_METHOD_FUTURE_INDEX: LazyLock<
     Index<Ssl, MutOnly<Option<BoxPrivateKeyMethodFuture>>>,
 > = LazyLock::new(|| Ssl::new_ex_index().unwrap());
@@ -96,6 +105,23 @@ impl SslContextBuilder {
 
             finish(client_hello).or(Err(SelectCertError::ERROR))
         });
+    }
+
+    /// Asynchronously selects credentials using [`Self::set_certificate_callback`].
+    /// The factory runs once per selection; its future is retained across retries
+    /// and dropped with the SSL connection. Copy any borrowed request metadata
+    /// into the future, then configure the SSL in the returned finish callback.
+    ///
+    /// A task waker must be installed with [`SslRef::set_task_waker`];
+    /// `rama-boring-tokio` handles this automatically.
+    pub fn set_async_certificate_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&mut CertificateSelection<'_>) -> Result<BoxCertificateFuture, AsyncSelectCertError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.set_certificate_callback(async_certificate_callback(callback));
     }
 
     // TODO: cloudflare also has credential version which is fallible here (Result<(), ErrorStack>)
@@ -176,6 +202,18 @@ impl SslContextBuilder {
 }
 
 impl SslRef {
+    /// Overrides this connection's async certificate selection.
+    /// See [`SslContextBuilder::set_async_certificate_callback`].
+    pub fn set_async_certificate_callback<F>(&mut self, callback: F)
+    where
+        F: Fn(&mut CertificateSelection<'_>) -> Result<BoxCertificateFuture, AsyncSelectCertError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.set_certificate_callback(async_certificate_callback(callback));
+    }
+
     pub fn set_async_custom_verify_callback<F>(&mut self, mode: SslVerifyMode, callback: F)
     where
         F: Fn(&mut SslRef) -> Result<BoxCustomVerifyFuture, SslAlert> + Send + Sync + 'static,
@@ -186,6 +224,28 @@ impl SslRef {
     /// Sets the task waker to be used in async callbacks installed on this `Ssl`.
     pub fn set_task_waker(&mut self, waker: Option<Waker>) {
         self.replace_ex_data(*TASK_WAKER_INDEX, waker);
+    }
+}
+
+fn async_certificate_callback<F>(
+    callback: F,
+) -> impl Fn(CertificateSelection<'_>) -> Result<(), SelectCertError>
+where
+    F: Fn(&mut CertificateSelection<'_>) -> Result<BoxCertificateFuture, AsyncSelectCertError>
+        + Send
+        + Sync
+        + 'static,
+{
+    move |mut selection| match with_ex_data_future(
+        &mut selection,
+        *CERTIFICATE_FUTURE_INDEX,
+        CertificateSelection::ssl_mut,
+        &callback,
+        identity,
+    ) {
+        Poll::Pending => Err(SelectCertError::RETRY),
+        Poll::Ready(Err(_)) => Err(SelectCertError::ERROR),
+        Poll::Ready(Ok(finish)) => finish(selection).map_err(|_| SelectCertError::ERROR),
     }
 }
 

@@ -99,10 +99,12 @@ use crate::{cvt, cvt_0i, cvt_n, cvt_p, init, try_int};
 use crate::{ffi, free_data_box};
 
 pub use self::async_callbacks::{
-    AsyncPrivateKeyMethod, AsyncPrivateKeyMethodError, AsyncSelectCertError, BoxCustomVerifyFinish,
-    BoxCustomVerifyFuture, BoxGetSessionFinish, BoxGetSessionFuture, BoxPrivateKeyMethodFinish,
-    BoxPrivateKeyMethodFuture, BoxSelectCertFinish, BoxSelectCertFuture, ExDataFuture,
+    AsyncPrivateKeyMethod, AsyncPrivateKeyMethodError, AsyncSelectCertError, BoxCertificateFinish,
+    BoxCertificateFuture, BoxCustomVerifyFinish, BoxCustomVerifyFuture, BoxGetSessionFinish,
+    BoxGetSessionFuture, BoxPrivateKeyMethodFinish, BoxPrivateKeyMethodFuture, BoxSelectCertFinish,
+    BoxSelectCertFuture, ExDataFuture,
 };
+pub use self::certificate_selection::CertificateSelection;
 pub use self::connector::{
     ConnectConfiguration, SslAcceptor, SslAcceptorBuilder, SslConnector, SslConnectorBuilder,
 };
@@ -114,6 +116,7 @@ mod async_callbacks;
 mod bio;
 mod buffer;
 mod callbacks;
+mod certificate_selection;
 mod connector;
 mod credential;
 mod ech;
