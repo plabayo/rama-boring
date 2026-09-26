@@ -13,7 +13,7 @@ use std::{
 
 /// Certificate-selection state, available only while the selection callback runs.
 /// Copy request metadata before moving it into an asynchronous operation.
-pub struct CertificateSelection<'ssl>(&'ssl mut SslRef);
+pub struct CertificateSelection<'ssl>(pub(super) &'ssl mut SslRef);
 
 impl CertificateSelection<'_> {
     pub fn ssl(&self) -> &SslRef {
@@ -83,8 +83,18 @@ impl CertificateSelection<'_> {
     }
 }
 
-// Keep this callback's ex-data distinct from other callbacks with the same F.
-struct CertificateCallback<F>(Arc<F>);
+type CertificateCallback =
+    Arc<dyn Fn(CertificateSelection<'_>) -> Result<(), SelectCertError> + Send + Sync>;
+
+// One slot per SSL, so replacing a different closure type also releases captures.
+struct ConnectionCallback(Option<CertificateCallback>);
+struct ContextCallback(CertificateCallback);
+
+pub(super) fn clear_connection_callback(ssl: &mut SslRef) {
+    if let Some(callback) = ssl.ex_data_mut(Ssl::cached_ex_index::<ConnectionCallback>()) {
+        callback.0 = None;
+    }
+}
 
 impl SslContextBuilder {
     /// Selects the local certificate after peer extensions have been processed.
@@ -96,7 +106,8 @@ impl SslContextBuilder {
     /// Configure credentials through [`CertificateSelection::ssl_mut`]. `Ok(())`
     /// continues with the configured credentials. To omit a client certificate or
     /// replace all candidates, first call [`SslRef::clear_certificates`]; otherwise
-    /// inherited credentials remain eligible as fallbacks. An empty list permits
+    /// inherited modern credentials are tried before newly added credentials, and
+    /// the legacy certificate is tried last. An empty list permits
     /// an anonymous response, while a nonempty list with no usable credential fails.
     /// [`SelectCertError::ERROR`] aborts; [`SelectCertError::RETRY`] pauses with
     /// [`super::ErrorCode::WANT_X509_LOOKUP`]. This does not replace peer verification.
@@ -106,11 +117,11 @@ impl SslContextBuilder {
         F: Fn(CertificateSelection<'_>) -> Result<(), SelectCertError> + Send + Sync + 'static,
     {
         self.replace_ex_data(
-            SslContext::cached_ex_index::<CertificateCallback<F>>(),
-            CertificateCallback(Arc::new(callback)),
+            SslContext::cached_ex_index::<ContextCallback>(),
+            ContextCallback(Arc::new(callback)),
         );
         unsafe {
-            ffi::SSL_CTX_set_cert_cb(self.as_ptr(), Some(context_callback::<F>), ptr::null_mut());
+            ffi::SSL_CTX_set_cert_cb(self.as_ptr(), Some(context_callback), ptr::null_mut());
         }
     }
 }
@@ -126,15 +137,11 @@ impl SslRef {
         F: Fn(CertificateSelection<'_>) -> Result<(), SelectCertError> + Send + Sync + 'static,
     {
         self.replace_ex_data(
-            Ssl::cached_ex_index::<CertificateCallback<F>>(),
-            CertificateCallback(Arc::new(callback)),
+            Ssl::cached_ex_index::<ConnectionCallback>(),
+            ConnectionCallback(Some(Arc::new(callback))),
         );
         unsafe {
-            ffi::SSL_set_cert_cb(
-                self.as_ptr(),
-                Some(connection_callback::<F>),
-                ptr::null_mut(),
-            );
+            ffi::SSL_set_cert_cb(self.as_ptr(), Some(connection_callback), ptr::null_mut());
         }
         super::async_callbacks::invalidate_certificate_selection(self);
     }
@@ -149,31 +156,24 @@ impl SslRef {
     }
 }
 
-unsafe extern "C" fn context_callback<F>(ssl: *mut ffi::SSL, _: *mut c_void) -> c_int
-where
-    F: Fn(CertificateSelection<'_>) -> Result<(), SelectCertError> + Send + Sync + 'static,
-{
+unsafe extern "C" fn context_callback(ssl: *mut ffi::SSL, _: *mut c_void) -> c_int {
     // Retain the callback even if it replaces itself or switches SSL contexts.
     let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
     let callback = ssl
         .ssl_context()
-        .ex_data(SslContext::cached_ex_index::<CertificateCallback<F>>())
+        .ex_data(SslContext::cached_ex_index::<ContextCallback>())
         .expect("BUG: certificate callback missing")
         .0
         .clone();
     callback_result(callback(CertificateSelection(ssl)))
 }
 
-unsafe extern "C" fn connection_callback<F>(ssl: *mut ffi::SSL, _: *mut c_void) -> c_int
-where
-    F: Fn(CertificateSelection<'_>) -> Result<(), SelectCertError> + Send + Sync + 'static,
-{
+unsafe extern "C" fn connection_callback(ssl: *mut ffi::SSL, _: *mut c_void) -> c_int {
     let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
     let callback = ssl
-        .ex_data(Ssl::cached_ex_index::<CertificateCallback<F>>())
-        .expect("BUG: connection certificate callback missing")
-        .0
-        .clone();
+        .ex_data(Ssl::cached_ex_index::<ConnectionCallback>())
+        .and_then(|callback| callback.0.clone())
+        .expect("BUG: connection certificate callback missing");
     callback_result(callback(CertificateSelection(ssl)))
 }
 

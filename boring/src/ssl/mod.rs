@@ -3130,6 +3130,7 @@ impl SslRef {
     pub fn set_verify(&mut self, mode: SslVerifyMode) {
         self.ssl_context().check_x509();
         unsafe { ffi::SSL_set_verify(self.as_ptr(), c_int::from(mode.bits()), None) }
+        async_callbacks::invalidate_custom_verify(self);
     }
 
     /// Sets the certificate verification depth.
@@ -3182,6 +3183,7 @@ impl SslRef {
                 Some(ssl_raw_verify::<F>),
             );
         }
+        async_callbacks::invalidate_custom_verify(self);
     }
 
     /// Sets a custom certificate store for verifying peer certificates.
@@ -3216,6 +3218,7 @@ impl SslRef {
                 Some(ssl_raw_custom_verify::<F>),
             );
         }
+        async_callbacks::invalidate_custom_verify(self);
     }
 
     /// Like [`SslContextBuilder::set_tmp_dh`].
@@ -3622,7 +3625,8 @@ impl SslRef {
     /// It is most commonly used in the Server Name Indication (SNI) callback.
     /// A different context replaces the certificate callback and credentials,
     /// including per-connection overrides. An active async certificate selection
-    /// is cancelled and the handshake will fail.
+    /// or custom verification is cancelled and the handshake will fail. Pending
+    /// early ClientHello callbacks are also cancelled; route in their finish closure.
     #[corresponds(SSL_set_SSL_CTX)]
     pub fn set_ssl_context(&mut self, ctx: &SslContextRef) -> Result<(), ErrorStack> {
         assert_eq!(
@@ -3635,7 +3639,8 @@ impl SslRef {
             cvt_p(ffi::SSL_set_SSL_CTX(self.as_ptr(), ctx.as_ptr()))?;
         }
         if changed {
-            async_callbacks::invalidate_certificate_selection(self);
+            certificate_selection::clear_connection_callback(self);
+            async_callbacks::context_changed(self);
         }
         Ok(())
     }

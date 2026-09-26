@@ -52,42 +52,48 @@ pub type ExDataFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 
 pub(crate) static TASK_WAKER_INDEX: LazyLock<Index<Ssl, Option<Waker>>> =
     LazyLock::new(|| Ssl::new_ex_index().unwrap());
-pub(crate) static SELECT_CERT_FUTURE_INDEX: LazyLock<
-    Index<Ssl, MutOnly<Option<BoxSelectCertFuture>>>,
-> = LazyLock::new(|| Ssl::new_ex_index().unwrap());
-static CERTIFICATE_SELECTION_STATE_INDEX: LazyLock<Index<Ssl, MutOnly<CertificateSelectionState>>> =
+static SELECT_CERT_STATE_INDEX: LazyLock<Index<Ssl, MutOnly<CallbackState<BoxSelectCertFuture>>>> =
     LazyLock::new(|| Ssl::new_ex_index().unwrap());
+static CERTIFICATE_SELECTION_STATE_INDEX: LazyLock<
+    Index<Ssl, MutOnly<CallbackState<BoxCertificateFuture>>>,
+> = LazyLock::new(|| Ssl::new_ex_index().unwrap());
 pub(crate) static SELECT_PRIVATE_KEY_METHOD_FUTURE_INDEX: LazyLock<
     Index<Ssl, MutOnly<Option<BoxPrivateKeyMethodFuture>>>,
 > = LazyLock::new(|| Ssl::new_ex_index().unwrap());
 pub(crate) static SELECT_GET_SESSION_FUTURE_INDEX: LazyLock<
     Index<Ssl, MutOnly<Option<BoxGetSessionFuture>>>,
 > = LazyLock::new(|| Ssl::new_ex_index().unwrap());
-pub(crate) static SELECT_CUSTOM_VERIFY_FUTURE_INDEX: LazyLock<
-    Index<Ssl, MutOnly<Option<BoxCustomVerifyFuture>>>,
+static CUSTOM_VERIFY_STATE_INDEX: LazyLock<
+    Index<Ssl, MutOnly<CallbackState<BoxCustomVerifyFuture>>>,
 > = LazyLock::new(|| Ssl::new_ex_index().unwrap());
 
-#[derive(Default)]
-struct CertificateSelectionState {
-    future: Option<BoxCertificateFuture>,
+struct CallbackState<F> {
+    future: Option<F>,
     active: bool,
     invalidated: bool,
 }
 
-// A callback/context change must not resume a future created by the old policy.
-// Also guard factories that replace themselves before returning their future.
-pub(super) fn invalidate_certificate_selection(ssl: &mut SslRef) {
-    let Some(state) = ssl
-        .ex_data_mut(*CERTIFICATE_SELECTION_STATE_INDEX)
-        .map(MutOnly::get_mut)
-    else {
-        return;
+fn invalidate<F: Send + 'static>(
+    ssl: &mut SslRef,
+    index: Index<Ssl, MutOnly<CallbackState<F>>>,
+) -> bool {
+    let Some(state) = ssl.ex_data_mut(index).map(MutOnly::get_mut) else {
+        return false;
     };
     if state.active || state.invalidated {
         state.invalidated = true;
         state.future = None;
-        // A replacement context may have no callback at all. Install a native
-        // rejection hook so even that path cannot silently continue.
+    }
+    state.invalidated
+}
+
+// Reject even when a replacement context/callback would otherwise skip the hook.
+pub(super) fn invalidate_certificate_selection(ssl: &mut SslRef) {
+    let invalidated = invalidate(ssl, *CERTIFICATE_SELECTION_STATE_INDEX);
+    let early_invalidated = ssl
+        .ex_data_mut(*SELECT_CERT_STATE_INDEX)
+        .is_some_and(|state| state.get_mut().invalidated);
+    if invalidated || early_invalidated {
         unsafe {
             ffi::SSL_set_cert_cb(
                 ssl.as_ptr(),
@@ -96,6 +102,36 @@ pub(super) fn invalidate_certificate_selection(ssl: &mut SslRef) {
             );
         }
     }
+}
+
+pub(super) fn invalidate_custom_verify(ssl: &mut SslRef) {
+    if invalidate(ssl, *CUSTOM_VERIFY_STATE_INDEX) {
+        // SSL_VERIFY_NONE would suppress a verification failure on clients.
+        let mode = ssl.verify_mode() | SslVerifyMode::PEER;
+        unsafe {
+            ffi::SSL_set_custom_verify(
+                ssl.as_ptr(),
+                mode.bits() as _,
+                Some(invalidated_verify_callback),
+            );
+        }
+    }
+}
+
+pub(super) fn context_changed(ssl: &mut SslRef) {
+    invalidate(ssl, *SELECT_CERT_STATE_INDEX);
+    invalidate_certificate_selection(ssl);
+    invalidate_custom_verify(ssl);
+}
+
+unsafe extern "C" fn invalidated_verify_callback(
+    _: *mut ffi::SSL,
+    alert: *mut u8,
+) -> ffi::ssl_verify_result_t {
+    unsafe {
+        *alert = SslAlert::INTERNAL_ERROR.0 as u8;
+    }
+    ffi::ssl_verify_result_t::ssl_verify_invalid
 }
 
 unsafe extern "C" fn invalidated_certificate_callback(
@@ -117,6 +153,9 @@ impl SslContextBuilder {
     /// A task waker must be set on `Ssl` values associated with the resulting
     /// `SslContext` with [`SslRef::set_task_waker`].
     ///
+    /// Changing contexts while the factory or future is active aborts the handshake.
+    /// Context routing remains supported in the finish closure.
+    ///
     /// See [`SslContextBuilder::set_select_certificate_callback`] for the sync
     /// setter of this callback.
     pub fn set_async_select_certificate_callback<F>(&mut self, callback: F)
@@ -127,22 +166,21 @@ impl SslContextBuilder {
             + 'static,
     {
         self.set_select_certificate_callback(move |mut client_hello| {
-            let fut_poll_result = with_ex_data_future(
+            match with_callback_state(
                 &mut client_hello,
-                *SELECT_CERT_FUTURE_INDEX,
+                *SELECT_CERT_STATE_INDEX,
                 ClientHello::ssl_mut,
                 &callback,
-                identity,
-            );
-
-            let fut_result = match fut_poll_result {
-                Poll::Ready(fut_result) => fut_result,
-                Poll::Pending => return Err(SelectCertError::RETRY),
-            };
-
-            let finish = fut_result.or(Err(SelectCertError::ERROR))?;
-
-            finish(client_hello).or(Err(SelectCertError::ERROR))
+                |hello, finish| {
+                    // Context routing is the early callback's job, unlike late selection.
+                    callback_state(hello.ssl_mut(), *SELECT_CERT_STATE_INDEX).active = false;
+                    finish(ClientHello(hello.0))
+                },
+                AsyncSelectCertError,
+            ) {
+                Poll::Ready(result) => result.map_err(|_| SelectCertError::ERROR),
+                Poll::Pending => Err(SelectCertError::RETRY),
+            }
         });
     }
 
@@ -150,7 +188,7 @@ impl SslContextBuilder {
     /// The factory runs once per selection; its future is retained across retries
     /// and dropped with the SSL connection. Copy any borrowed request metadata
     /// into the future, then configure the SSL in the returned finish callback.
-    /// Replacing the callback or changing contexts while its factory or future is
+    /// Replacing the callback or changing contexts while its factory, future or finish is
     /// active aborts the handshake and discards the old selection. A pending
     /// selection does no transport I/O; callers should enforce a deadline.
     ///
@@ -228,6 +266,9 @@ impl SslContextBuilder {
     /// A task waker must be set on `Ssl` values associated with the resulting
     /// `SslContext` with [`SslRef::set_task_waker`].
     ///
+    /// Replacing the verification callback or mode, or changing contexts, while
+    /// this callback is active cancels verification and aborts the handshake.
+    ///
     /// See [`SslContextBuilder::set_custom_verify_callback`] for the sync version of this method.
     ///
     /// # Panics
@@ -278,16 +319,75 @@ impl SslRef {
     }
 }
 
-fn certificate_selection_state(ssl: &mut SslRef) -> &mut CertificateSelectionState {
-    if ssl.ex_data(*CERTIFICATE_SELECTION_STATE_INDEX).is_none() {
+fn callback_state<F: Send + 'static>(
+    ssl: &mut SslRef,
+    index: Index<Ssl, MutOnly<CallbackState<F>>>,
+) -> &mut CallbackState<F> {
+    if ssl.ex_data(index).is_none() {
         ssl.set_ex_data(
-            *CERTIFICATE_SELECTION_STATE_INDEX,
-            MutOnly::new(CertificateSelectionState::default()),
+            index,
+            MutOnly::new(CallbackState {
+                future: None,
+                active: false,
+                invalidated: false,
+            }),
         );
     }
-    ssl.ex_data_mut(*CERTIFICATE_SELECTION_STATE_INDEX)
-        .unwrap()
-        .get_mut()
+    ssl.ex_data_mut(index).unwrap().get_mut()
+}
+
+type CallbackStateIndex<T, E> = Index<Ssl, MutOnly<CallbackState<ExDataFuture<Result<T, E>>>>>;
+
+// Own the future while polling and keep the operation active through its finish.
+fn with_callback_state<H, T: 'static, E: Copy + 'static>(
+    handle: &mut H,
+    index: CallbackStateIndex<T, E>,
+    ssl_mut: impl Fn(&mut H) -> &mut SslRef,
+    create: impl FnOnce(&mut H) -> Result<ExDataFuture<Result<T, E>>, E>,
+    finish: impl FnOnce(&mut H, T) -> Result<(), E>,
+    invalidated_error: E,
+) -> Poll<Result<(), E>> {
+    let state = callback_state(ssl_mut(handle), index);
+    if state.invalidated {
+        return Poll::Ready(Err(invalidated_error));
+    }
+    state.active = true;
+    let future = state.future.take();
+    let mut future = match future.map(Ok).unwrap_or_else(|| create(handle)) {
+        Ok(future) => future,
+        Err(error) => {
+            callback_state(ssl_mut(handle), index).active = false;
+            return Poll::Ready(Err(error));
+        }
+    };
+    if callback_state(ssl_mut(handle), index).invalidated {
+        return Poll::Ready(Err(invalidated_error));
+    }
+    let Some(waker) = ssl_mut(handle)
+        .ex_data(*TASK_WAKER_INDEX)
+        .cloned()
+        .flatten()
+    else {
+        callback_state(ssl_mut(handle), index).active = false;
+        return Poll::Ready(Err(invalidated_error));
+    };
+    match future.as_mut().poll(&mut Context::from_waker(&waker)) {
+        Poll::Pending => {
+            callback_state(ssl_mut(handle), index).future = Some(future);
+            Poll::Pending
+        }
+        Poll::Ready(result) => {
+            drop(future);
+            let result = result.and_then(|value| finish(handle, value));
+            let state = callback_state(ssl_mut(handle), index);
+            state.active = false;
+            Poll::Ready(if state.invalidated {
+                Err(invalidated_error)
+            } else {
+                result
+            })
+        }
+    }
 }
 
 fn async_certificate_callback<F>(
@@ -299,43 +399,16 @@ where
         + Sync
         + 'static,
 {
-    move |mut selection| {
-        let state = certificate_selection_state(selection.ssl_mut());
-        if state.invalidated {
-            return Err(SelectCertError::ERROR);
-        }
-        state.active = true;
-        let future = state.future.take();
-        let mut future = match future.map(Ok).unwrap_or_else(|| callback(&mut selection)) {
-            Ok(future) => future,
-            Err(_) => {
-                certificate_selection_state(selection.ssl_mut()).active = false;
-                return Err(SelectCertError::ERROR);
-            }
-        };
-        if certificate_selection_state(selection.ssl_mut()).invalidated {
-            return Err(SelectCertError::ERROR);
-        }
-        let waker = selection
-            .ssl()
-            .ex_data(*TASK_WAKER_INDEX)
-            .cloned()
-            .flatten()
-            .expect("task waker should be set");
-        let result = future.as_mut().poll(&mut Context::from_waker(&waker));
-        let state = certificate_selection_state(selection.ssl_mut());
-        match result {
-            Poll::Pending => {
-                state.future = Some(future);
-                Err(SelectCertError::RETRY)
-            }
-            Poll::Ready(result) => {
-                state.active = false;
-                drop(future);
-                let finish = result.map_err(|_| SelectCertError::ERROR)?;
-                finish(selection).map_err(|_| SelectCertError::ERROR)
-            }
-        }
+    move |mut selection| match with_callback_state(
+        &mut selection,
+        *CERTIFICATE_SELECTION_STATE_INDEX,
+        CertificateSelection::ssl_mut,
+        &callback,
+        |selection, finish| finish(CertificateSelection(selection.ssl_mut())),
+        AsyncSelectCertError,
+    ) {
+        Poll::Pending => Err(SelectCertError::RETRY),
+        Poll::Ready(result) => result.map_err(|_| SelectCertError::ERROR),
     }
 }
 
@@ -345,20 +418,16 @@ fn async_custom_verify_callback<F>(
 where
     F: Fn(&mut SslRef) -> Result<BoxCustomVerifyFuture, SslAlert> + Send + Sync + 'static,
 {
-    move |ssl| {
-        let fut_poll_result = with_ex_data_future(
-            &mut *ssl,
-            *SELECT_CUSTOM_VERIFY_FUTURE_INDEX,
-            |ssl| ssl,
-            &callback,
-            identity,
-        );
-
-        match fut_poll_result {
-            Poll::Ready(Err(alert)) => Err(SslVerifyError::Invalid(alert)),
-            Poll::Ready(Ok(finish)) => Ok(finish(ssl).map_err(SslVerifyError::Invalid)?),
-            Poll::Pending => Err(SslVerifyError::Retry),
-        }
+    move |ssl| match with_callback_state(
+        &mut *ssl,
+        *CUSTOM_VERIFY_STATE_INDEX,
+        |ssl| ssl,
+        &callback,
+        |ssl, finish| finish(ssl),
+        SslAlert::INTERNAL_ERROR,
+    ) {
+        Poll::Ready(result) => result.map_err(SslVerifyError::Invalid),
+        Poll::Pending => Err(SslVerifyError::Retry),
     }
 }
 

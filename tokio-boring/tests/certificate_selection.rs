@@ -260,7 +260,7 @@ async fn delayed_selection_preserves_request_and_verification() {
                 count.fetch_add(1, SeqCst);
                 assert!(!selection.ssl().is_server());
                 assert_eq!(selection.ssl().selected_alpn_protocol(), Some(&b"h2"[..]));
-                assert_eq!(selection.requested_ca_names().map(<[u8]>::to_vec).collect::<Vec<_>>(), vec![material().ca.cert.subject_name().to_der().unwrap()]);
+                assert_eq!(selection.requested_ca_names().map(<[u8]>::to_vec).collect::<Vec<_>>(), vec![material().ca.cert.subject_name().to_der().unwrap(), material().other_ca.cert.subject_name().to_der().unwrap()]);
                 assert!(selection.peer_verify_algorithms().contains(&SslSignatureAlgorithm::ECDSA_SECP256R1_SHA256));
                 assert_eq!(selection.certificate_types().is_empty(), version == SslVersion::TLS1_3);
                 assert_eq!(selection.ssl().peer_certificate().unwrap().to_der().unwrap(), material().server.cert.to_der().unwrap());
@@ -286,16 +286,12 @@ async fn delayed_selection_preserves_request_and_verification() {
                 c.set_async_certificate_callback(callback);
                 client_ssl(c)
             };
-            let (s, c) = pair(
-                server(
-                    version,
-                    SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
-                )
-                .build(),
-                ssl,
-                Some(&material().client.cert),
-            )
-            .await;
+            let mut s = server(
+                version,
+                SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
+            );
+            s.add_client_ca(&material().other_ca.cert).unwrap();
+            let (s, c) = pair(s.build(), ssl, Some(&material().client.cert)).await;
             s.unwrap();
             c.unwrap();
             assert_eq!(calls.load(SeqCst), 1);
@@ -431,46 +427,67 @@ impl Drop for DropProbe {
 }
 
 #[tokio::test]
-async fn cancelling_pending_selection_drops_future_and_transport() {
-    for (version, deadline) in VERSIONS.into_iter().flat_map(|v| [(v, false), (v, true)]) {
-        let dropped = Arc::new(AtomicUsize::new(0));
-        let observed = dropped.clone();
-        let started = Arc::new(tokio::sync::Notify::new());
-        let notify = started.clone();
-        let mut c = client(version);
-        c.set_async_certificate_callback(move |_| {
-            let probe = DropProbe(observed.clone());
-            notify.notify_one();
-            Ok(Box::pin(async move {
-                let _probe = probe;
-                std::future::pending::<()>().await;
-                unreachable!()
-            }))
-        });
-        let (a, b) = transport();
-        let s = server(version, SslVerifyMode::PEER).build();
-        let mut client = Box::pin(connect(b, client_ssl(c)));
-        let mut server = Box::pin(accept(a, s, None));
-        bounded(async {
-            tokio::select! {
-                _ = started.notified() => {},
-                result = &mut client => panic!("client completed while pending: {result:?}"),
-                result = &mut server => panic!("server completed while pending: {result:?}"),
-            }
-            if deadline {
-                assert!(tokio::time::timeout(Duration::from_millis(2), client)
-                    .await
-                    .is_err());
+async fn cancelling_pending_selection_or_signature_drops_future_and_transport() {
+    for signing in [false, true] {
+        for (version, deadline) in VERSIONS.into_iter().flat_map(|v| [(v, false), (v, true)]) {
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let observed = dropped.clone();
+            let started = Arc::new(tokio::sync::Notify::new());
+            let notify = started.clone();
+            let mut c = client(version);
+            if signing {
+                let mut credential = SslCredential::builder().unwrap();
+                credential
+                    .set_certificate_chain([&material().client.cert])
+                    .unwrap();
+                credential
+                    .set_async_private_key_method(DelayedSigner {
+                        pending: Some((notify, observed)),
+                        calls: Arc::new(AtomicUsize::new(0)),
+                        fail: false,
+                    })
+                    .unwrap();
+                let credential = credential.build();
+                c.set_async_certificate_callback(move |_| {
+                    let credential = credential.clone();
+                    Ok(Box::pin(async move { Ok(install(credential)) }))
+                });
             } else {
-                drop(client);
+                c.set_async_certificate_callback(move |_| {
+                    let probe = DropProbe(observed.clone());
+                    notify.notify_one();
+                    Ok(Box::pin(async move {
+                        let _probe = probe;
+                        std::future::pending::<()>().await;
+                        unreachable!()
+                    }))
+                });
             }
-            assert_eq!(dropped.load(SeqCst), 1);
-            assert!(
-                server.await.is_err(),
-                "cancelled client retained its transport"
-            );
-        })
-        .await;
+            let (a, b) = transport();
+            let s = server(version, SslVerifyMode::PEER).build();
+            let mut client = Box::pin(connect(b, client_ssl(c)));
+            let mut server = Box::pin(accept(a, s, None));
+            bounded(async {
+                tokio::select! {
+                    _ = started.notified() => {},
+                    result = &mut client => panic!("client completed while pending: {result:?}"),
+                    result = &mut server => panic!("server completed while pending: {result:?}"),
+                }
+                if deadline {
+                    assert!(tokio::time::timeout(Duration::from_millis(2), client)
+                        .await
+                        .is_err());
+                } else {
+                    drop(client);
+                }
+                assert_eq!(dropped.load(SeqCst), 1);
+                assert!(
+                    server.await.is_err(),
+                    "cancelled client retained its transport"
+                );
+            })
+            .await;
+        }
     }
 }
 
@@ -1103,6 +1120,10 @@ async fn hello_retry_request_does_not_repeat_certificate_selection() {
     let count = server_calls.clone();
     let mut s = server(SslVersion::TLS1_3, SslVerifyMode::PEER);
     s.set_curves(&[SslCurve::SECP384R1]).unwrap();
+    s.set_select_certificate_callback(|mut hello| {
+        hello.ssl_mut().clear_certificates();
+        Ok(())
+    });
     s.set_async_certificate_callback(move |_| {
         count.fetch_add(1, SeqCst);
         Ok(Box::pin(async {
@@ -1150,6 +1171,7 @@ async fn sni_context_switch_replaces_a_connection_override_before_selection() {
 }
 
 struct DelayedSigner {
+    pending: Option<(Arc<tokio::sync::Notify>, Arc<AtomicUsize>)>,
     calls: Arc<AtomicUsize>,
     fail: bool,
 }
@@ -1166,6 +1188,14 @@ impl rama_boring::ssl::AsyncPrivateKeyMethod for DelayedSigner {
     > {
         assert_eq!(algorithm, SslSignatureAlgorithm::ECDSA_SECP256R1_SHA256);
         self.calls.fetch_add(1, SeqCst);
+        if let Some((notify, drops)) = &self.pending {
+            let probe = DropProbe(drops.clone());
+            notify.notify_one();
+            return Ok(Box::pin(async move {
+                let _probe = probe;
+                std::future::pending().await
+            }));
+        }
         let input = input.to_vec();
         let fail = self.fail;
         Ok(Box::pin(async move {
@@ -1209,6 +1239,7 @@ async fn selected_credential_supports_a_delayed_remote_signer() {
                 .unwrap();
             credential
                 .set_async_private_key_method(DelayedSigner {
+                    pending: None,
                     calls: calls.clone(),
                     fail,
                 })
@@ -1280,4 +1311,194 @@ async fn upstream_disconnect_while_pending_is_observed_when_selection_resumes() 
         })
         .await;
     }
+}
+
+#[tokio::test]
+async fn inherited_modern_credentials_win_unless_mapping_clears_them() {
+    let mapped = Identity::new("mapped", Some(&material().ca));
+    for version in VERSIONS {
+        for clear in [false, true] {
+            let credential = mapped.credential();
+            let mut c = client(version);
+            c.add_credential(&material().client.credential()).unwrap();
+            c.set_async_certificate_callback(move |_| {
+                let credential = credential.clone();
+                Ok(Box::pin(async move {
+                    Ok(Box::new(move |mut selection: CertificateSelection<'_>| {
+                        if clear {
+                            selection.ssl_mut().clear_certificates();
+                        }
+                        selection.ssl_mut().add_credential(&credential).unwrap();
+                        Ok(())
+                    }) as BoxCertificateFinish)
+                }))
+            });
+            let expected = if clear {
+                &mapped.cert
+            } else {
+                &material().client.cert
+            };
+            let (s, c) = pair(
+                server(version, SslVerifyMode::PEER).build(),
+                client_ssl(c),
+                Some(expected),
+            )
+            .await;
+            s.unwrap();
+            c.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn reconfiguring_certificate_selection_in_finish_aborts() {
+    for version in VERSIONS {
+        for change in 0..3 {
+            let mut c = client(version);
+            c.set_async_certificate_callback(move |_| {
+                Ok(Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    Ok(Box::new(move |mut selection: CertificateSelection<'_>| {
+                        selection
+                            .ssl_mut()
+                            .add_credential(&material().client.credential())
+                            .unwrap();
+                        match change {
+                            0 => selection
+                                .ssl_mut()
+                                .set_ssl_context(client(version).build().context())
+                                .unwrap(),
+                            1 => selection
+                                .ssl_mut()
+                                .set_certificate_callback(|_| panic!("replacement must not run")),
+                            _ => {
+                                let ctx = selection.ssl().ssl_context().to_owned();
+                                selection.ssl_mut().set_ssl_context(&ctx).unwrap();
+                            }
+                        }
+                        Ok(())
+                    }) as BoxCertificateFinish)
+                }))
+            });
+            let (s, c) = pair(
+                server(version, SslVerifyMode::PEER).build(),
+                client_ssl(c),
+                Some(&material().client.cert),
+            )
+            .await;
+            assert_eq!(s.is_ok(), change == 2);
+            assert_eq!(c.is_ok(), change == 2);
+        }
+    }
+}
+
+#[tokio::test]
+async fn custom_verify_reconfiguration_in_factory_and_finish_aborts() {
+    use rama_boring::ssl::{BoxCustomVerifyFinish, SslAlert};
+    for version in VERSIONS {
+        for in_finish in [false, true] {
+            let finishes = Arc::new(AtomicUsize::new(0));
+            let count = finishes.clone();
+            let mut c = client(version);
+            c.set_async_custom_verify_callback(SslVerifyMode::PEER, move |ssl| {
+                if !in_finish {
+                    ssl.set_async_custom_verify_callback(SslVerifyMode::PEER, |_| {
+                        Err(SslAlert::BAD_CERTIFICATE)
+                    });
+                }
+                let count = count.clone();
+                Ok(Box::pin(async move {
+                    Ok(Box::new(move |ssl: &mut rama_boring::ssl::SslRef| {
+                        count.fetch_add(1, SeqCst);
+                        ssl.set_verify(SslVerifyMode::NONE);
+                        Ok(())
+                    }) as BoxCustomVerifyFinish)
+                }))
+            });
+            let (s, c) = pair(
+                server(version, SslVerifyMode::NONE).build(),
+                client_ssl(c),
+                None,
+            )
+            .await;
+            assert!(s.is_err());
+            assert!(c.is_err());
+            assert_eq!(finishes.load(SeqCst), usize::from(in_finish));
+        }
+    }
+}
+
+#[tokio::test]
+async fn early_client_hello_context_routing_is_allowed_only_in_finish() {
+    use rama_boring::ssl::{BoxSelectCertFinish, ClientHello};
+    for version in VERSIONS {
+        for in_finish in [false, true] {
+            let finishes = Arc::new(AtomicUsize::new(0));
+            let count = finishes.clone();
+            let replacement = server(version, SslVerifyMode::NONE).build();
+            let mut s = server(version, SslVerifyMode::NONE);
+            s.set_async_select_certificate_callback(move |hello| {
+                if !in_finish {
+                    hello
+                        .ssl_mut()
+                        .set_ssl_context(replacement.context())
+                        .unwrap();
+                }
+                let (count, replacement) = (count.clone(), replacement.clone());
+                Ok(Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    Ok(Box::new(move |mut hello: ClientHello<'_>| {
+                        count.fetch_add(1, SeqCst);
+                        hello
+                            .ssl_mut()
+                            .set_ssl_context(replacement.context())
+                            .unwrap();
+                        Ok(())
+                    }) as BoxSelectCertFinish)
+                }))
+            });
+            let (s, c) = pair(s.build(), client_ssl(client(version)), None).await;
+            assert_eq!(s.is_ok(), in_finish);
+            assert_eq!(c.is_ok(), in_finish);
+            assert_eq!(finishes.load(SeqCst), usize::from(in_finish));
+        }
+    }
+}
+
+#[tokio::test]
+async fn rejected_ech_skips_selection_and_sends_no_inherited_identity() {
+    use rama_boring::{hpke::HpkeKey, ssl::SslEchKeys};
+    let key = HpkeKey::dhkem_p256_sha256(include_bytes!("../../boring/test/echkey-2")).unwrap();
+    let mut keys = SslEchKeys::builder().unwrap();
+    keys.add_key(true, include_bytes!("../../boring/test/echconfig-2"), key)
+        .unwrap();
+    let s = server(SslVersion::TLS1_3, SslVerifyMode::PEER);
+    s.set_ech_keys(&keys.build()).unwrap();
+    let mut c = client(SslVersion::TLS1_3);
+    c.add_credential(&material().client.credential()).unwrap();
+    c.set_async_certificate_callback(|_| panic!("ECH rejection must skip selection"));
+    // Accept the test server's outer identity to reach the ECH rejection path.
+    c.set_custom_verify_callback(SslVerifyMode::PEER, |ssl| {
+        assert_eq!(ssl.get_ech_name_override(), Some(&b"ech.com"[..]));
+        Ok(())
+    });
+    let mut ssl = client_ssl(c);
+    ssl.set_ech_config_list(include_bytes!("../../boring/test/echconfiglist"))
+        .unwrap();
+    let (a, b) = transport();
+    bounded(async {
+        let accept = async {
+            let stream = SslStreamBuilder::new(Ssl::new(s.build().context()).unwrap(), a)
+                .accept()
+                .await
+                .unwrap();
+            assert!(stream.ssl().peer_certificate().is_none());
+        };
+        let connect = async {
+            let error = SslStreamBuilder::new(ssl, b).connect().await.unwrap_err();
+            assert!(error.to_string().contains("ECH_REJECTED"));
+        };
+        tokio::join!(accept, connect);
+    })
+    .await;
 }

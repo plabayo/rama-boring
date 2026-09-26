@@ -105,7 +105,7 @@ impl std::task::Wake for NoopWake {
 fn pending_selection_is_cancelled_by_every_callback_and_context_replacement() {
     use crate::ssl::{AsyncSelectCertError, BoxCertificateFinish};
     for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
-        for replacement in 0..6 {
+        for replacement in 0..7 {
             let mut server = Server::builder();
             server.ctx().set_min_proto_version(Some(version)).unwrap();
             server.ctx().set_max_proto_version(Some(version)).unwrap();
@@ -172,6 +172,11 @@ fn pending_selection_is_cancelled_by_every_callback_and_context_replacement() {
                         .unwrap();
                 }
                 4 => mid.ssl_mut().set_ssl_context(&ctx).unwrap(),
+                6 => {
+                    let other = SslContext::builder(SslMethod::tls()).unwrap().build();
+                    mid.ssl_mut().set_ssl_context(&other).unwrap();
+                    mid.ssl_mut().set_ssl_context(&ctx).unwrap();
+                }
                 _ => mid.get_ref().shutdown(std::net::Shutdown::Both).unwrap(),
             }
             ready.store(true, SeqCst);
@@ -200,6 +205,284 @@ fn pending_selection_is_cancelled_by_every_callback_and_context_replacement() {
                 assert_eq!(finishes.load(SeqCst), 0);
             }
             assert_eq!(dropped.load(SeqCst), 1);
+        }
+    }
+}
+
+#[test]
+fn discarded_certificate_callbacks_release_captures_immediately() {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
+    let probe = DropProbe(dropped.clone());
+    ctx.set_certificate_callback(move |_| {
+        let _keep = &probe;
+        Ok(())
+    });
+    ctx.set_certificate_callback(|_| Ok(()));
+    assert_eq!(dropped.load(SeqCst), 1);
+    let ctx = ctx.build();
+    let mut ssl = Ssl::new(&ctx).unwrap();
+    for switch_context in [false, true] {
+        let probe = DropProbe(dropped.clone());
+        ssl.set_async_certificate_callback(move |_| {
+            let _keep = &probe;
+            Err(crate::ssl::AsyncSelectCertError)
+        });
+        if switch_context {
+            let other = SslContext::builder(SslMethod::tls()).unwrap().build();
+            ssl.set_ssl_context(&other).unwrap();
+        } else {
+            ssl.set_certificate_callback(|_| Ok(()));
+        }
+        assert_eq!(dropped.load(SeqCst), if switch_context { 3 } else { 2 });
+    }
+    drop(ssl);
+    assert_eq!(dropped.load(SeqCst), 3);
+}
+
+#[test]
+fn pending_custom_verification_cannot_survive_reconfiguration() {
+    use crate::ssl::{BoxCustomVerifyFinish, SslAlert};
+    for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
+        for replacement in 0..6 {
+            let mut server = Server::builder();
+            server.ctx().set_min_proto_version(Some(version)).unwrap();
+            server.ctx().set_max_proto_version(Some(version)).unwrap();
+            if replacement != 5 {
+                server.should_error();
+            }
+            let server = server.build();
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let finishes = Arc::new(AtomicUsize::new(0));
+            let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (drops, calls, gate) = (dropped.clone(), finishes.clone(), ready.clone());
+            let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
+            ctx.set_async_custom_verify_callback(SslVerifyMode::PEER, move |_| {
+                let probe = DropProbe(drops.clone());
+                let (calls, gate) = (calls.clone(), gate.clone());
+                Ok(Box::pin(std::future::poll_fn(move |_| {
+                    let _keep = &probe;
+                    if !gate.load(SeqCst) {
+                        return std::task::Poll::Pending;
+                    }
+                    let calls = calls.clone();
+                    std::task::Poll::Ready(Ok(Box::new(move |_: &mut crate::ssl::SslRef| {
+                        calls.fetch_add(1, SeqCst);
+                        Ok(())
+                    }) as BoxCustomVerifyFinish))
+                })))
+            });
+            let ctx = ctx.build();
+            let mut ssl = Ssl::new(&ctx).unwrap();
+            ssl.set_task_waker(Some(Arc::new(NoopWake).into()));
+            let socket = server.connect_tcp();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut mid = match ssl.connect(socket) {
+                Err(HandshakeError::WouldBlock(mid)) => mid,
+                _ => panic!("verification did not pause"),
+            };
+            match replacement {
+                0 => mid
+                    .ssl_mut()
+                    .set_async_custom_verify_callback(SslVerifyMode::PEER, |_| {
+                        Err(SslAlert::BAD_CERTIFICATE)
+                    }),
+                1 => mid
+                    .ssl_mut()
+                    .set_custom_verify_callback(SslVerifyMode::NONE, |_| Ok(())),
+                2 => mid.ssl_mut().set_verify(SslVerifyMode::NONE),
+                3 => mid
+                    .ssl_mut()
+                    .set_verify_callback(SslVerifyMode::NONE, |_, _| true),
+                4 => {
+                    let other = SslContext::builder(SslMethod::tls()).unwrap().build();
+                    mid.ssl_mut().set_ssl_context(&other).unwrap();
+                    mid.ssl_mut().set_ssl_context(&ctx).unwrap();
+                    mid.ssl_mut().set_verify(SslVerifyMode::NONE);
+                }
+                _ => mid.ssl_mut().set_ssl_context(&ctx).unwrap(),
+            }
+            ready.store(true, SeqCst);
+            if replacement == 5 {
+                assert_eq!(dropped.load(SeqCst), 0);
+                let mut stream = mid.handshake().unwrap();
+                stream.read_exact(&mut [0]).unwrap();
+                assert_eq!(finishes.load(SeqCst), 1);
+            } else {
+                assert_eq!(dropped.load(SeqCst), 1);
+                assert!(matches!(mid.handshake(), Err(HandshakeError::Failure(_))));
+                assert_eq!(finishes.load(SeqCst), 0);
+            }
+            assert_eq!(dropped.load(SeqCst), 1);
+        }
+    }
+}
+
+#[test]
+fn pending_early_selection_cannot_be_bypassed_by_context_routing() {
+    use crate::ssl::{AsyncSelectCertError, BoxSelectCertFinish, ClientHello, SslFiletype};
+    use std::{
+        io::Write,
+        net::{TcpListener, TcpStream},
+    };
+    for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
+        for replacement in 0..4 {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = std::thread::spawn(move || {
+                let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
+                ctx.set_min_proto_version(Some(version)).unwrap();
+                ctx.set_max_proto_version(Some(version)).unwrap();
+                let socket = TcpStream::connect(addr).unwrap();
+                socket
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                socket
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                match Ssl::new(&ctx.build()).unwrap().connect(socket) {
+                    Ok(mut stream) => stream.read_exact(&mut [0]).is_ok(),
+                    Err(_) => false,
+                }
+            });
+            let dropped = Arc::new(AtomicUsize::new(0));
+            let finishes = Arc::new(AtomicUsize::new(0));
+            let ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (drops, calls, gate) = (dropped.clone(), finishes.clone(), ready.clone());
+            let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
+            ctx.set_certificate_chain_file("test/cert.pem").unwrap();
+            ctx.set_private_key_file("test/key.pem", SslFiletype::PEM)
+                .unwrap();
+            ctx.set_async_select_certificate_callback(move |_| {
+                let (probe, calls, gate) = (DropProbe(drops.clone()), calls.clone(), gate.clone());
+                Ok(Box::pin(std::future::poll_fn(move |_| {
+                    let _keep = &probe;
+                    if !gate.load(SeqCst) {
+                        return std::task::Poll::Pending;
+                    }
+                    let calls = calls.clone();
+                    std::task::Poll::Ready(Ok(Box::new(move |_: ClientHello<'_>| {
+                        calls.fetch_add(1, SeqCst);
+                        Ok(())
+                    }) as BoxSelectCertFinish))
+                })))
+            });
+            let ctx = ctx.build();
+            let mut ssl = Ssl::new(&ctx).unwrap();
+            ssl.set_task_waker(Some(Arc::new(NoopWake).into()));
+            let socket = listener.accept().unwrap().0;
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut mid = match ssl.accept(socket) {
+                Err(HandshakeError::WouldBlock(mid)) => mid,
+                _ => panic!("early selection did not pause"),
+            };
+            if replacement == 3 {
+                mid.ssl_mut().set_ssl_context(&ctx).unwrap();
+            } else {
+                let mut other = SslContext::builder(SslMethod::tls()).unwrap();
+                other.set_certificate_chain_file("test/cert.pem").unwrap();
+                other
+                    .set_private_key_file("test/key.pem", SslFiletype::PEM)
+                    .unwrap();
+                if replacement == 1 {
+                    other.set_async_select_certificate_callback(|_| Err(AsyncSelectCertError));
+                }
+                mid.ssl_mut().set_ssl_context(&other.build()).unwrap();
+                if replacement == 2 {
+                    mid.ssl_mut().set_ssl_context(&ctx).unwrap();
+                }
+                // A later certificate override must not remove the rejection hook.
+                mid.ssl_mut().set_certificate_callback(|_| Ok(()));
+            }
+            ready.store(true, SeqCst);
+            if replacement == 3 {
+                assert_eq!(dropped.load(SeqCst), 0);
+                mid.handshake().unwrap().write_all(&[0]).unwrap();
+                assert_eq!(finishes.load(SeqCst), 1);
+            } else {
+                assert_eq!(dropped.load(SeqCst), 1);
+                assert!(matches!(mid.handshake(), Err(HandshakeError::Failure(_))));
+                assert_eq!(finishes.load(SeqCst), 0);
+            }
+            assert_eq!(client.join().unwrap(), replacement == 3);
+            assert_eq!(dropped.load(SeqCst), 1);
+        }
+    }
+}
+
+#[test]
+fn async_certificate_selection_without_a_waker_fails_without_panicking() {
+    let mut server = Server::builder();
+    server.ctx().set_verify(SslVerifyMode::PEER);
+    server.should_error();
+    let server = server.build();
+    let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
+    ctx.set_async_certificate_callback(|_| Ok(Box::pin(std::future::pending())));
+    let socket = server.connect_tcp();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    assert!(matches!(
+        Ssl::new(&ctx.build()).unwrap().connect(socket),
+        Err(HandshakeError::Failure(_))
+    ));
+}
+
+#[test]
+fn selection_errors_send_internal_error_when_transport_is_writable() {
+    use crate::ssl::{AsyncSelectCertError, BoxCertificateFinish};
+    for version in [SslVersion::TLS1_2, SslVersion::TLS1_3] {
+        for stage in 0..3 {
+            let mut server = Server::builder();
+            server.ctx().set_min_proto_version(Some(version)).unwrap();
+            server.ctx().set_max_proto_version(Some(version)).unwrap();
+            server.ctx().set_verify(SslVerifyMode::PEER);
+            server.err_cb(|error| {
+                let message = error.to_string();
+                assert!(message.contains("ALERT_INTERNAL_ERROR"), "{message}");
+            });
+            let server = server.build();
+            let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
+            ctx.set_async_certificate_callback(move |_| {
+                if stage == 0 {
+                    return Err(AsyncSelectCertError);
+                }
+                Ok(Box::pin(async move {
+                    if stage == 1 {
+                        return Err(AsyncSelectCertError);
+                    }
+                    Ok(
+                        Box::new(|_: CertificateSelection<'_>| Err(AsyncSelectCertError))
+                            as BoxCertificateFinish,
+                    )
+                }))
+            });
+            let mut ssl = Ssl::new(&ctx.build()).unwrap();
+            ssl.set_task_waker(Some(Arc::new(NoopWake).into()));
+            let socket = server.connect_tcp();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            assert!(matches!(
+                ssl.connect(socket),
+                Err(HandshakeError::Failure(_))
+            ));
         }
     }
 }
