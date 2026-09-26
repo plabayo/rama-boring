@@ -184,3 +184,25 @@ async fn with_async_private_key_method_error(method: Method) {
 
     future::join(server, client).await;
 }
+
+#[tokio::test]
+async fn oversized_async_signature_fails_without_panicking() {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    let calls = Arc::new(AtomicUsize::new(0));
+    let count = calls.clone();
+    with_async_private_key_method_error(Method::new().sign(move |_, _, _, _| {
+        let count = count.clone();
+        Ok(Box::pin(async move {
+            yield_now().await;
+            Ok(Box::new(move |_: &mut SslRef, _: &mut [u8]| {
+                count.fetch_add(1, Ordering::SeqCst);
+                Ok(usize::MAX)
+            }) as Box<_>)
+        }))
+    }))
+    .await;
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+}

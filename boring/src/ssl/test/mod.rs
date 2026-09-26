@@ -29,6 +29,7 @@ use super::CompliancePolicy;
 mod ca_names;
 mod cert_compressor;
 mod cert_verify;
+mod certificate_selection;
 mod credentials;
 mod custom_verify;
 mod ech;

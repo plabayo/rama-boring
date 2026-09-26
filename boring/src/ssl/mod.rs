@@ -99,10 +99,12 @@ use crate::{cvt, cvt_0i, cvt_n, cvt_p, init, try_int};
 use crate::{ffi, free_data_box};
 
 pub use self::async_callbacks::{
-    AsyncPrivateKeyMethod, AsyncPrivateKeyMethodError, AsyncSelectCertError, BoxCustomVerifyFinish,
-    BoxCustomVerifyFuture, BoxGetSessionFinish, BoxGetSessionFuture, BoxPrivateKeyMethodFinish,
-    BoxPrivateKeyMethodFuture, BoxSelectCertFinish, BoxSelectCertFuture, ExDataFuture,
+    AsyncPrivateKeyMethod, AsyncPrivateKeyMethodError, AsyncSelectCertError, BoxCertificateFinish,
+    BoxCertificateFuture, BoxCustomVerifyFinish, BoxCustomVerifyFuture, BoxGetSessionFinish,
+    BoxGetSessionFuture, BoxPrivateKeyMethodFinish, BoxPrivateKeyMethodFuture, BoxSelectCertFinish,
+    BoxSelectCertFuture, ExDataFuture,
 };
+pub use self::certificate_selection::CertificateSelection;
 pub use self::connector::{
     ConnectConfiguration, SslAcceptor, SslAcceptorBuilder, SslConnector, SslConnectorBuilder,
 };
@@ -114,6 +116,7 @@ mod async_callbacks;
 mod bio;
 mod buffer;
 mod callbacks;
+mod certificate_selection;
 mod connector;
 mod credential;
 mod ech;
@@ -501,6 +504,7 @@ static INDEXES: LazyLock<Mutex<HashMap<TypeId, c_int>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static SSL_INDEXES: LazyLock<Mutex<HashMap<TypeId, c_int>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+// Retain the initial context for sessions and callbacks copied at SSL_new.
 static SESSION_CTX_INDEX: LazyLock<Index<Ssl, SslContext>> =
     LazyLock::new(|| Ssl::new_ex_index().unwrap());
 static X509_FLAG_INDEX: LazyLock<Index<SslContext, bool>> =
@@ -1177,6 +1181,9 @@ impl SslContextBuilder {
     /// Some useful alerts include [`SslAlert::CERTIFICATE_EXPIRED`], [`SslAlert::CERTIFICATE_REVOKED`],
     /// [`SslAlert::UNKNOWN_CA`], [`SslAlert::BAD_CERTIFICATE`], [`SslAlert::CERTIFICATE_UNKNOWN`],
     /// and [`SslAlert::INTERNAL_ERROR`]. See RFC 5246 section 7.2.2 for their precise meanings.
+    ///
+    /// Acceptance here does not prove possession of the peer's private key. Wait
+    /// for the complete handshake before relying on the authenticated identity.
     ///
     /// To verify a certificate asynchronously, the callback may return `Err(SslVerifyError::Retry)`.
     /// The handshake will then pause with an error with code [`ErrorCode::WANT_CERTIFICATE_VERIFY`].
@@ -3127,6 +3134,7 @@ impl SslRef {
     pub fn set_verify(&mut self, mode: SslVerifyMode) {
         self.ssl_context().check_x509();
         unsafe { ffi::SSL_set_verify(self.as_ptr(), c_int::from(mode.bits()), None) }
+        async_callbacks::invalidate_custom_verify(self);
     }
 
     /// Sets the certificate verification depth.
@@ -3179,6 +3187,7 @@ impl SslRef {
                 Some(ssl_raw_verify::<F>),
             );
         }
+        async_callbacks::invalidate_custom_verify(self);
     }
 
     /// Sets a custom certificate store for verifying peer certificates.
@@ -3213,6 +3222,7 @@ impl SslRef {
                 Some(ssl_raw_custom_verify::<F>),
             );
         }
+        async_callbacks::invalidate_custom_verify(self);
     }
 
     /// Like [`SslContextBuilder::set_tmp_dh`].
@@ -3617,14 +3627,48 @@ impl SslRef {
     /// Changes the context corresponding to the current connection.
     ///
     /// It is most commonly used in the Server Name Indication (SNI) callback.
+    /// A different context replaces the certificate callback and configured credentials,
+    /// including their per-connection overrides. An already selected credential and
+    /// its signer stay selected for the current handshake.
+    ///
+    /// Verification mode and callbacks installed with `set_verify_callback` or
+    /// `set_custom_verify_callback` are preserved. Re-apply them explicitly after
+    /// routing when the destination requires a different client-auth policy.
+    /// Verification parameters (depth, X.509 flags, purpose and hostname) and
+    /// preferences for verifying peer signatures are also preserved. Apply the
+    /// destination's policy explicitly on the connection after routing.
+    /// The context-level [`SslContextBuilder::set_cert_verify_callback`] hook instead
+    /// follows `ctx`, as does its default certificate store. Routing also replaces
+    /// the per-connection verification store and session ID context with `ctx`'s
+    /// values. Apply any per-connection trust-store override after routing.
+    /// Ticket-key and PSK callbacks retain their original context.
+    /// An active async certificate selection or custom verification is cancelled
+    /// and the handshake will fail. Pending early ClientHello callbacks are also
+    /// cancelled; route in their finish closure.
+    /// Returns an error without changing the connection if the contexts differ
+    /// in X.509 support.
     #[corresponds(SSL_set_SSL_CTX)]
     pub fn set_ssl_context(&mut self, ctx: &SslContextRef) -> Result<(), ErrorStack> {
-        assert_eq!(
-            self.ssl_context().has_x509_support(),
-            ctx.has_x509_support(),
-            "X.509 certificate support in old and new contexts doesn't match",
-        );
-        unsafe { cvt_p(ffi::SSL_set_SSL_CTX(self.as_ptr(), ctx.as_ptr())).map(|_| ()) }
+        if self.ssl_context().has_x509_support() != ctx.has_x509_support() {
+            return Err(ErrorStack::internal_error_str(
+                "X.509 certificate support in old and new contexts doesn't match",
+            ));
+        }
+        let changed = self.ssl_context().as_ptr() != ctx.as_ptr();
+        let selected_owner = changed
+            .then(|| credential::capture_selected_credential_context(self))
+            .flatten();
+        unsafe {
+            cvt_p(ffi::SSL_set_SSL_CTX(self.as_ptr(), ctx.as_ptr()))?;
+        }
+        if changed {
+            if let Some(owner) = selected_owner {
+                self.set_ex_data(*credential::SELECTED_CREDENTIAL_CONTEXT_INDEX, owner);
+            }
+            certificate_selection::clear_connection_callback(self);
+            async_callbacks::context_changed(self);
+        }
+        Ok(())
     }
 
     /// Returns the context corresponding to the current connection.
