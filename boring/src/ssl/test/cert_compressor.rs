@@ -1,9 +1,8 @@
 use std::io::Write as _;
+use std::sync::{Arc, Mutex};
 
 use super::server::Server;
-use crate::ssl::CertificateCompressor;
-use crate::x509::store::X509StoreBuilder;
-use crate::x509::X509;
+use crate::ssl::{CertificateCompressionAlgorithm, CertificateCompressor};
 
 struct BrotliCompressor {
     q: u32,
@@ -42,61 +41,66 @@ impl CertificateCompressor for BrotliCompressor {
     }
 }
 
+/// Connect with compression configured per side; return what each side observed.
+fn observed(
+    client_compresses: bool,
+    server_compresses: bool,
+) -> [(
+    Option<CertificateCompressionAlgorithm>,
+    Option<CertificateCompressionAlgorithm>,
+); 2] {
+    let server_observed = Arc::new(Mutex::new(None));
+    let mut server = Server::builder();
+    if server_compresses {
+        server
+            .ctx()
+            .add_certificate_compression_algorithm(BrotliCompressor::default())
+            .unwrap();
+    }
+    let slot = server_observed.clone();
+    server.io_cb(move |stream| {
+        let ssl = stream.ssl();
+        *slot.lock().unwrap() = Some((
+            ssl.certificate_compression_algorithm(),
+            ssl.peer_certificate_compression_algorithm(),
+        ));
+    });
+    let server = server.build();
+
+    let mut client = server.client();
+    if client_compresses {
+        client
+            .ctx()
+            .add_certificate_compression_algorithm(BrotliCompressor::default())
+            .unwrap();
+    }
+    let stream = client.connect();
+    let client_observed = (
+        stream.ssl().certificate_compression_algorithm(),
+        stream.ssl().peer_certificate_compression_algorithm(),
+    );
+    drop(stream);
+    drop(server);
+    let server_observed = server_observed.lock().unwrap().take().unwrap();
+    [client_observed, server_observed]
+}
+
 #[test]
 fn server_only_cert_compression() {
-    let mut server_builder = Server::builder();
-    server_builder
-        .ctx()
-        .add_certificate_compression_algorithm(BrotliCompressor::default())
-        .unwrap();
-
-    let server = server_builder.build();
-
-    let mut store = X509StoreBuilder::new().unwrap();
-    let x509 = X509::from_pem(super::ROOT_CERT).unwrap();
-    store.add_cert(&x509).unwrap();
-
-    let client = server.client();
-
-    client.connect();
+    assert_eq!(observed(false, true), [(None, None), (None, None)]);
 }
 
 #[test]
 fn client_only_cert_compression() {
-    let server_builder = Server::builder().build();
-
-    let mut store = X509StoreBuilder::new().unwrap();
-    let x509 = X509::from_pem(super::ROOT_CERT).unwrap();
-    store.add_cert(&x509).unwrap();
-
-    let mut client = server_builder.client();
-    client
-        .ctx()
-        .add_certificate_compression_algorithm(BrotliCompressor::default())
-        .unwrap();
-
-    client.connect();
+    assert_eq!(observed(true, false), [(None, None), (None, None)]);
 }
 
 #[test]
 fn client_and_server_cert_compression() {
-    let mut server = Server::builder();
-    server
-        .ctx()
-        .add_certificate_compression_algorithm(BrotliCompressor::default())
-        .unwrap();
-
-    let server = server.build();
-
-    let mut store = X509StoreBuilder::new().unwrap();
-    let x509 = X509::from_pem(super::ROOT_CERT).unwrap();
-    store.add_cert(&x509).unwrap();
-
-    let mut client = server.client();
-    client
-        .ctx()
-        .add_certificate_compression_algorithm(BrotliCompressor::default())
-        .unwrap();
-
-    client.connect();
+    let algorithm = Some(BrotliCompressor::ALGORITHM);
+    assert_eq!(
+        observed(true, true),
+        [(None, algorithm), (algorithm, None)],
+        "the server compresses its certificate and the client decompresses it"
+    );
 }

@@ -26,6 +26,7 @@ use crate::x509::{X509Name, X509};
 
 use super::CompliancePolicy;
 
+mod alps;
 mod ca_names;
 mod cert_compressor;
 mod cert_verify;

@@ -509,6 +509,11 @@ static SESSION_CTX_INDEX: LazyLock<Index<Ssl, SslContext>> =
     LazyLock::new(|| Ssl::new_ex_index().unwrap());
 static X509_FLAG_INDEX: LazyLock<Index<SslContext, bool>> =
     LazyLock::new(|| SslContext::new_ex_index().unwrap());
+// Certificate compression algorithms a connection used, per direction.
+static CERT_COMPRESSED_INDEX: LazyLock<Index<Ssl, CertificateCompressionAlgorithm>> =
+    LazyLock::new(|| Ssl::new_ex_index().unwrap());
+static CERT_DECOMPRESSED_INDEX: LazyLock<Index<Ssl, CertificateCompressionAlgorithm>> =
+    LazyLock::new(|| Ssl::new_ex_index().unwrap());
 
 /// An error returned from the SNI callback.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -4244,16 +4249,62 @@ impl SslRef {
     /// Adds application settings for the given protocol to be sent via ALPS.
     #[corresponds(SSL_add_application_settings)]
     pub fn add_application_settings(&mut self, alps: &[u8]) -> Result<(), ErrorStack> {
+        self.add_application_settings_value(alps, &[])
+    }
+
+    /// Enables ALPS for `protocol`, sending `value` as this endpoint's settings.
+    ///
+    /// The protocol must also be negotiable through ALPN. A server can configure
+    /// only the protocol it selects, from its ALPN select callback.
+    #[corresponds(SSL_add_application_settings)]
+    pub fn add_application_settings_value(
+        &mut self,
+        protocol: &[u8],
+        value: &[u8],
+    ) -> Result<(), ErrorStack> {
         unsafe {
             cvt_0i(ffi::SSL_add_application_settings(
                 self.as_ptr(),
-                alps.as_ptr(),
-                alps.len(),
-                ptr::null(),
-                0,
+                protocol.as_ptr(),
+                protocol.len(),
+                value.as_ptr(),
+                value.len(),
             ))
             .map(|_| ())
         }
+    }
+
+    /// The settings the peer sent through ALPS, or `None` when ALPS was not negotiated.
+    #[corresponds(SSL_get0_peer_application_settings)]
+    #[must_use]
+    pub fn peer_application_settings(&self) -> Option<&[u8]> {
+        unsafe {
+            if ffi::SSL_has_application_settings(self.as_ptr()) == 0 {
+                return None;
+            }
+            let mut data = ptr::null();
+            let mut len = 0;
+            ffi::SSL_get0_peer_application_settings(self.as_ptr(), &mut data, &mut len);
+            Some(if len == 0 {
+                &[]
+            } else {
+                slice::from_raw_parts(data, len)
+            })
+        }
+    }
+
+    /// The algorithm this endpoint compressed its own certificate with.
+    #[must_use]
+    pub fn certificate_compression_algorithm(&self) -> Option<CertificateCompressionAlgorithm> {
+        self.ex_data(*CERT_COMPRESSED_INDEX).copied()
+    }
+
+    /// The algorithm the peer compressed its certificate with.
+    #[must_use]
+    pub fn peer_certificate_compression_algorithm(
+        &self,
+    ) -> Option<CertificateCompressionAlgorithm> {
+        self.ex_data(*CERT_DECOMPRESSED_INDEX).copied()
     }
 }
 

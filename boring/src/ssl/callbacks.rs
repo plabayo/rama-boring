@@ -4,7 +4,8 @@ use super::{
     AlpnError, CertificateCompressor, ClientHello, GetSessionPendingError, PrivateKeyMethod,
     PrivateKeyMethodError, SelectCertError, SniError, Ssl, SslAlert, SslContext, SslContextRef,
     SslInfoCallbackAlert, SslInfoCallbackMode, SslInfoCallbackValue, SslRef, SslSession,
-    SslSessionRef, SslSignatureAlgorithm, SslVerifyError, SESSION_CTX_INDEX,
+    SslSessionRef, SslSignatureAlgorithm, SslVerifyError, CERT_COMPRESSED_INDEX,
+    CERT_DECOMPRESSED_INDEX, SESSION_CTX_INDEX,
 };
 use crate::error::ErrorStack;
 use crate::ffi;
@@ -694,6 +695,7 @@ where
         return 0;
     }
 
+    ssl.set_ex_data(*CERT_COMPRESSED_INDEX, C::ALGORITHM);
     1
 }
 
@@ -737,6 +739,7 @@ where
     };
 
     unsafe { *out = crypto_buffer };
+    ssl.set_ex_data(*CERT_DECOMPRESSED_INDEX, C::ALGORITHM);
     1
 }
 
