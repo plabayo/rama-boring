@@ -529,7 +529,7 @@ async fn concurrent_connections_keep_separate_pending_selections() {
                 });
                 c.build()
             };
-            let shared = (!independent_contexts).then(&configure);
+            let shared = (!independent_contexts).then(configure);
             let mut s = server(
                 version,
                 SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,

@@ -781,6 +781,8 @@ fn generate_bindings(config: &Config) {
         .layout_tests(config.env.debug.is_some())
         .prepend_enum_name(true)
         .blocklist_type("max_align_t") // Not supported by bindgen on all targets, not used by BoringSSL
+        // The C allocator is libc API, and its declarations clash with those the standard library uses.
+        .blocklist_function("malloc|calloc|realloc|free|aligned_alloc|posix_memalign")
         .clang_args(get_extra_clang_args_for_bindgen(config))
         .clang_arg("-I")
         .clang_arg(include_path.display().to_string());
