@@ -2101,6 +2101,14 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_permute_extensions(self.as_ptr(), enabled as _) }
     }
 
+    /// Sets whether the ClientHello `signature_algorithms` list starts with a GREASE value.
+    ///
+    /// This is independent of [`Self::set_grease_enabled`]. The value is random per handshake.
+    #[corresponds(SSL_CTX_set_grease_sigalgs_enabled)]
+    pub fn set_grease_sigalgs_enabled(&mut self, enabled: bool) {
+        unsafe { ffi::SSL_CTX_set_grease_sigalgs_enabled(self.as_ptr(), enabled as _) }
+    }
+
     /// Configures whether ClientHello extensions should be in the provided order.
     #[corresponds(RAMA_SSL_CTX_set_extension_order)]
     pub fn set_extension_order(&mut self, ids: &[u16]) -> Result<(), ErrorStack> {
@@ -4001,6 +4009,24 @@ impl SslRef {
             } else {
                 Some(slice::from_raw_parts(data, len))
             }
+        }
+    }
+
+    /// Sends key shares for exactly `curves`, in order, in the initial ClientHello.
+    ///
+    /// Each curve must be a configured group and appear in the configured order,
+    /// so finish configuring groups first. An empty slice sends no key share, which
+    /// costs a HelloRetryRequest round trip. Without this call, BoringSSL sends at
+    /// most two key shares, at most one of them post-quantum.
+    #[corresponds(SSL_set1_client_key_shares)]
+    pub fn set_client_key_shares(&mut self, curves: &[SslCurve]) -> Result<(), ErrorStack> {
+        let group_ids: Vec<u16> = curves.iter().map(|curve| curve.0 as u16).collect();
+        unsafe {
+            cvt(ffi::SSL_set1_client_key_shares(
+                self.as_ptr(),
+                group_ids.as_ptr(),
+                group_ids.len(),
+            ))
         }
     }
 

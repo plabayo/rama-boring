@@ -30,6 +30,7 @@ mod ca_names;
 mod cert_compressor;
 mod cert_verify;
 mod certificate_selection;
+mod client_hello;
 mod credentials;
 mod custom_verify;
 mod ech;
