@@ -9,7 +9,7 @@ const CONFIGURED: [SslCurve; 3] = [
     SslCurve::SECP256R1,
 ];
 
-/// Capture one extension body of every ClientHello the server receives.
+/// Capture one extension body of the initial ClientHello of each connection.
 fn capture_extension(server: &mut Builder, extension: ExtensionType) -> Arc<Mutex<Vec<Vec<u8>>>> {
     let captured = Arc::new(Mutex::new(Vec::new()));
     let callback_captured = Arc::clone(&captured);

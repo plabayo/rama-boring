@@ -4012,12 +4012,14 @@ impl SslRef {
         }
     }
 
-    /// Sends key shares for exactly `curves`, in order, in the initial ClientHello.
+    /// Sends TLS 1.3 key shares for exactly `curves`, in order, in the initial ClientHello.
     ///
-    /// Each curve must be a configured group and appear in the configured order,
-    /// so finish configuring groups first. An empty slice sends no key share, which
-    /// costs a HelloRetryRequest round trip. Without this call, BoringSSL sends at
-    /// most two key shares, at most one of them post-quantum.
+    /// The curves must be unique and an ordered subset of the configured groups, so
+    /// finish configuring groups first. With GREASE enabled a GREASE key share is
+    /// added as well. An empty slice sends no real key share, which costs a
+    /// HelloRetryRequest. Without this call, BoringSSL sends at most two key shares,
+    /// at most one of them post-quantum. A server supported groups hint, when set,
+    /// takes precedence over this selection.
     #[corresponds(SSL_set1_client_key_shares)]
     pub fn set_client_key_shares(&mut self, curves: &[SslCurve]) -> Result<(), ErrorStack> {
         let group_ids: Vec<u16> = curves.iter().map(|curve| curve.0 as u16).collect();
