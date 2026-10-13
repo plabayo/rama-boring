@@ -1122,99 +1122,6 @@ fn test_io_retry() {
 }
 
 #[test]
-#[should_panic(expected = "blammo")]
-fn write_panic() {
-    struct ExplodingStream(TcpStream);
-
-    impl Read for ExplodingStream {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.0.read(buf)
-        }
-    }
-
-    impl Write for ExplodingStream {
-        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
-            panic!("blammo");
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            self.0.flush()
-        }
-    }
-
-    let mut server = Server::builder();
-    server.should_error();
-    let server = server.build();
-
-    let stream = ExplodingStream(server.connect_tcp());
-
-    let ctx = SslContext::builder(SslMethod::tls()).unwrap();
-    let _ = Ssl::new(&ctx.build()).unwrap().connect(stream);
-}
-
-#[test]
-#[should_panic(expected = "blammo")]
-fn read_panic() {
-    struct ExplodingStream(TcpStream);
-
-    impl Read for ExplodingStream {
-        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
-            panic!("blammo");
-        }
-    }
-
-    impl Write for ExplodingStream {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.write(buf)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            self.0.flush()
-        }
-    }
-
-    let mut server = Server::builder();
-    server.should_error();
-    let server = server.build();
-
-    let stream = ExplodingStream(server.connect_tcp());
-
-    let ctx = SslContext::builder(SslMethod::tls()).unwrap();
-    let _ = Ssl::new(&ctx.build()).unwrap().connect(stream);
-}
-
-#[test]
-#[should_panic(expected = "blammo")]
-fn flush_panic() {
-    struct ExplodingStream(TcpStream);
-
-    impl Read for ExplodingStream {
-        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-            self.0.read(buf)
-        }
-    }
-
-    impl Write for ExplodingStream {
-        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-            self.0.write(buf)
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            panic!("blammo");
-        }
-    }
-
-    let mut server = Server::builder();
-    server.should_error();
-    let server = server.build();
-
-    let stream = ExplodingStream(server.connect_tcp());
-
-    let ctx = SslContext::builder(SslMethod::tls()).unwrap();
-    let _ = Ssl::new(&ctx.build()).unwrap().connect(stream);
-}
-
-#[test]
 fn refcount_ssl_context() {
     let mut ssl = {
         let ctx = SslContext::builder(SslMethod::tls()).unwrap();
@@ -1954,4 +1861,5 @@ fn per_session_extension_order_bounds_and_server_role() {
     server.ssl_mut().set_extension_order(&[43]).unwrap_err();
 }
 
+mod panic_safety;
 mod session_order;

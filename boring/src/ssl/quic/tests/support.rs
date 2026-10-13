@@ -26,7 +26,7 @@ use std::{
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicUsize, Ordering::SeqCst},
+        atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst},
         Arc, Mutex,
     },
     task::{Context, Poll, RawWaker, RawWakerVTable, Wake, Waker},
@@ -120,6 +120,7 @@ enum Outcome {
     Wait,
     Pass,
     Fail,
+    Panic,
 }
 
 /// Stands in for one asynchronous policy, issuer, verifier or signer.
@@ -133,6 +134,8 @@ pub(super) struct Gate {
     pub(super) polls: AtomicUsize,
     pub(super) dropped: AtomicUsize,
     pub(super) finished: AtomicUsize,
+    panic_in_factory: AtomicBool,
+    panic_in_finish: AtomicBool,
 }
 
 impl Gate {
@@ -144,6 +147,8 @@ impl Gate {
             polls: AtomicUsize::new(0),
             dropped: AtomicUsize::new(0),
             finished: AtomicUsize::new(0),
+            panic_in_factory: AtomicBool::new(false),
+            panic_in_finish: AtomicBool::new(false),
         })
     }
 
@@ -153,6 +158,22 @@ impl Gate {
 
     pub(super) fn fail(&self) {
         self.resolve(Outcome::Fail);
+    }
+
+    /// The pending future panics when polled next.
+    pub(super) fn panic(&self) {
+        self.resolve(Outcome::Panic);
+    }
+
+    /// Opens the gate; the finish closure then panics.
+    pub(super) fn panic_in_finish(&self) {
+        self.panic_in_finish.store(true, SeqCst);
+        self.open();
+    }
+
+    /// The next factory call panics before creating a future.
+    pub(super) fn panic_in_factory(&self) {
+        self.panic_in_factory.store(true, SeqCst);
     }
 
     fn resolve(&self, outcome: Outcome) {
@@ -192,6 +213,7 @@ impl Gate {
         ok: impl FnOnce() -> T + Send + 'static,
         err: E,
     ) -> ExDataFuture<Result<T, E>> {
+        assert!(!self.panic_in_factory.load(SeqCst), "factory");
         self.created.fetch_add(1, SeqCst);
         Box::pin(GateFuture {
             gate: self.clone(),
@@ -202,6 +224,7 @@ impl Gate {
 
     pub(super) fn record_finish(&self) {
         self.finished.fetch_add(1, SeqCst);
+        assert!(!self.panic_in_finish.load(SeqCst), "finish");
     }
 }
 
@@ -228,6 +251,7 @@ impl<T, E> Future for GateFuture<T, E> {
             }
             Outcome::Pass => Poll::Ready(Ok((self.ok.take().expect("polled after completion"))())),
             Outcome::Fail => Poll::Ready(Err(self.err.take().expect("polled after completion"))),
+            Outcome::Panic => panic!("poll"),
         }
     }
 }

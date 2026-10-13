@@ -4,12 +4,10 @@ use super::{
     async_callbacks::TASK_WAKER_INDEX, error::InnerError, Error, ErrorCode, Ssl, SslCipherRef,
     SslRef,
 };
-use crate::{cvt, error::ErrorStack, ffi};
+use crate::{cvt, error::ErrorStack, ffi, unwind};
 use foreign_types::{ForeignType, ForeignTypeRef};
 use std::{
-    fmt,
-    panic::{catch_unwind, AssertUnwindSafe},
-    slice,
+    fmt, slice,
     sync::{Arc, Mutex},
     task::{Context, Poll},
 };
@@ -399,17 +397,12 @@ unsafe fn invoke(
     let Some(state) = ssl.ex_data(Ssl::cached_ex_index::<Arc<Callbacks>>()) else {
         return 0;
     };
-    let result = catch_unwind(AssertUnwindSafe(|| call(state.method.as_ref())));
-    let error = match result {
-        Ok(Ok(())) => return 1,
-        Ok(Err(error)) => QuicError::Callback(error),
-        Err(payload) => {
-            // A user-defined panic payload can itself panic when dropped.
-            if let Err(nested) = catch_unwind(AssertUnwindSafe(|| drop(payload))) {
-                std::mem::forget(nested);
-            }
-            QuicError::CallbackPanicked
-        }
+    let result = unwind::catch(
+        || call(state.method.as_ref()).map_err(QuicError::Callback),
+        |_| Err(QuicError::CallbackPanicked),
+    );
+    let Err(error) = result else {
+        return 1;
     };
     let mut failure = state.failure.lock().unwrap_or_else(|e| e.into_inner());
     if failure.is_none() {

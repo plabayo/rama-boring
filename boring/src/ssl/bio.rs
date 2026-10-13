@@ -3,7 +3,6 @@ use crate::ffi::{
     BIO_CTRL_DGRAM_QUERY_MTU, BIO_CTRL_FLUSH,
 };
 use crate::libc_types::{c_char, c_int, c_long, c_void, strlen};
-use std::any::Any;
 use std::io;
 use std::io::prelude::*;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -12,12 +11,44 @@ use std::slice;
 
 use crate::cvt_p;
 use crate::error::ErrorStack;
+use crate::unwind;
 
 pub struct StreamState<S> {
     pub stream: S,
     pub error: Option<io::Error>,
-    pub panic: Option<Box<dyn Any + Send>>,
+    /// The stream panicked; it is never used again and every later I/O fails.
+    pub panicked: bool,
     pub dtls_mtu_size: c_long,
+}
+
+impl<S> StreamState<S> {
+    // A panic leaves the stream in an unknown state: report it as an I/O error
+    // and never touch the stream again.
+    #[cold]
+    #[inline(never)]
+    fn poison(&mut self, payload: Box<dyn std::any::Any + Send>) {
+        let message = unwind::contain(payload);
+        self.panicked = true;
+        self.error = Some(io::Error::other(format!(
+            "TLS transport stream panicked: {message}"
+        )));
+    }
+
+    #[inline(always)]
+    fn poisoned(&mut self) -> bool {
+        if self.panicked {
+            self.poisoned_again();
+        }
+        self.panicked
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn poisoned_again(&mut self) {
+        if self.error.is_none() {
+            self.error = Some(io::Error::other("TLS transport stream panicked earlier"));
+        }
+    }
 }
 
 /// Safe wrapper for BIO_METHOD
@@ -38,7 +69,7 @@ pub fn new<S: Read + Write>(stream: S) -> Result<(*mut BIO, BioMethod), ErrorSta
     let state = Box::new(StreamState {
         stream,
         error: None,
-        panic: None,
+        panicked: false,
         dtls_mtu_size: 0,
     });
 
@@ -54,11 +85,6 @@ pub fn new<S: Read + Write>(stream: S) -> Result<(*mut BIO, BioMethod), ErrorSta
 pub unsafe fn take_error<S>(bio: *mut BIO) -> Option<io::Error> {
     let state = state::<S>(bio);
     state.error.take()
-}
-
-pub unsafe fn take_panic<S>(bio: *mut BIO) -> Option<Box<dyn Any + Send>> {
-    let state = state::<S>(bio);
-    state.panic.take()
 }
 
 pub unsafe fn get_ref<'a, S: 'a>(bio: *mut BIO) -> &'a S {
@@ -106,6 +132,9 @@ unsafe extern "C" fn bwrite<S: Write>(bio: *mut BIO, buf: *const c_char, len: c_
     };
 
     let state = state::<S>(bio);
+    if state.poisoned() {
+        return -1;
+    }
     let buf = slice::from_raw_parts(buf.cast(), len);
 
     match catch_unwind(AssertUnwindSafe(|| state.stream.write(buf))) {
@@ -117,8 +146,8 @@ unsafe extern "C" fn bwrite<S: Write>(bio: *mut BIO, buf: *const c_char, len: c_
             state.error = Some(err);
             -1
         }
-        Err(err) => {
-            state.panic = Some(err);
+        Err(payload) => {
+            state.poison(payload);
             -1
         }
     }
@@ -132,6 +161,9 @@ unsafe extern "C" fn bread<S: Read>(bio: *mut BIO, buf: *mut c_char, len: c_int)
     };
 
     let state = state::<S>(bio);
+    if state.poisoned() {
+        return -1;
+    }
     let buf = slice::from_raw_parts_mut(buf.cast(), len);
 
     match catch_unwind(AssertUnwindSafe(|| state.stream.read(buf))) {
@@ -143,8 +175,8 @@ unsafe extern "C" fn bread<S: Read>(bio: *mut BIO, buf: *mut c_char, len: c_int)
             state.error = Some(err);
             -1
         }
-        Err(err) => {
-            state.panic = Some(err);
+        Err(payload) => {
+            state.poison(payload);
             -1
         }
     }
@@ -172,6 +204,9 @@ unsafe extern "C" fn ctrl<S: Write>(
 
     if cmd == BIO_CTRL_FLUSH {
         BIO_clear_retry_flags(bio);
+        if state.poisoned() {
+            return 0;
+        }
         match catch_unwind(AssertUnwindSafe(|| state.stream.flush())) {
             Ok(Ok(())) => 1,
             Ok(Err(err)) => {
@@ -181,8 +216,8 @@ unsafe extern "C" fn ctrl<S: Write>(
                 state.error = Some(err);
                 0
             }
-            Err(err) => {
-                state.panic = Some(err);
+            Err(payload) => {
+                state.poison(payload);
                 0
             }
         }
@@ -209,7 +244,8 @@ unsafe extern "C" fn destroy<S>(bio: *mut BIO) -> c_int {
     let data = BIO_get_data(bio);
 
     if !data.is_null() {
-        drop(Box::<StreamState<S>>::from_raw(data.cast()));
+        // Called from C: a panicking stream destructor must not unwind.
+        unwind::drop_contained(Box::<StreamState<S>>::from_raw(data.cast()));
         BIO_set_data(bio, ptr::null_mut());
     }
 

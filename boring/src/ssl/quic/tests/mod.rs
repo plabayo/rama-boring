@@ -242,25 +242,26 @@ fn fragmented_handshake_and_resumption_deliver_directional_secrets() {
     }
 }
 
-#[test]
-fn callback_faults_return_to_rust_and_release_ownership() {
-    let (ctx, _, _) = contexts();
-    for panic in [false, true] {
-        let record = Arc::new(Record {
-            panic,
-            fail: !panic,
-            ..Default::default()
-        });
-        let weak = Arc::downgrade(&record);
-        let mut conn = connection(&ctx, false, record);
-        let error = conn.handshake().unwrap_err();
-        assert!(matches!(
-            (panic, error),
-            (true, QuicError::CallbackPanicked) | (false, QuicError::Callback(_))
-        ));
-        assert!(matches!(conn.handshake(), Err(QuicError::InvalidState)));
-        drop(conn);
-        assert!(weak.upgrade().is_none());
+isolated_test! {
+    fn callback_faults_return_to_rust_and_release_ownership() {
+        let (ctx, _, _) = contexts();
+        for panic in [false, true] {
+            let record = Arc::new(Record {
+                panic,
+                fail: !panic,
+                ..Default::default()
+            });
+            let weak = Arc::downgrade(&record);
+            let mut conn = connection(&ctx, false, record);
+            let error = conn.handshake().unwrap_err();
+            assert!(matches!(
+                (panic, error),
+                (true, QuicError::CallbackPanicked) | (false, QuicError::Callback(_))
+            ));
+            assert!(matches!(conn.handshake(), Err(QuicError::InvalidState)));
+            drop(conn);
+            assert!(weak.upgrade().is_none());
+        }
     }
 }
 
@@ -273,18 +274,19 @@ fn wrong_encryption_level_is_rejected() {
         .is_err());
 }
 
-#[test]
-fn panicking_payload_destructor_cannot_unwind_through_c() {
-    let (ctx, _, _) = contexts();
-    let record = Arc::new(Record {
-        panic_payload: true,
-        ..Default::default()
-    });
-    let mut client = connection(&ctx, false, record);
-    assert!(matches!(
-        client.handshake(),
-        Err(QuicError::CallbackPanicked)
-    ));
+isolated_test! {
+    fn panicking_payload_destructor_cannot_unwind_through_c() {
+        let (ctx, _, _) = contexts();
+        let record = Arc::new(Record {
+            panic_payload: true,
+            ..Default::default()
+        });
+        let mut client = connection(&ctx, false, record);
+        assert!(matches!(
+            client.handshake(),
+            Err(QuicError::CallbackPanicked)
+        ));
+    }
 }
 
 #[test]

@@ -67,6 +67,12 @@ impl ErrorStack {
 
     /// Used to report errors from the Rust crate
     #[cold]
+    pub(crate) fn internal_error_string(message: String) -> Self {
+        Self(vec![Error::new_internal(Data::String(message))])
+    }
+
+    /// Used to report errors from the Rust crate
+    #[cold]
     pub(crate) fn internal_error_str(message: &'static str) -> Self {
         Self(vec![Error::new_internal(Data::Static(message))])
     }

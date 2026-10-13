@@ -115,8 +115,9 @@ fn async_verify(ctx: &mut SslContextBuilder, gate: &Arc<Gate>) {
     );
 }
 
-/// Builds a client and server whose handshake waits at `wait` on `gate`.
-fn handshake_waiting_at(wait: Wait, gate: &Arc<Gate>) -> (Peer, Peer) {
+/// Builds a client and server configured to wait at `wait` on `gate`, and runs
+/// their handshake as far as it goes.
+fn handshake_at(wait: Wait, gate: &Arc<Gate>) -> (Peer, Peer) {
     let pki = &*PKI;
     let mut server = quic_context();
     let mut client = quic_context();
@@ -194,6 +195,12 @@ fn handshake_waiting_at(wait: Wait, gate: &Arc<Gate>) -> (Peer, Peer) {
     client.conn.ssl_mut().set_hostname("server.test").unwrap();
     let mut server = Peer::quic(&server.build(), true);
     settle(&mut client, &mut server, 7);
+    (client, server)
+}
+
+/// Builds a client and server whose handshake waits at `wait` on `gate`.
+fn handshake_waiting_at(wait: Wait, gate: &Arc<Gate>) -> (Peer, Peer) {
+    let (client, server) = handshake_at(wait, gate);
     assert!(gate.is_waiting(), "{wait:?} did not wait");
     assert_eq!(gate.created(), 1, "{wait:?}");
     assert!(client.error.is_none() && server.error.is_none(), "{wait:?}");
@@ -824,4 +831,48 @@ fn every_schedule_at_every_wait_keeps_the_contract() {
         }
     }
     assert_eq!(schedules, 7 * 3 * 2 * 2 * 4 * 2);
+}
+
+#[track_caller]
+fn assert_panic_failed(peer: &mut Peer, stage: &str, context: &str) {
+    match &peer.error {
+        Some(QuicError::Tls(error)) => assert!(
+            error
+                .to_string()
+                .contains(&format!("callback panicked: {stage}")),
+            "{context}: {error}"
+        ),
+        other => panic!("{context}: {other:?}"),
+    }
+    assert_poisoned(peer);
+}
+
+isolated_test! {
+    fn panics_at_every_wait_fail_the_handshake_closed() {
+        for wait in WAITS {
+            for stage in ["poll", "finish"] {
+                let context = format!("{wait:?} {stage}");
+                let gate = Gate::new();
+                let (mut client, mut server) = handshake_waiting_at(wait, &gate);
+                let (waiting, _) = waiting_side(wait, &mut client, &mut server);
+                if stage == "poll" {
+                    gate.panic();
+                } else {
+                    gate.panic_in_finish();
+                }
+                waiting.poll();
+                assert_panic_failed(waiting, stage, &context);
+                drop((client, server));
+                gate.assert_released();
+                assert_eq!(gate.created(), 1, "{context}: retried after a panic");
+            }
+
+            let gate = Gate::new();
+            gate.panic_in_factory();
+            let (mut client, mut server) = handshake_at(wait, &gate);
+            let (waiting, _) = waiting_side(wait, &mut client, &mut server);
+            assert_panic_failed(waiting, "factory", &format!("{wait:?} factory"));
+            assert_eq!(gate.created(), 0);
+        }
+    }
 }

@@ -141,10 +141,15 @@ pub(super) fn cancel_pending(ssl: &mut SslRef) {
     if let Some(state) = ssl.ex_data_mut(*SELECT_PRIVATE_KEY_METHOD_FUTURE_INDEX) {
         state.get_mut().take();
     }
+    cancel_session_lookup(ssl);
+    ssl.set_task_waker(None);
+}
+
+// A panicking session lookup reports a miss; its future must not be resumed.
+pub(super) fn cancel_session_lookup(ssl: &mut SslRef) {
     if let Some(state) = ssl.ex_data_mut(*SELECT_GET_SESSION_FUTURE_INDEX) {
         state.get_mut().take();
     }
-    ssl.set_task_waker(None);
 }
 
 pub(super) fn context_changed(ssl: &mut SslRef) {

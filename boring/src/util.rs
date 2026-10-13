@@ -1,36 +1,18 @@
 use crate::error::ErrorStack;
 use crate::libc_types::{c_char, c_int, c_void};
+use crate::unwind;
 use foreign_types::{ForeignType, ForeignTypeRef};
-use std::any::Any;
-use std::panic::{self, AssertUnwindSafe};
 use std::slice;
 
-/// Wraps a user-supplied callback and a slot for panics thrown inside the callback (while FFI
-/// frames are on the stack).
-///
-/// When dropped, checks if the callback has panicked, and resumes unwinding if so.
+/// Wraps a user-supplied callback that runs while FFI frames are on the stack.
 pub struct CallbackState<F> {
     /// The user callback. Taken out of the `Option` when called.
     cb: Option<F>,
-    /// If the callback panics, we place the panic object here, to be re-thrown once OpenSSL
-    /// returns.
-    panic: Option<Box<dyn Any + Send + 'static>>,
 }
 
 impl<F> CallbackState<F> {
     pub fn new(callback: F) -> Self {
-        CallbackState {
-            cb: Some(callback),
-            panic: None,
-        }
-    }
-}
-
-impl<F> Drop for CallbackState<F> {
-    fn drop(&mut self) {
-        if let Some(panic) = self.panic.take() {
-            panic::resume_unwind(panic);
-        }
+        CallbackState { cb: Some(callback) }
     }
 }
 
@@ -48,19 +30,23 @@ where
 {
     let callback = &mut *cb_state.cast::<CallbackState<F>>();
 
-    let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        let pass_slice = slice::from_raw_parts_mut(buf.cast::<u8>(), size as usize);
-        callback.cb.take().unwrap()(pass_slice)
-    }));
+    // A panic fails the key load with an error instead of unwinding through C.
+    let result = unwind::catch(
+        || {
+            let pass_slice = slice::from_raw_parts_mut(buf.cast::<u8>(), size as usize);
+            callback.cb.take().unwrap()(pass_slice)
+        },
+        |message| {
+            Err(ErrorStack::internal_error_string(format!(
+                "callback panicked: {message}"
+            )))
+        },
+    );
 
     match result {
-        Ok(Ok(len)) => len as c_int,
-        Ok(Err(err)) => {
-            err.put();
-            0
-        }
+        Ok(len) => len as c_int,
         Err(err) => {
-            callback.panic = Some(err);
+            err.put();
             0
         }
     }

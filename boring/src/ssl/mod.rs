@@ -57,6 +57,17 @@
 //!     }
 //! }
 //! ```
+//!
+//! # Panics in callbacks and streams
+//!
+//! A panic never unwinds through BoringSSL. A panicking callback, future,
+//! finish closure or signer fails its operation with an error that carries the
+//! panic message ("callback panicked: …"); pending asynchronous work is
+//! dropped and never resumed. A panicking transport stream fails the operation
+//! with an I/O error and is never used again. Callbacks that only observe
+//! (info, keylog, new and removed sessions) and session lookups cannot fail the
+//! handshake: their panics are contained, and a lookup reports a cache miss.
+//! The panic hook still runs for every panic.
 use crate::libc_types::{c_char, c_int, c_uchar, c_uint};
 use foreign_types::{ForeignType, ForeignTypeRef, Opaque};
 use openssl_macros::corresponds;
@@ -70,7 +81,6 @@ use std::io::prelude::*;
 use std::marker::PhantomData;
 use std::mem::{self, ManuallyDrop, MaybeUninit};
 use std::ops::Deref;
-use std::panic::resume_unwind;
 use std::path::Path;
 use std::ptr::{self, NonNull};
 use std::slice;
@@ -4610,8 +4620,6 @@ impl<S: Read + Write> SslStream<S> {
 
 impl<S> SslStream<S> {
     fn make_error(&mut self, ret: c_int) -> Error {
-        self.check_panic();
-
         let code = self.ssl.error_code(ret);
 
         let cause = match code {
@@ -4632,12 +4640,6 @@ impl<S> SslStream<S> {
         };
 
         Error { code, cause }
-    }
-
-    fn check_panic(&mut self) {
-        if let Some(err) = unsafe { bio::take_panic::<S>(self.ssl.get_raw_rbio()) } {
-            resume_unwind(err)
-        }
     }
 
     fn get_bio_error(&mut self) -> Option<io::Error> {

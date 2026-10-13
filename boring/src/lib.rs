@@ -138,6 +138,8 @@ pub mod hkdf;
 pub mod hmac;
 pub mod hpke;
 pub mod memcmp;
+#[macro_use]
+mod unwind;
 // pub mod mlkem; // TODO
 pub mod nid;
 pub mod pkcs12;
@@ -221,6 +223,7 @@ unsafe extern "C" fn free_data_box<T>(
     _argp: *mut c_void,
 ) {
     if !ptr.is_null() {
-        drop(Box::<T>::from_raw(ptr.cast::<T>()));
+        // BoringSSL frees ex data from C: a panicking destructor must not unwind.
+        unwind::drop_contained(Box::<T>::from_raw(ptr.cast::<T>()));
     }
 }
