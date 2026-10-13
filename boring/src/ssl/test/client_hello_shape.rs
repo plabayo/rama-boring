@@ -1039,3 +1039,39 @@ fn wire_settings_are_fixed_once_the_client_hello_is_written() {
         .set_client_hello_shape(&ClientHelloShape::new())
         .is_err());
 }
+
+#[test]
+fn every_list_takes_at_most_sixteen_grease_slots() {
+    let sixteen: Vec<u16> = (0..16)
+        .map(|n| (n << 12) | 0x0a00 | (n << 4) | 0x0a)
+        .collect();
+    let mut seventeen = sixteen.clone();
+    seventeen.push(0x0a0a);
+    let with = |values: &[u16], known: u16| [values, &[known]].concat();
+    let mut ssl = client(|_| {});
+    assert!(ssl.set_raw_cipher_list(&with(&sixteen, 0x1301)).is_ok());
+    assert!(ssl.set_raw_cipher_list(&with(&seventeen, 0x1301)).is_err());
+    assert!(ssl
+        .set_raw_supported_groups(&with(&sixteen, X25519))
+        .is_ok());
+    assert!(ssl
+        .set_raw_supported_groups(&with(&seventeen, X25519))
+        .is_err());
+    assert!(ssl.set_raw_key_shares(&with(&sixteen, X25519)).is_ok());
+    assert!(ssl.set_raw_key_shares(&with(&seventeen, X25519)).is_err());
+    assert!(ssl
+        .set_raw_supported_versions(&with(&sixteen, 0x0304))
+        .is_ok());
+    assert!(ssl
+        .set_raw_supported_versions(&with(&seventeen, 0x0304))
+        .is_err());
+    assert!(ssl
+        .set_raw_signature_algorithms(&with(&sixteen, 0x0804))
+        .is_ok());
+    assert!(ssl
+        .set_raw_signature_algorithms(&with(&seventeen, 0x0804))
+        .is_err());
+    let mut ctx = client_context();
+    assert!(ctx.set_raw_cipher_list(&with(&sixteen, 0x1301)).is_ok());
+    assert!(ctx.set_raw_cipher_list(&with(&seventeen, 0x1301)).is_err());
+}
