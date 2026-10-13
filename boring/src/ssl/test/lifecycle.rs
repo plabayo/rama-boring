@@ -1403,6 +1403,25 @@ fn raw_groups_set_before_accept_configure_a_server() {
     }
 }
 
+isolated_test! {
+    /// A server's raw group list longer than its context's: the per-group
+    /// flags, read when the server's preference decides, must grow with it.
+    fn raw_groups_longer_than_the_context_list_configure_a_server() {
+        for version in VERSIONS {
+            let mut ssl = server_with(version, |ctx| {
+                ctx.set_curves_list("X25519").unwrap();
+                ctx.set_options(crate::ssl::SslOptions::CIPHER_SERVER_PREFERENCE);
+            });
+            ssl.set_raw_supported_groups(&[X25519, P256, P384]).unwrap();
+            let mut offer = client(version);
+            offer.set_raw_supported_groups(&[P384]).unwrap();
+            offer.set_raw_key_shares(&[P384]).unwrap();
+            let done = connect(offer, ssl);
+            assert_eq!(done.server.ssl().group_id(), Some(P384), "{version:?}");
+        }
+    }
+}
+
 #[test]
 fn raw_groups_drop_a_native_key_share_selection_they_exclude() {
     let mut ssl = client(TLS13);
