@@ -5,17 +5,22 @@
 //! what the relay does between polls: it dials egress with the client's
 //! extension order, issues the ingress certificate once the origin is
 //! authenticated, pauses egress at the origin's CertificateRequest, authenticates
-//! ingress through a policy, answers egress with the mapped credential, binds
-//! ingress completion to egress success, and cancels both legs on failure or
-//! deadline.
+//! ingress through a policy, answers egress with the mapped credential only once
+//! the ingress handshake is done, closes ingress if egress then fails, and
+//! cancels both legs on failure or deadline.
+//!
+//! The policy sees the client certificate before its CertificateVerify, so
+//! accepting the certificate proves nothing about the key. Like Rama, the relay
+//! waits for the ingress `HANDSHAKE_DONE`: in TLS 1.3 ingress completes without
+//! egress, since its certificate was issued earlier, so this cannot deadlock.
 
-use super::support::{credential, deliver, quic_context, Authority, Gate, Peer};
+use super::support::{credential, deliver, ec_key, quic_context, Authority, Gate, Peer};
 use crate::ssl::test::wire;
 use crate::{
     pkey::{PKey, Private},
     ssl::{
         AsyncSelectCertError, BoxCertificateFinish, BoxCustomVerifyFinish, CertificateSelection,
-        SslAlert, SslContext, SslCredential, SslRef, SslVerifyMode,
+        SslAlert, SslContext, SslCredential, SslInfoCallbackMode, SslRef, SslVerifyMode,
     },
     x509::X509,
 };
@@ -39,6 +44,8 @@ struct Pki {
     origin: (X509, PKey<Private>),
     client: (X509, PKey<Private>),
     untrusted_client: (X509, PKey<Private>),
+    /// A key other than the trusted client certificate's.
+    impostor_key: PKey<Private>,
     mapped: (X509, PKey<Private>),
     /// A mapped credential the origin does not trust.
     unknown_mapped: (X509, PKey<Private>),
@@ -54,6 +61,7 @@ static PKI: LazyLock<Pki> = LazyLock::new(|| {
         origin: origin_ca.issue(ORIGIN),
         client: client_ca.issue("client.test"),
         untrusted_client: rogue.issue("client.test"),
+        impostor_key: ec_key(),
         mapped: upstream_ca.issue("relay.test"),
         unknown_mapped: rogue.issue("relay.test"),
         mitm,
@@ -75,7 +83,16 @@ enum ClientCert {
     None,
     Trusted,
     Untrusted,
+    /// The trusted certificate without its key: CertificateVerify fails.
+    Impostor,
 }
+
+const CLIENT_CERTS: [ClientCert; 4] = [
+    ClientCert::None,
+    ClientCert::Trusted,
+    ClientCert::Untrusted,
+    ClientCert::Impostor,
+];
 
 /// A policy wait at which the relay may be cancelled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -132,6 +149,9 @@ struct Shared {
     origin_cert: Mutex<Option<X509>>,
     origin_requested: AtomicBool,
     presented: Mutex<Option<X509>>,
+    /// Set on the ingress `HANDSHAKE_DONE`: the client proved its identity.
+    ingress_done: AtomicBool,
+    verified_client: Mutex<Option<X509>>,
     upstream_credential: Mutex<Option<SslCredential>>,
     events: Mutex<Vec<&'static str>>,
 }
@@ -217,7 +237,7 @@ struct Relay {
     egress_ctx: SslContext,
     origin: Peer,
     policy_decided: bool,
-    policy_bound: bool,
+    upstream_answered: bool,
     cancelled: bool,
 }
 
@@ -242,6 +262,14 @@ impl Relay {
                     None,
                 ))
                 .unwrap(),
+            ClientCert::Impostor => {
+                // Credentials refuse a mismatched key; a key method signs anyway.
+                let signer = Gate::new();
+                signer.open();
+                client
+                    .add_credential(&credential(&pki.client.0, &pki.impostor_key, Some(&signer)))
+                    .unwrap()
+            }
         }
 
         let mut origin = quic_context();
@@ -257,6 +285,14 @@ impl Relay {
             OriginAuth::Required => SslVerifyMode::PEER | SslVerifyMode::FAIL_IF_NO_PEER_CERT,
         });
         origin.set_select_certificate_callback(capture_hello("origin", &shared));
+        let seen = shared.clone();
+        origin.set_msg_callback(move |_, message| {
+            match message.handshake_type().filter(|_| !message.is_written()) {
+                Some(11) => seen.event("origin read certificate"),
+                Some(15) => seen.event("origin read certificate verify"),
+                _ => {}
+            }
+        });
 
         let ingress = Self::ingress_context(scenario, &shared, &gates);
         let egress_ctx = Self::egress_context(&shared, &gates);
@@ -284,7 +320,7 @@ impl Relay {
             egress_ctx,
             origin,
             policy_decided: false,
-            policy_bound: false,
+            upstream_answered: false,
             cancelled: false,
         }
     }
@@ -293,6 +329,16 @@ impl Relay {
         let mut ingress = quic_context();
         // The relay peeks the ClientHello before issuing anything.
         ingress.set_select_certificate_callback(capture_hello("client", shared));
+        // Only now has the client proven possession: CertificateVerify and
+        // Finished were both verified.
+        let done = shared.clone();
+        ingress.set_info_callback(move |ssl, mode, _| {
+            if mode == SslInfoCallbackMode::HANDSHAKE_DONE {
+                *done.verified_client.lock().unwrap() = ssl.peer_certificate();
+                done.ingress_done.store(true, SeqCst);
+                done.event("ingress handshake done");
+            }
+        });
         let (shared, issuer) = (shared.clone(), gates.issuer.clone());
         let issued_signer = scenario.async_signers.then(|| gates.issued_signing.clone());
         let policy = gates.policy.clone();
@@ -471,13 +517,27 @@ impl Relay {
             }
         }
 
+        // The policy judges the certificate before its CertificateVerify:
+        // accepting it releases nothing upstream.
         if self.gates.policy.is_waiting() && !self.policy_decided {
             self.policy_decided = true;
             let presented = self.shared.presented.lock().unwrap().clone().unwrap();
-            if !PKI.client_ca.issued(&presented) {
+            if PKI.client_ca.issued(&presented) {
+                self.shared.event("policy accepted");
+                self.gates.policy.open();
+            } else {
                 self.shared.event("policy rejected");
                 self.gates.policy.fail();
-            } else if self.gates.upstream.is_waiting() {
+            }
+        }
+        // Egress answers from the identity ingress proved, or without a
+        // credential when the client presented none.
+        if self.gates.upstream.is_waiting()
+            && !self.upstream_answered
+            && self.shared.ingress_done.load(SeqCst)
+        {
+            self.upstream_answered = true;
+            if self.shared.verified_client.lock().unwrap().is_some() {
                 let (cert, key) = if self.scenario.mapped_untrusted {
                     &PKI.unknown_mapped
                 } else {
@@ -489,39 +549,21 @@ impl Relay {
                     .then_some(&self.gates.mapped_signing);
                 *self.shared.upstream_credential.lock().unwrap() =
                     Some(credential(cert, key, signer));
-                self.shared.event("policy mapped");
-                self.policy_bound = true;
-                self.gates.upstream.open();
+                self.shared.event("credential mapped");
             } else {
-                self.shared.event("policy accepted");
-                self.gates.policy.open();
+                self.shared.event("forward none");
             }
-        }
-        let egress = self.egress.as_mut().unwrap();
-        if self.policy_bound && self.gates.policy.is_waiting() {
-            // Ingress completes only once the origin accepted the mapped credential.
-            if confirmed {
-                self.gates.policy.open();
-            } else if egress.is_closed() {
-                self.gates.policy.fail();
-            }
-        }
-        // A client without a certificate never reaches the policy; once ingress
-        // completes, egress answers the origin without a credential.
-        if self.gates.upstream.is_waiting() && !self.policy_bound && self.ingress.is_complete() {
-            self.shared.event("forward none");
             self.gates.upstream.open();
         }
 
-        // Neither leg outlives the other before handoff.
-        if egress.is_closed() && !self.ingress.is_closed() && !self.policy_bound {
+        // Neither leg outlives the other before handoff: a complete ingress is
+        // closed when the origin then refuses egress.
+        let egress = self.egress.as_mut().unwrap();
+        if egress.is_closed() && !self.ingress.is_closed() {
             self.ingress.abort();
         }
         if self.ingress.is_closed() && !egress.is_closed() {
             egress.abort();
-        }
-        if self.ingress.is_complete() && self.shared.position("ingress complete").is_none() {
-            self.shared.event("ingress complete");
         }
     }
 
@@ -577,8 +619,12 @@ impl Relay {
             ingress_peer: self.ingress.conn.ssl().peer_certificate(),
             origin_peer: self.origin.conn.ssl().peer_certificate(),
             client_peer: self.client.conn.ssl().peer_certificate(),
+            verified_client: self.shared.verified_client.lock().unwrap().clone(),
             client_alerted: !self.client.record.alerts.lock().unwrap().is_empty(),
             ingress_alerted: !self.ingress.record.alerts.lock().unwrap().is_empty(),
+            ingress_error: self.ingress.error.as_ref().map(ToString::to_string),
+            ingress_aborted: self.ingress.aborted,
+            egress_aborted: egress.is_some_and(|egress| egress.aborted),
             client_hello: self.shared.client_hello.lock().unwrap().clone(),
             origin_hello: self.shared.origin_hello.lock().unwrap().clone(),
             events: self.shared.events.lock().unwrap().clone(),
@@ -647,8 +693,13 @@ struct Outcome {
     ingress_peer: Option<X509>,
     origin_peer: Option<X509>,
     client_peer: Option<X509>,
+    /// The client identity ingress reported at `HANDSHAKE_DONE`.
+    verified_client: Option<X509>,
     client_alerted: bool,
     ingress_alerted: bool,
+    ingress_error: Option<String>,
+    ingress_aborted: bool,
+    egress_aborted: bool,
     client_hello: Option<Vec<u16>>,
     origin_hello: Option<Vec<u16>>,
     events: Vec<&'static str>,
@@ -700,12 +751,32 @@ impl Outcome {
         if let Some(peer) = &self.origin_peer {
             assert!(!PKI.client_ca.issued(peer), "{context}");
         }
-        // Ingress never completes authentication the origin rejected.
-        if self.ingress
-            && self.created(Point::Policy) == 1
-            && self.events.contains(&"policy mapped")
-        {
-            assert!(self.origin && self.egress, "{context}");
+        // No leg survives alone: the relay hands off all four or none.
+        let legs = [self.client, self.ingress, self.egress, self.origin];
+        assert!(legs.iter().all(|leg| *leg == legs[0]), "{context}");
+        // Nothing reaches the origin before the client proved possession of its
+        // key: a certificate the policy accepted is not yet an identity.
+        for event in [
+            "credential mapped",
+            "forward none",
+            "upstream answered",
+            "origin read certificate",
+            "origin read certificate verify",
+        ] {
+            if self.events.contains(&event) {
+                assert!(
+                    self.before("ingress handshake done", event),
+                    "{event} before proof of possession: {context}"
+                );
+            }
+        }
+        // A mapped credential stands only for a verified trusted client.
+        if self.events.contains(&"credential mapped") || self.origin_peer.is_some() {
+            let verified = self.verified_client.as_ref();
+            assert!(
+                verified.is_some_and(|peer| PKI.client_ca.issued(peer)),
+                "{context}"
+            );
         }
         // The origin sees the client's extension order.
         if let (Some(client), Some(origin)) = (&self.client_hello, &self.origin_hello) {
@@ -722,6 +793,8 @@ struct Expected {
     complete: bool,
     origin_sees: Option<&'static str>,
     ingress_sees_client: bool,
+    /// Ingress reports the client at `HANDSHAKE_DONE`.
+    verified: bool,
     upstream: bool,
     policy: bool,
 }
@@ -732,12 +805,14 @@ fn expected(scenario: &Scenario) -> Expected {
     let ingress_asks = origin_asks || scenario.ingress_auth;
     let presents = ingress_asks && scenario.client != ClientCert::None;
     let policy = presents;
-    let accepted = scenario.client == ClientCert::Trusted;
-    let mapped = origin_asks && presents && accepted;
+    // The policy accepts the impostor's certificate; its CertificateVerify fails.
+    let accepted = matches!(scenario.client, ClientCert::Trusted | ClientCert::Impostor);
+    let proven = scenario.client == ClientCert::Trusted;
+    let mapped = origin_asks && presents && proven;
     let mapped_accepted = mapped && !scenario.mapped_untrusted;
     let complete = match (scenario.client, ingress_asks) {
         (_, false) => true,
-        (ClientCert::Untrusted, true) => false,
+        (ClientCert::Untrusted | ClientCert::Impostor, true) => false,
         (ClientCert::None, true) => {
             !scenario.ingress_auth && scenario.origin != OriginAuth::Required
         }
@@ -747,6 +822,7 @@ fn expected(scenario: &Scenario) -> Expected {
         complete,
         origin_sees: (complete && mapped_accepted).then_some("mapped"),
         ingress_sees_client: presents && accepted,
+        verified: presents && proven,
         upstream: origin_asks,
         policy,
     }
@@ -818,6 +894,14 @@ fn check(scenario: Scenario) -> Outcome {
         expected.ingress_sees_client,
         "{context}"
     );
+    assert_eq!(
+        outcome
+            .verified_client
+            .as_ref()
+            .is_some_and(|peer| PKI.client_ca.issued(peer)),
+        expected.verified,
+        "{context}"
+    );
     if expected.complete {
         assert!(outcome.client_hello.is_some() && outcome.origin_hello.is_some());
         assert!(
@@ -850,7 +934,7 @@ fn ingress_only_authentication_never_reaches_the_origin() {
     let outcome = check(Scenario::new(OriginAuth::None, ClientCert::Trusted, true));
     assert_eq!(outcome.created(Point::Upstream), 0);
     assert!(outcome.before("issued", "policy accepted"));
-    assert!(outcome.before("egress confirmed", "ingress complete"));
+    assert!(outcome.before("egress confirmed", "ingress handshake done"));
 
     for client in [ClientCert::None, ClientCert::Untrusted] {
         let outcome = check(Scenario::new(OriginAuth::None, client, true));
@@ -860,21 +944,24 @@ fn ingress_only_authentication_never_reaches_the_origin() {
 }
 
 #[test]
-fn mapped_credential_answers_the_origin_after_ingress_authentication() {
+fn mapped_credential_answers_the_origin_after_proof_of_possession() {
     for async_signers in [false, true] {
         let outcome = check(Scenario {
             async_signers,
             ..Scenario::new(OriginAuth::Required, ClientCert::Trusted, false)
         });
-        // Egress pauses at the CertificateRequest; ingress issues, authenticates,
-        // and only then does egress answer and ingress complete.
+        // Egress pauses at the CertificateRequest; ingress issues, accepts the
+        // certificate, completes once the client proved its key, and only then
+        // does egress answer.
         for (a, b) in [
             ("origin requested", "issued"),
             ("issued", "policy started"),
-            ("policy started", "policy mapped"),
-            ("policy mapped", "upstream answered"),
-            ("upstream answered", "egress confirmed"),
-            ("egress confirmed", "ingress complete"),
+            ("policy started", "policy accepted"),
+            ("policy accepted", "ingress handshake done"),
+            ("ingress handshake done", "credential mapped"),
+            ("credential mapped", "upstream answered"),
+            ("upstream answered", "origin read certificate verify"),
+            ("origin read certificate verify", "egress confirmed"),
         ] {
             assert!(outcome.before(a, b), "{a} before {b}: {:?}", outcome.events);
         }
@@ -911,7 +998,7 @@ fn policy_rejection_never_answers_the_origin() {
 }
 
 #[test]
-fn origin_refusing_the_mapped_credential_fails_ingress_too() {
+fn origin_refusing_the_mapped_credential_closes_the_complete_ingress() {
     // Optional origin auth still rejects a presented credential it cannot verify.
     for (origin, chunk) in [(OriginAuth::Required, 1200), (OriginAuth::Optional, 1)] {
         let outcome = check(Scenario {
@@ -919,9 +1006,53 @@ fn origin_refusing_the_mapped_credential_fails_ingress_too() {
             chunk,
             ..Scenario::new(origin, ClientCert::Trusted, false)
         });
-        assert!(outcome.events.contains(&"policy mapped"));
+        assert!(outcome.before("ingress handshake done", "credential mapped"));
         assert!(!outcome.ingress && !outcome.egress && !outcome.origin);
-        assert!(outcome.ingress_alerted, "ingress must not complete unbound");
+        // TLS already succeeded on ingress: the relay closes the connection.
+        assert!(outcome.ingress_aborted && !outcome.ingress_alerted);
+    }
+}
+
+#[test]
+fn certificate_without_proof_of_possession_never_reaches_the_origin() {
+    // The policy accepts the certificate, but the client signs with another key.
+    for (origin, ingress_auth, async_signers, chunk) in [
+        (OriginAuth::Required, false, false, 1200),
+        (OriginAuth::Optional, false, true, 1),
+        (OriginAuth::Required, true, true, 97),
+        (OriginAuth::None, true, false, 211),
+    ] {
+        let scenario = Scenario {
+            async_signers,
+            chunk,
+            ..Scenario::new(origin, ClientCert::Impostor, ingress_auth)
+        };
+        let outcome = check(scenario);
+        let context = format!("{scenario:?} events={:?}", outcome.events);
+        assert!(
+            outcome.before("policy started", "policy accepted"),
+            "{context}"
+        );
+        let error = outcome.ingress_error.as_deref().unwrap_or_default();
+        assert!(error.contains("BAD_SIGNATURE"), "{error}: {context}");
+        assert!(outcome.ingress_alerted, "{context}");
+        assert!(outcome.verified_client.is_none(), "{context}");
+        for event in [
+            "ingress handshake done",
+            "credential mapped",
+            "forward none",
+            "origin read certificate",
+            "origin read certificate verify",
+        ] {
+            assert!(!outcome.events.contains(&event), "{event}: {context}");
+        }
+        assert!(outcome.origin_peer.is_none(), "{context}");
+        // Egress paused at the CertificateRequest is aborted unanswered.
+        assert!(outcome.egress_aborted && !outcome.origin, "{context}");
+        let paused = usize::from(origin != OriginAuth::None);
+        assert_eq!(outcome.created(Point::Upstream), paused, "{context}");
+        assert_eq!(outcome.gates.upstream.finished(), 0, "{context}");
+        assert_eq!(outcome.gates.mapped_signing.created(), 0, "{context}");
     }
 }
 
@@ -962,11 +1093,7 @@ fn scenarios() -> impl Strategy<Value = Scenario> {
             Just(OriginAuth::Optional),
             Just(OriginAuth::Required)
         ],
-        prop_oneof![
-            Just(ClientCert::None),
-            Just(ClientCert::Trusted),
-            Just(ClientCert::Untrusted)
-        ],
+        proptest::sample::select(CLIENT_CERTS.to_vec()),
         any::<bool>(),
         any::<bool>(),
         any::<bool>(),
@@ -1006,7 +1133,7 @@ fn relay_contract_holds_for_every_discrete_scenario() {
     const CHUNKS: [usize; 5] = [1, 7, 97, 211, 1200];
     let mut count = 0;
     for origin in [OriginAuth::None, OriginAuth::Optional, OriginAuth::Required] {
-        for client in [ClientCert::None, ClientCert::Trusted, ClientCert::Untrusted] {
+        for client in CLIENT_CERTS {
             for ingress_auth in [false, true] {
                 for mapped_untrusted in [false, true] {
                     for async_signers in [false, true] {
@@ -1030,7 +1157,7 @@ fn relay_contract_holds_for_every_discrete_scenario() {
             }
         }
     }
-    assert_eq!(count, 3 * 3 * 2 * 2 * 2 * 4 * 6);
+    assert_eq!(count, 3 * CLIENT_CERTS.len() * 2 * 2 * 2 * 4 * 6);
 }
 
 proptest! {
