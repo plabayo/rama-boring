@@ -257,8 +257,10 @@ impl SslEarlyDataReason {
 
     /// The raw native value.
     #[must_use]
+    // The native enum is `i32` on MSVC and `u32` elsewhere.
+    #[allow(clippy::unnecessary_cast)]
     pub fn as_raw(&self) -> u32 {
-        self.0 .0
+        self.0 .0 as u32
     }
 }
 
