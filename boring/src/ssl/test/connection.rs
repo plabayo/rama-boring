@@ -136,6 +136,18 @@ fn tls13_server_cipher_preference_is_per_connection() {
     let mut ssl = Ssl::new(&server).unwrap();
     assert!(ssl.set_tls13_server_ciphers(&[0xc02f]).is_err());
     assert!(ssl.set_tls13_server_ciphers(&[0xcafe]).is_err());
+
+    // A preference never overrides the server's compliance policy.
+    let mut ssl = Ssl::new(&server).unwrap();
+    ssl.set_compliance_policy(crate::ssl::CompliancePolicy::FIPS_202205)
+        .unwrap();
+    ssl.set_tls13_server_ciphers(&[0x1303]).unwrap();
+    let mut offers_chacha = Ssl::new(&client_context().build()).unwrap();
+    offers_chacha
+        .set_raw_cipher_list(&[0x1303, 0x1301, 0x1302])
+        .unwrap();
+    let fips = handshake(offers_chacha, ssl).0.done();
+    assert_ne!(fips.ssl().current_cipher().unwrap().protocol_id(), 0x1303);
 }
 
 /// "Compresses" by copying, under a configurable algorithm id.
@@ -362,6 +374,24 @@ fn max_send_fragment_splits_records() {
     };
     assert_eq!(records(None), 1);
     assert_eq!(records(Some(512)), 4);
+    // The context-level setting applies to its connections.
+    let seen = Seen::default();
+    let mut ctx = client_context();
+    ctx.set_max_send_fragment(512);
+    let mut ssl = Ssl::new(&ctx.build()).unwrap();
+    ssl.set_msg_callback(observe(&seen));
+    let (client, server) = handshake(ssl, Ssl::new(&server_context().build()).unwrap());
+    let (mut client, mut server) = (client.done(), server.done());
+    seen.lock().unwrap().clear();
+    client.write_all(&[7; 2000]).unwrap();
+    server.read_exact(&mut [0; 2000]).unwrap();
+    let written_headers = seen
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(written, content, ..)| *written && *content == SslContentType::HEADER.as_raw())
+        .count();
+    assert_eq!(written_headers, 4);
     // Smaller values are clamped to 512.
     assert_eq!(records(Some(100)), 4);
 }
@@ -373,6 +403,58 @@ fn exchange(client: &mut SslStream<End>, server: &mut SslStream<End>) {
     server.write_all(b"pong").unwrap();
     client.read_exact(&mut buf).unwrap();
     assert_eq!(&buf, b"pong");
+}
+
+#[test]
+fn message_metadata_and_constants() {
+    assert_eq!(SslContentType::HANDSHAKE.as_raw(), 22);
+    assert_eq!(SslContentType::ALERT.as_raw(), 21);
+    assert_eq!(SslContentType::HEADER.as_raw(), 256);
+    assert_eq!(crate::ssl::SslEarlyDataReason::ACCEPTED.as_raw(), 2);
+    assert_eq!(crate::ssl::SslEarlyDataReason::UNKNOWN.as_raw(), 0);
+    assert_eq!(
+        format!("{:?}", crate::ssl::SslEarlyDataReason::ACCEPTED),
+        "accepted"
+    );
+
+    let versions = Arc::new(Mutex::new(Vec::new()));
+    let sink = versions.clone();
+    let mut ssl = Ssl::new(&client_context().build()).unwrap();
+    ssl.set_msg_callback(move |_, message| {
+        sink.lock()
+            .unwrap()
+            .push((message.content_type(), message.version()));
+    });
+    handshake(ssl, Ssl::new(&server_context().build()).unwrap())
+        .0
+        .done();
+    let versions = versions.lock().unwrap();
+    // Record headers carry no version; messages carry the version in effect.
+    assert!(versions
+        .iter()
+        .filter(|(content, _)| *content == SslContentType::HEADER)
+        .all(|(_, version)| *version == 0));
+    let last_message = versions
+        .iter()
+        .rev()
+        .find(|(content, _)| *content == SslContentType::HANDSHAKE);
+    assert_eq!(last_message.map(|(_, version)| *version), Some(0x0304));
+}
+
+#[test]
+fn shed_configuration_is_released_after_the_handshake() {
+    for shed in [false, true] {
+        let mut client = Ssl::new(&client_context().build()).unwrap();
+        client.set_shed_handshake_config(shed);
+        let (client, server) = handshake(client, Ssl::new(&server_context().build()).unwrap());
+        let (mut client, mut server) = (client.done(), server.done());
+        exchange(&mut client, &mut server);
+        // Settings that live in the handshake configuration are gone once shed.
+        assert_eq!(
+            client.ssl_mut().set_raw_cipher_list(&[0x1301]).is_err(),
+            shed
+        );
+    }
 }
 
 #[test]
@@ -399,6 +481,10 @@ fn negotiated_state_getters() {
     client
         .set_private_key_file("test/key.pem", crate::ssl::SslFiletype::PEM)
         .unwrap();
+    // Nothing is negotiated before a handshake.
+    let fresh = Ssl::new(&client_context().build()).unwrap();
+    assert!(!fresh.extended_master_secret_support());
+    assert!(!fresh.secure_renegotiation_support());
     let (client, server) = connect(client, server);
     let (client, server) = (client.done(), server.done());
     for ssl in [client.ssl(), server.ssl()] {

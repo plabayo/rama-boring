@@ -42,10 +42,18 @@ fn client_hello_order(record: &Record) -> Vec<u16> {
     while !fields.is_empty() {
         let id = u16::from_be_bytes([fields[0], fields[1]]);
         let length = usize::from(u16::from_be_bytes([fields[2], fields[3]]));
-        order.push(id);
+        // GREASE values are fresh per connection; compare their positions.
+        order.push(if is_grease(id) { GREASE } else { id });
         fields = &fields[4 + length..];
     }
     order
+}
+
+/// Marks a GREASE position in a parsed or expected extension order.
+const GREASE: u16 = 0x0a0a;
+
+fn is_grease(id: u16) -> bool {
+    id & 0x0f0f == 0x0a0a && id >> 8 == id & 0xff
 }
 
 fn use_legacy_codepoint(peer: &mut Peer, legacy: bool) {
@@ -88,16 +96,19 @@ static CONTEXTS: LazyLock<(SslContext, SslContext)> = LazyLock::new(|| {
 });
 
 /// What a per-SSL order must emit: requested IDs first, deduplicated and
-/// restricted to emitted extensions, then everything else in canonical order.
+/// restricted to emitted extensions, with every GREASE codepoint a GREASE slot
+/// at its position, then everything else in canonical order.
 fn expected(requested: &[u16], canonical: &[u16]) -> Vec<u16> {
     let mut order = Vec::new();
     for id in requested {
-        if canonical.contains(id) && !order.contains(id) {
+        if is_grease(*id) {
+            order.push(GREASE);
+        } else if canonical.contains(id) && !order.contains(id) {
             order.push(*id);
         }
     }
     for id in canonical {
-        if !order.contains(id) {
+        if *id != GREASE && !order.contains(id) {
             order.push(*id);
         }
     }

@@ -65,7 +65,7 @@ impl<S: Read + Write> Side<S> {
         match result {
             Ok(stream) => Self::Done(stream),
             Err(HandshakeError::WouldBlock(mid)) => Self::Mid(mid),
-            Err(HandshakeError::Failure(mid)) => Self::Failed(mid.error().to_string()),
+            Err(HandshakeError::Failure(mid)) => Self::Failed(describe(mid.error())),
             Err(HandshakeError::SetupFailure(error)) => Self::Failed(error.to_string()),
         }
     }
@@ -94,6 +94,16 @@ impl<S: Read + Write> Side<S> {
                 error.contains(&format!("callback panicked: {what}")),
                 "{error}"
             ),
+            Self::Done(_) => panic!("handshake succeeded"),
+            Self::Mid(_) => panic!("handshake stalled"),
+        }
+    }
+
+    /// The handshake failed with an error mentioning `text`.
+    #[track_caller]
+    pub(super) fn panicked_or_failed_with(&self, text: &str) {
+        match self {
+            Self::Failed(error) => assert!(error.contains(text), "{error}"),
             Self::Done(_) => panic!("handshake succeeded"),
             Self::Mid(_) => panic!("handshake stalled"),
         }
@@ -140,4 +150,20 @@ pub(super) fn connect(
         Ssl::new(&client.build()).unwrap(),
         Ssl::new(&server.build()).unwrap(),
     )
+}
+
+/// An error with each queued error's detail, which `Display` leaves out.
+fn describe(error: &crate::ssl::Error) -> String {
+    let mut text = error.to_string();
+    for queued in error
+        .ssl_error()
+        .map(|stack| stack.errors())
+        .unwrap_or_default()
+    {
+        if let Some(data) = queued.data() {
+            text.push_str(" | ");
+            text.push_str(data);
+        }
+    }
+    text
 }

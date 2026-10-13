@@ -2,13 +2,167 @@
 //! negotiated-state getters that complement the context-level configuration.
 
 use super::{
-    callbacks, CertificateCompressionAlgorithm, Ssl, SslContext, SslContextBuilder, SslRef,
-    SESSION_CTX_INDEX,
+    callbacks, CertificateCompressionAlgorithm, ExtensionType, Ssl, SslContext, SslContextBuilder,
+    SslRef, SESSION_CTX_INDEX,
 };
 use crate::{cvt, error::ErrorStack, ffi, stack::StackRef, x509::X509};
 use foreign_types::ForeignTypeRef;
 use openssl_macros::corresponds;
 use std::{ffi::CStr, fmt, slice, sync::Arc};
+
+bitflags::bitflags! {
+    /// ClientHello lists that get a native GREASE value, first in the list (for
+    /// extensions: first and last). A list set with GREASE codepoints of its
+    /// own uses those slots instead.
+    #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
+    pub struct GreaseLists: u32 {
+        const CIPHERS = ffi::RAMA_SSL_GREASE_CIPHERS as u32;
+        const GROUPS = ffi::RAMA_SSL_GREASE_GROUPS as u32;
+        const KEY_SHARES = ffi::RAMA_SSL_GREASE_KEY_SHARES as u32;
+        const VERSIONS = ffi::RAMA_SSL_GREASE_VERSIONS as u32;
+        const SIGNATURE_ALGORITHMS = ffi::RAMA_SSL_GREASE_SIGNATURE_ALGORITHMS as u32;
+        const EXTENSIONS = ffi::RAMA_SSL_GREASE_EXTENSIONS as u32;
+    }
+}
+
+/// How GREASE values are chosen.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash)]
+pub enum GreaseValues {
+    /// Random per connection, as browsers do.
+    #[default]
+    Fresh,
+    /// Derived from a seed: reproducible, for tests and pinned variants.
+    Seeded(u64),
+    /// Exactly the GREASE codepoints listed, so a relay can mirror its peer.
+    /// Slots without a listed codepoint stay fresh.
+    Pinned,
+}
+
+/// What to do with listed values a connection cannot negotiate: unknown
+/// extensions, groups, versions and signature algorithms.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash)]
+pub enum UnknownValues {
+    /// Leave them out.
+    #[default]
+    Drop,
+    /// Fail the handshake, naming the value.
+    Forbid,
+    /// Send them as listed. If the server then selects or answers one, the
+    /// handshake fails. Unknown key shares are always dropped: they need a key.
+    Preserve,
+}
+
+/// ClientHello padding.
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash)]
+pub enum Padding {
+    /// BoringSSL's rule: over TCP, pad a 256–511 byte ClientHello to 512 bytes.
+    #[default]
+    Native,
+    /// No padding extension.
+    Off,
+    /// Pad the ClientHello, handshake header included, to this many bytes when
+    /// shorter.
+    ToLength(u16),
+}
+
+/// The cross-cutting choices that shape one connection's ClientHello.
+///
+/// Lists (ciphers, groups, key shares, versions, signature algorithms and the
+/// extension order) are set with their own setters, exactly as they appear on
+/// the wire: a GREASE codepoint in a list marks a GREASE slot at that position.
+/// This shape decides what those GREASE slots become, what happens to values
+/// the connection cannot negotiate, the padding, and the bodies of GREASE and
+/// preserved extensions. Everything left unset keeps BoringSSL's behaviour.
+/// All of it is combined when the ClientHello is written, so the order in
+/// which settings are applied does not matter.
+///
+/// With a real ECH configuration, GREASE slots and preserved extensions of the
+/// extension order do not apply (the encrypted ClientHello references the outer
+/// extensions natively); the order of known extensions still does.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientHelloShape {
+    grease_lists: Option<GreaseLists>,
+    grease_values: GreaseValues,
+    unknown_values: UnknownValues,
+    padding: Padding,
+    extension_bodies: Vec<(ExtensionType, Vec<u8>)>,
+}
+
+impl ClientHelloShape {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Lists that get a native GREASE value, replacing the context's GREASE
+    /// settings for this connection.
+    pub fn set_grease_lists(&mut self, lists: GreaseLists) -> &mut Self {
+        self.grease_lists = Some(lists);
+        self
+    }
+
+    #[must_use]
+    pub fn with_grease_lists(mut self, lists: GreaseLists) -> Self {
+        self.set_grease_lists(lists);
+        self
+    }
+
+    pub fn set_grease_values(&mut self, values: GreaseValues) -> &mut Self {
+        self.grease_values = values;
+        self
+    }
+
+    #[must_use]
+    pub fn with_grease_values(mut self, values: GreaseValues) -> Self {
+        self.set_grease_values(values);
+        self
+    }
+
+    pub fn set_unknown_values(&mut self, values: UnknownValues) -> &mut Self {
+        self.unknown_values = values;
+        self
+    }
+
+    #[must_use]
+    pub fn with_unknown_values(mut self, values: UnknownValues) -> Self {
+        self.set_unknown_values(values);
+        self
+    }
+
+    pub fn set_padding(&mut self, padding: Padding) -> &mut Self {
+        self.padding = padding;
+        self
+    }
+
+    #[must_use]
+    pub fn with_padding(mut self, padding: Padding) -> Self {
+        self.set_padding(padding);
+        self
+    }
+
+    /// The body sent for extension `id` of the extension order: a GREASE
+    /// codepoint or a preserved extension BoringSSL does not build. GREASE
+    /// extensions default to an empty first and one-byte later body; preserved
+    /// extensions default to an empty body. A later body for `id` replaces it.
+    pub fn set_extension_body(&mut self, id: ExtensionType, body: impl Into<Vec<u8>>) -> &mut Self {
+        let body = body.into();
+        match self
+            .extension_bodies
+            .iter_mut()
+            .find(|(known, _)| *known == id)
+        {
+            Some((_, existing)) => *existing = body,
+            None => self.extension_bodies.push((id, body)),
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn with_extension_body(mut self, id: ExtensionType, body: impl Into<Vec<u8>>) -> Self {
+        self.set_extension_body(id, body);
+        self
+    }
+}
 
 /// How a client handles a TLS 1.2 server's renegotiation request.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -332,6 +486,119 @@ impl SslRef {
                 self.as_ptr(),
                 ids.as_ptr(),
                 ids.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
+    /// Applies a [`ClientHelloShape`] to this client before its handshake starts.
+    ///
+    /// Fails for a server, once the ClientHello was written, for an extension
+    /// body BoringSSL builds itself, or for a body over 65535 bytes.
+    pub fn set_client_hello_shape(&mut self, shape: &ClientHelloShape) -> Result<(), ErrorStack> {
+        if shape
+            .extension_bodies
+            .iter()
+            .any(|(_, body)| body.len() > usize::from(u16::MAX))
+        {
+            return Err(ErrorStack::internal_error_str(
+                "extension body exceeds 65535 bytes",
+            ));
+        }
+        let (mode, seed) = match shape.grease_values {
+            GreaseValues::Fresh => (ffi::RAMA_SSL_GREASE_VALUES_FRESH, 0),
+            GreaseValues::Seeded(seed) => (ffi::RAMA_SSL_GREASE_VALUES_SEEDED, seed),
+            GreaseValues::Pinned => (ffi::RAMA_SSL_GREASE_VALUES_PINNED, 0),
+        };
+        let unknown = match shape.unknown_values {
+            UnknownValues::Drop => ffi::RAMA_SSL_UNKNOWN_DROP,
+            UnknownValues::Forbid => ffi::RAMA_SSL_UNKNOWN_FORBID,
+            UnknownValues::Preserve => ffi::RAMA_SSL_UNKNOWN_PRESERVE,
+        };
+        let (padding, length) = match shape.padding {
+            Padding::Native => (ffi::RAMA_SSL_PADDING_NATIVE, 0),
+            Padding::Off => (ffi::RAMA_SSL_PADDING_OFF, 0),
+            Padding::ToLength(length) => (ffi::RAMA_SSL_PADDING_TO_LENGTH, usize::from(length)),
+        };
+        unsafe {
+            let ssl = self.as_ptr();
+            // Bodies go first: a rejected one fails before any other choice
+            // changes, and bodies only matter once the order lists their IDs.
+            for (id, body) in &shape.extension_bodies {
+                cvt(ffi::RAMA_SSL_set_extension_body(
+                    ssl,
+                    id.0,
+                    body.as_ptr(),
+                    body.len(),
+                ))?;
+            }
+            cvt(ffi::RAMA_SSL_set_grease_values(ssl, mode as _, seed))?;
+            cvt(ffi::RAMA_SSL_set_unknown_values(ssl, unknown as _))?;
+            cvt(ffi::RAMA_SSL_set_padding(ssl, padding as _, length))?;
+            if let Some(lists) = shape.grease_lists {
+                cvt(ffi::RAMA_SSL_set_grease_lists(ssl, lists.bits()))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Sets the groups this client lists in supported_groups, exactly as on the
+    /// wire: GREASE codepoints are GREASE slots, and groups it cannot negotiate
+    /// follow [`UnknownValues`]. The supported ones also become the groups this
+    /// connection negotiates. Fails if none is supported.
+    #[corresponds(RAMA_SSL_set_raw_supported_groups)]
+    pub fn set_raw_supported_groups(&mut self, groups: &[u16]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt(ffi::RAMA_SSL_set_raw_supported_groups(
+                self.as_ptr(),
+                groups.as_ptr(),
+                groups.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
+    /// Sets the groups this client sends key shares for, in order, exactly as
+    /// on the wire: GREASE codepoints are GREASE key shares. A group must also
+    /// be a supported group; others are never sent (they need a key).
+    #[corresponds(RAMA_SSL_set_raw_key_shares)]
+    pub fn set_raw_key_shares(&mut self, groups: &[u16]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt(ffi::RAMA_SSL_set_raw_key_shares(
+                self.as_ptr(),
+                groups.as_ptr(),
+                groups.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
+    /// Sets the versions this client lists in supported_versions, exactly as
+    /// on the wire: GREASE codepoints are GREASE slots, and versions outside the
+    /// configured minimum and maximum follow [`UnknownValues`].
+    #[corresponds(RAMA_SSL_set_raw_supported_versions)]
+    pub fn set_raw_supported_versions(&mut self, versions: &[u16]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt(ffi::RAMA_SSL_set_raw_supported_versions(
+                self.as_ptr(),
+                versions.as_ptr(),
+                versions.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
+    /// Sets the signature algorithms this client lists, exactly as on the wire:
+    /// GREASE codepoints are GREASE slots, and algorithms BoringSSL does not
+    /// implement follow [`UnknownValues`]. The server's choice is still checked
+    /// against [`Self::set_verify_algorithm_prefs`].
+    #[corresponds(RAMA_SSL_set_raw_signature_algorithms)]
+    pub fn set_raw_signature_algorithms(&mut self, algorithms: &[u16]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt(ffi::RAMA_SSL_set_raw_signature_algorithms(
+                self.as_ptr(),
+                algorithms.as_ptr(),
+                algorithms.len(),
             ))
             .map(|_| ())
         }

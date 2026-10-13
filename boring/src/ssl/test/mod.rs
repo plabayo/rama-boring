@@ -296,7 +296,12 @@ fn test_raw_cipher_list_preserves_unknown_values_and_duplicates() {
     client.ctx().set_raw_cipher_list(&raw_ciphers).unwrap();
     let _ = client.connect();
 
-    assert_eq!(*captured.lock().unwrap(), [raw_ciphers]);
+    // A GREASE codepoint is a GREASE slot: a fresh GREASE value at its position.
+    let captured = captured.lock().unwrap();
+    let sent = &captured[0];
+    assert_eq!(sent[1..], raw_ciphers[1..]);
+    assert_eq!(sent[0] & 0x0f0f, 0x0a0a);
+    assert_eq!(sent[0] >> 8, sent[0] & 0xff);
 }
 
 #[test]
@@ -1861,6 +1866,7 @@ fn per_session_extension_order_bounds_and_server_role() {
     server.ssl_mut().set_extension_order(&[43]).unwrap_err();
 }
 
+mod client_hello_shape;
 mod connection;
 mod memory;
 mod panic_safety;

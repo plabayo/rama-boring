@@ -94,3 +94,25 @@ fn ech_grease() {
     let ssl_stream = client.connect();
     assert!(!ssl_stream.ssl().ech_accepted());
 }
+
+#[test]
+fn ech_with_a_shaped_client_hello_is_accepted() {
+    use crate::ssl::{ClientHelloShape, GreaseLists, GreaseValues};
+    // With real ECH the inner hello references outer extensions natively: a
+    // shaped outer hello must not break that.
+    let (_server, mut client) = bootstrap_ech(ECH_CONFIG, ECH_KEY, ECH_CONFIG_LIST);
+    let ssl = client.ssl();
+    ssl.set_extension_order(&[0x3a3a, 43, 51, 10, 13, 0x4a4a])
+        .unwrap();
+    ssl.set_raw_supported_groups(&[0x5a5a, 0x001d, 0x0017])
+        .unwrap();
+    ssl.set_raw_cipher_list(&[0x6a6a, 0x1301, 0x1302]).unwrap();
+    ssl.set_client_hello_shape(
+        &ClientHelloShape::new()
+            .with_grease_values(GreaseValues::Pinned)
+            .with_grease_lists(GreaseLists::all()),
+    )
+    .unwrap();
+    let ssl_stream = client.connect();
+    assert!(ssl_stream.ssl().ech_accepted());
+}

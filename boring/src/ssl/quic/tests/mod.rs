@@ -430,6 +430,10 @@ fn early_data_reasons_explain_acceptance_and_rejection() {
         SslEarlyDataReason::NO_SESSION_OFFERED
     );
     let ticket = tickets.lock().unwrap().take().unwrap();
+    // Back-date the ticket by 30 seconds: the server sees the client's clock skew.
+    unsafe {
+        crate::ffi::SSL_SESSION_set_time(ticket.as_ptr(), ticket.time() - 30);
+    }
     let (client, server) = handshake(Some(&ticket), b"transport-context");
     assert_eq!(
         client.ssl().early_data_reason(),
@@ -439,7 +443,8 @@ fn early_data_reasons_explain_acceptance_and_rejection() {
         server.ssl().early_data_reason(),
         SslEarlyDataReason::ACCEPTED
     );
-    assert!(client.ssl().ticket_age_skew().abs() <= 1);
+    let skew = server.ssl().ticket_age_skew();
+    assert!((29..=31).contains(&skew.abs()), "{skew}");
     let ticket = tickets.lock().unwrap().take().unwrap();
     let (_, server) = handshake(Some(&ticket), b"changed-transport-context");
     let reason = server.ssl().early_data_reason();

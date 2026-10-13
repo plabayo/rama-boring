@@ -115,7 +115,10 @@ pub use self::async_callbacks::{
     BoxSelectCertFuture, ExDataFuture,
 };
 pub use self::certificate_selection::CertificateSelection;
-pub use self::connection::{SslContentType, SslEarlyDataReason, SslMessage, SslRenegotiateMode};
+pub use self::connection::{
+    ClientHelloShape, GreaseLists, GreaseValues, Padding, SslContentType, SslEarlyDataReason,
+    SslMessage, SslRenegotiateMode, UnknownValues,
+};
 pub use self::connector::{
     ConnectConfiguration, SslAcceptor, SslAcceptorBuilder, SslConnector, SslConnectorBuilder,
 };
@@ -3272,14 +3275,19 @@ impl SslRef {
         unsafe { ffi::SSL_set_permute_extensions(self.as_ptr(), enabled as _) }
     }
 
-    /// Sets this client's ClientHello extension order before its handshake starts.
+    /// Sets this client's ClientHello extension order before its handshake starts,
+    /// exactly as on the wire.
     ///
     /// Unlike [`SslContextBuilder::set_extension_order`], this leaves the shared
     /// context and its session cache untouched and overrides both context ordering and
-    /// random permutation. Recognized IDs are emitted first in the requested order;
-    /// unsupported and duplicate IDs are ignored. Unlisted extensions keep native
-    /// canonical order, so an empty slice selects canonical order. Native PSK-last
-    /// and GREASE placement rules still apply. A later call replaces the order.
+    /// random permutation. Listed extensions are emitted first in the requested order;
+    /// unlisted ones follow in native canonical order, so an empty slice selects
+    /// canonical order. A GREASE codepoint is a GREASE extension at that position
+    /// (its value and body follow [`ClientHelloShape`]); listing one replaces the
+    /// native first and last GREASE extensions. IDs BoringSSL does not implement
+    /// follow [`UnknownValues`] (dropped by default), duplicates are ignored, and
+    /// padding and pre_shared_key keep their native positions. A later call
+    /// replaces the order.
     ///
     /// Fails for a server, once the ClientHello was written, or for more than
     /// 256 IDs.

@@ -1,5 +1,5 @@
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 3b48c2a..2d6c33c 100644
+index 3b48c2a..8e59856 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
 @@ -1739,8 +1739,17 @@ OPENSSL_EXPORT int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx,
@@ -42,7 +42,7 @@ index 3b48c2a..2d6c33c 100644
  
  // QUIC integration.
  //
-@@ -5565,7 +5580,54 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
+@@ -5565,7 +5580,137 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
  
@@ -76,6 +76,89 @@ index 3b48c2a..2d6c33c 100644
 +OPENSSL_EXPORT int RAMA_SSL_set_tls13_server_ciphers(SSL *ssl,
 +                                                     const uint16_t *ids,
 +                                                     size_t num);
++
++// GREASE lists for |RAMA_SSL_set_grease_lists|.
++#define RAMA_SSL_GREASE_CIPHERS 0x01
++#define RAMA_SSL_GREASE_GROUPS 0x02
++#define RAMA_SSL_GREASE_KEY_SHARES 0x04
++#define RAMA_SSL_GREASE_VERSIONS 0x08
++#define RAMA_SSL_GREASE_SIGNATURE_ALGORITHMS 0x10
++#define RAMA_SSL_GREASE_EXTENSIONS 0x20
++
++// RAMA_SSL_set_grease_lists selects, for this client |ssl|, which lists get a
++// native GREASE value (first in the list; for extensions, first and last).
++// It replaces the context's GREASE settings for this connection. A list set
++// with GREASE codepoints of its own uses those slots instead.
++OPENSSL_EXPORT int RAMA_SSL_set_grease_lists(SSL *ssl, uint32_t lists);
++
++// GREASE value modes for |RAMA_SSL_set_grease_values|.
++#define RAMA_SSL_GREASE_VALUES_FRESH 0
++#define RAMA_SSL_GREASE_VALUES_SEEDED 1
++#define RAMA_SSL_GREASE_VALUES_PINNED 2
++
++// RAMA_SSL_set_grease_values chooses this client's GREASE values: fresh per
++// connection (the default), derived from |seed|, or pinned to the GREASE
++// codepoints listed in its lists (slots without one stay fresh).
++OPENSSL_EXPORT int RAMA_SSL_set_grease_values(SSL *ssl, int mode,
++                                              uint64_t seed);
++
++// Policies for |RAMA_SSL_set_unknown_values|.
++#define RAMA_SSL_UNKNOWN_DROP 0
++#define RAMA_SSL_UNKNOWN_FORBID 1
++#define RAMA_SSL_UNKNOWN_PRESERVE 2
++
++// RAMA_SSL_set_unknown_values sets what this client does with listed values it
++// cannot negotiate (unknown extensions, groups, versions and signature
++// algorithms): drop them (the default), fail the handshake, or send them as
++// listed. If a server then selects or answers a preserved value, the
++// handshake fails. Unknown key shares are always dropped: they need a key.
++OPENSSL_EXPORT int RAMA_SSL_set_unknown_values(SSL *ssl, int policy);
++
++// Padding modes for |RAMA_SSL_set_padding|.
++#define RAMA_SSL_PADDING_NATIVE 0
++#define RAMA_SSL_PADDING_OFF 1
++#define RAMA_SSL_PADDING_TO_LENGTH 2
++
++// RAMA_SSL_set_padding sets this client's ClientHello padding: native (the
++// default), off, or padded to |length| bytes including the handshake header
++// when shorter. The first ClientHello only, as natively.
++OPENSSL_EXPORT int RAMA_SSL_set_padding(SSL *ssl, int mode, size_t length);
++
++// RAMA_SSL_set_extension_body sets the body sent for extension |id| of the
++// extension order: a GREASE codepoint or an extension BoringSSL does not
++// build. GREASE extensions default to an empty first and one-byte later body;
++// preserved extensions default to an empty body. With a real ECH config, GREASE
++// slots and preserved extensions of the order do not apply: ClientHelloInner
++// references the outer extensions natively.
++OPENSSL_EXPORT int RAMA_SSL_set_extension_body(SSL *ssl, uint16_t id,
++                                               const uint8_t *body,
++                                               size_t len);
++
++// RAMA_SSL_set_raw_supported_groups sets the groups this client lists in its
++// ClientHello, in order. GREASE codepoints mark GREASE slots. Supported groups
++// also become the groups this connection negotiates.
++OPENSSL_EXPORT int RAMA_SSL_set_raw_supported_groups(SSL *ssl,
++                                                     const uint16_t *ids,
++                                                     size_t num);
++
++// RAMA_SSL_set_raw_key_shares sets the groups this client sends key shares
++// for, in order. GREASE codepoints mark GREASE key shares.
++OPENSSL_EXPORT int RAMA_SSL_set_raw_key_shares(SSL *ssl, const uint16_t *ids,
++                                               size_t num);
++
++// RAMA_SSL_set_raw_supported_versions sets the versions this client lists in
++// supported_versions, in order. GREASE codepoints mark GREASE slots. The
++// negotiable range stays set by the minimum and maximum versions.
++OPENSSL_EXPORT int RAMA_SSL_set_raw_supported_versions(SSL *ssl,
++                                                       const uint16_t *ids,
++                                                       size_t num);
++
++// RAMA_SSL_set_raw_signature_algorithms sets the signature algorithms this
++// client lists, in order. GREASE codepoints mark GREASE slots. Peer choices
++// are still checked against the verify algorithm preferences.
++OPENSSL_EXPORT int RAMA_SSL_set_raw_signature_algorithms(SSL *ssl,
++                                                         const uint16_t *ids,
++                                                         size_t num);
 +
 +// RAMA_SSL_MAX_EXTENSION_ORDER is the most IDs |RAMA_SSL_set_extension_order|
 +// accepts.
@@ -121,10 +204,201 @@ index f4b3484..30cf143 100644
  #define TLSEXT_MAXLEN_host_name 255
  
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
-index 90238d9..6e013a1 100644
+index 90238d9..972d09f 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
-@@ -3303,6 +3303,32 @@ static bool ext_quic_transport_params_add_serverhello_legacy(SSL_HANDSHAKE *hs,
+@@ -35,6 +35,7 @@
+ #include <openssl/evp.h>
+ #include <openssl/hmac.h>
+ #include <openssl/hpke.h>
++#include <openssl/sha.h>
+ #include <openssl/mem.h>
+ #include <openssl/nid.h>
+ #include <openssl/pool.h>
+@@ -1028,8 +1029,31 @@ static bool ext_sigalgs_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
+       !CBB_add_u16_length_prefixed(&contents, &sigalgs_cbb)) {
+     return false;
+   }
++  const RamaConnectionConfig *rama = hs->config->rama.get();
++  if (rama != nullptr && rama->sigalgs_set) {
++    for (uint16_t sigalg : rama->sigalgs) {
++      uint16_t value = sigalg;
++      if (rama_is_grease(sigalg)) {
++        value = rama_grease_value(hs, ssl_grease_signature_algorithm, sigalg);
++      } else if (SSL_get_signature_algorithm_key_type(sigalg) == EVP_PKEY_NONE) {
++        bool emit;
++        if (!rama_unknown_value(hs, SSL_R_UNKNOWN_DIGEST,
++                                "signature algorithm", sigalg, &emit)) {
++          return false;
++        }
++        if (!emit) {
++          continue;
++        }
++      }
++      if (!CBB_add_u16(&sigalgs_cbb, value)) {
++        return false;
++      }
++    }
++    return CBB_flush(out_compressible);
++  }
++
+   // Add a fake signature algorithm. See RFC 8701.
+-  if (hs->ssl->ctx->grease_sigalgs_enabled &&
++  if (rama_grease_enabled(hs, RAMA_SSL_GREASE_SIGNATURE_ALGORITHMS) &&
+       !CBB_add_u16(&sigalgs_cbb,
+                    ssl_get_grease_value(hs, ssl_grease_signature_algorithm))) {
+     return false;
+@@ -2428,6 +2452,48 @@ bool ssl_setup_key_shares(SSL_HANDSHAKE *hs, uint16_t override_group_id) {
+     return false;
+   }
+ 
++  // Configured key shares, in wire order, with GREASE slots.
++  const RamaConnectionConfig *rama = hs->config->rama.get();
++  if (override_group_id == 0 && rama != nullptr && rama->key_shares_set) {
++    bssl::ScopedCBB cbb;
++    if (!CBB_init(cbb.get(), 64)) {
++      return false;
++    }
++    CBB key_exchange;
++    for (uint16_t group_id : rama->key_shares) {
++      if (rama_is_grease(group_id)) {
++        if (!CBB_add_u16(cbb.get(),
++                         rama_grease_value(hs, ssl_grease_group, group_id)) ||
++            !CBB_add_u16(cbb.get(), 1 /* length */) ||
++            !CBB_add_u8(cbb.get(), 0 /* one byte key share */)) {
++          return false;
++        }
++        continue;
++      }
++      UniquePtr<SSLKeyShare> key_share;
++      if (std::find(supported_group_list.begin(), supported_group_list.end(),
++                    group_id) != supported_group_list.end()) {
++        key_share = SSLKeyShare::Create(group_id);
++      }
++      if (key_share == nullptr) {
++        // A key share needs a key: an unknown group is never sent.
++        bool emit;
++        if (!rama_unknown_value(hs, SSL_R_UNSUPPORTED_ELLIPTIC_CURVE,
++                                "key share", group_id, &emit)) {
++          return false;
++        }
++        continue;
++      }
++      if (!CBB_add_u16(cbb.get(), group_id) ||
++          !CBB_add_u16_length_prefixed(cbb.get(), &key_exchange) ||
++          !key_share->Generate(&key_exchange) ||
++          !hs->key_shares.TryPushBack(std::move(key_share))) {
++        return false;
++      }
++    }
++    return CBBFinishArray(cbb.get(), &hs->key_share_bytes);
++  }
++
+   std::optional<Span<const uint16_t>> selected_key_shares;
+ 
+   // This is used for HelloRetryRequest, where we have already been given the
+@@ -2487,7 +2553,8 @@ bool ssl_setup_key_shares(SSL_HANDSHAKE *hs, uint16_t override_group_id) {
+     return false;
+   }
+ 
+-  if (override_group_id == 0 && ssl->ctx->grease_enabled) {
++  if (override_group_id == 0 &&
++      rama_grease_enabled(hs, RAMA_SSL_GREASE_KEY_SHARES)) {
+     // Add a fake group. See RFC 8701.
+     if (!CBB_add_u16(cbb.get(), ssl_get_grease_value(hs, ssl_grease_group)) ||
+         !CBB_add_u16(cbb.get(), 1 /* length */) ||
+@@ -2693,15 +2760,46 @@ static bool ext_supported_versions_add_clienthello(
+     return false;
+   }
+ 
++  // Encrypted ClientHellos requires TLS 1.3 or later.
++  uint16_t extra_min_version =
++      type == ssl_client_hello_inner ? TLS1_3_VERSION : 0;
++
++  const RamaConnectionConfig *rama = hs->config->rama.get();
++  if (rama != nullptr && rama->versions_set) {
++    for (uint16_t version : rama->versions) {
++      uint16_t value = version;
++      uint16_t protocol_version;
++      if (rama_is_grease(version)) {
++        value = rama_grease_value(hs, ssl_grease_version, version);
++      } else if (!ssl_supports_version(hs, version) ||
++                 !ssl_protocol_version_from_wire(&protocol_version, version)) {
++        if (extra_min_version != 0) {
++          continue;  // ClientHelloInner only lists TLS 1.3 and later.
++        }
++        bool emit;
++        if (!rama_unknown_value(hs, SSL_R_UNSUPPORTED_PROTOCOL, "version",
++                                version, &emit)) {
++          return false;
++        }
++        if (!emit) {
++          continue;
++        }
++      } else if (protocol_version < extra_min_version) {
++        continue;
++      }
++      if (!CBB_add_u16(&versions, value)) {
++        return false;
++      }
++    }
++    return CBB_flush(out);
++  }
++
+   // Add a fake version. See RFC 8701.
+-  if (ssl->ctx->grease_enabled &&
++  if (rama_grease_enabled(hs, RAMA_SSL_GREASE_VERSIONS) &&
+       !CBB_add_u16(&versions, ssl_get_grease_value(hs, ssl_grease_version))) {
+     return false;
+   }
+ 
+-  // Encrypted ClientHellos requires TLS 1.3 or later.
+-  uint16_t extra_min_version =
+-      type == ssl_client_hello_inner ? TLS1_3_VERSION : 0;
+   if (!ssl_add_supported_versions(hs, &versions, extra_min_version) ||
+       !CBB_flush(out)) {
+     return false;
+@@ -2757,8 +2855,38 @@ static bool ext_supported_groups_add_clienthello(const SSL_HANDSHAKE *hs,
+     return false;
+   }
+ 
++  const RamaConnectionConfig *rama = hs->config->rama.get();
++  if (rama != nullptr && rama->groups_set) {
++    // Listed as configured: GREASE codepoints are slots, and groups this
++    // connection cannot negotiate follow the unknown-value policy.
++    const auto &supported = hs->config->supported_group_list;
++    for (uint16_t group : rama->groups) {
++      uint16_t value = group;
++      if (rama_is_grease(group)) {
++        value = rama_grease_value(hs, ssl_grease_group, group);
++      } else if (std::find(supported.begin(), supported.end(), group) ==
++                 supported.end()) {
++        bool emit;
++        if (!rama_unknown_value(hs, SSL_R_UNSUPPORTED_ELLIPTIC_CURVE, "group",
++                                group, &emit)) {
++          return false;
++        }
++        if (!emit) {
++          continue;
++        }
++      } else if (is_post_quantum_group(group) &&
++                 hs->max_version < TLS1_3_VERSION) {
++        continue;
++      }
++      if (!CBB_add_u16(&groups_bytes, value)) {
++        return false;
++      }
++    }
++    return CBB_flush(out_compressible);
++  }
++
+   // Add a fake group. See RFC 8701.
+-  if (ssl->ctx->grease_enabled &&
++  if (rama_grease_enabled(hs, RAMA_SSL_GREASE_GROUPS) &&
+       !CBB_add_u16(&groups_bytes, ssl_get_grease_value(hs, ssl_grease_group))) {
+     return false;
+   }
+@@ -3303,6 +3431,32 @@ static bool ext_quic_transport_params_add_serverhello_legacy(SSL_HANDSHAKE *hs,
  static bool ext_delegated_credential_add_clienthello(
      const SSL_HANDSHAKE *hs, CBB *out, CBB *out_compressible,
      ssl_client_hello_type_t type) {
@@ -157,7 +431,7 @@ index 90238d9..6e013a1 100644
    return true;
  }
  
-@@ -3328,6 +3354,30 @@ static bool ext_delegated_credential_parse_clienthello(SSL_HANDSHAKE *hs,
+@@ -3328,6 +3482,30 @@ static bool ext_delegated_credential_parse_clienthello(SSL_HANDSHAKE *hs,
    return true;
  }
  
@@ -188,7 +462,7 @@ index 90238d9..6e013a1 100644
  // Certificate compression
  
  static bool cert_compression_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
-@@ -3336,10 +3386,28 @@ static bool cert_compression_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
+@@ -3336,10 +3514,28 @@ static bool cert_compression_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
    bool first = true;
    CBB contents, algs;
  
@@ -219,7 +493,7 @@ index 90238d9..6e013a1 100644
  
      if (first &&
          (!CBB_add_u16(out_compressible, TLSEXT_TYPE_cert_compression) ||
-@@ -3393,6 +3461,7 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
+@@ -3393,6 +3589,7 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
    }
  
    size_t best_index = num_algs;
@@ -227,7 +501,7 @@ index 90238d9..6e013a1 100644
    size_t given_alg_idx = 0;
  
    while (CBS_len(&alg_ids) > 0) {
-@@ -3406,8 +3475,22 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
+@@ -3406,8 +3603,22 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
      for (size_t i = 0; i < num_algs; i++) {
        const auto &alg = ctx->cert_compression_algs[i];
        if (alg.alg_id == alg_id && alg.compress != nullptr) {
@@ -252,7 +526,7 @@ index 90238d9..6e013a1 100644
          }
          break;
        }
-@@ -3424,7 +3507,7 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
+@@ -3424,7 +3635,7 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
    if (best_index < num_algs &&
        ssl_protocol_version(hs->ssl) >= TLS1_3_VERSION) {
      hs->cert_compression_negotiated = true;
@@ -261,7 +535,7 @@ index 90238d9..6e013a1 100644
    }
  
    return true;
-@@ -4260,6 +4343,13 @@ static const struct tls_extension kExtensions[] = {
+@@ -4260,6 +4471,13 @@ static const struct tls_extension kExtensions[] = {
          cert_compression_parse_clienthello,
          cert_compression_add_serverhello,
      },
@@ -275,7 +549,7 @@ index 90238d9..6e013a1 100644
      {
          TLSEXT_TYPE_delegated_credential,
          ext_delegated_credential_add_clienthello,
-@@ -4342,6 +4432,90 @@ static_assert(kNumExtensions <=
+@@ -4342,6 +4560,162 @@ static_assert(kNumExtensions <=
                    sizeof(((SSL_HANDSHAKE *)nullptr)->extensions.received) * 8,
                "too many extensions for received bitset");
  
@@ -351,6 +625,78 @@ index 90238d9..6e013a1 100644
 +  return rama_ssl_build_extension_order(hs, ids, false);
 +}
 +
++static const struct tls_extension *tls_extension_find(uint32_t *out_index,
++                                                      uint16_t value);
++
++bool rama_has_grease(Span<const uint16_t> values) {
++  for (uint16_t value : values) {
++    if (rama_is_grease(value)) {
++      return true;
++    }
++  }
++  return false;
++}
++
++bool rama_grease_enabled(const SSL_HANDSHAKE *hs, uint32_t list) {
++  const RamaConnectionConfig *rama = hs->config->rama.get();
++  if (rama != nullptr && rama->grease_lists_set) {
++    return (rama->grease_lists & list) != 0;
++  }
++  if (list == RAMA_SSL_GREASE_SIGNATURE_ALGORITHMS) {
++    return hs->ssl->ctx->grease_sigalgs_enabled;
++  }
++  return hs->ssl->ctx->grease_enabled;
++}
++
++uint16_t rama_grease_value(const SSL_HANDSHAKE *hs,
++                           enum ssl_grease_index_t index, uint16_t codepoint) {
++  const RamaConnectionConfig *rama = hs->config->rama.get();
++  if (rama != nullptr && rama->grease_values == RAMA_SSL_GREASE_VALUES_PINNED &&
++      rama_is_grease(codepoint)) {
++    return codepoint;
++  }
++  return ssl_get_grease_value(hs, index);
++}
++
++bool rama_unknown_value(const SSL_HANDSHAKE *hs, int reason, const char *list,
++                        uint16_t value, bool *out_emit) {
++  const RamaConnectionConfig *rama = hs->config->rama.get();
++  const uint8_t policy =
++      rama == nullptr ? RAMA_SSL_UNKNOWN_DROP : rama->unknown_values;
++  if (policy == RAMA_SSL_UNKNOWN_FORBID) {
++    OPENSSL_PUT_ERROR(SSL, reason);
++    ERR_add_error_dataf("rama: %s 0x%04x cannot be negotiated", list,
++                        (unsigned)value);
++    return false;
++  }
++  *out_emit = policy == RAMA_SSL_UNKNOWN_PRESERVE;
++  return true;
++}
++
++bool rama_extension_is_native(uint16_t id) {
++  uint32_t index;
++  return tls_extension_find(&index, id) != nullptr ||
++         id == TLSEXT_TYPE_padding || id == TLSEXT_TYPE_pre_shared_key;
++}
++
++void rama_ssl_seed_grease(SSL_HANDSHAKE *hs) {
++  const RamaConnectionConfig *rama = hs->config->rama.get();
++  if (rama == nullptr || rama->grease_values != RAMA_SSL_GREASE_VALUES_SEEDED) {
++    return;
++  }
++  static const char kLabel[] = "rama grease";
++  uint8_t input[8 + sizeof(kLabel) - 1];
++  for (size_t i = 0; i < 8; i++) {
++    input[i] = static_cast<uint8_t>(rama->grease_seed >> (8 * i));
++  }
++  OPENSSL_memcpy(input + 8, kLabel, sizeof(kLabel) - 1);
++  uint8_t digest[SHA256_DIGEST_LENGTH];
++  SHA256(input, sizeof(input), digest);
++  static_assert(sizeof(hs->grease_seed) <= sizeof(digest),
++                "GREASE seed exceeds the digest");
++  OPENSSL_memcpy(hs->grease_seed, digest, sizeof(hs->grease_seed));
++}
++
 +bool rama_ssl_setup_extension_order(SSL_HANDSHAKE *hs) {
 +  // A per-session plan outranks context order and opaque random permutation.
 +  if (!hs->extension_permutation.empty()) {
@@ -366,6 +712,212 @@ index 90238d9..6e013a1 100644
  bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs) {
    if (!hs->config->permute_extensions) {
      return true;
+@@ -4390,6 +4764,117 @@ static bool add_padding_extension(CBB *cbb, uint16_t ext, size_t len) {
+   return CBB_flush(cbb);
+ }
+ 
++static Span<const uint8_t> rama_extension_body(const RamaConnectionConfig *rama,
++                                               uint16_t id, bool *out_found) {
++  for (const auto &entry : rama->extension_bodies) {
++    if (entry.first == id) {
++      *out_found = true;
++      return entry.second;
++    }
++  }
++  *out_found = false;
++  return {};
++}
++
++static bool rama_add_raw_extension(CBB *cbb, uint16_t id,
++                                   Span<const uint8_t> body) {
++  CBB child;
++  if (!CBB_add_u16(cbb, id) || !CBB_add_u16_length_prefixed(cbb, &child) ||
++      !CBB_add_bytes(&child, body.data(), body.size())) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_INTERNAL_ERROR);
++    return false;
++  }
++  return CBB_flush(cbb);
++}
++
++// rama_add_planned_extensions writes the configured extension order: GREASE
++// slots with fresh, seeded or pinned values, known extensions, and unknown ones
++// per the connection's policy. Known extensions written are flagged in
++// `*out_sent` so the caller writes the remaining ones afterwards.
++static bool rama_add_planned_extensions(SSL_HANDSHAKE *hs, CBB *extensions,
++                                        ssl_client_hello_type_t type,
++                                        uint64_t *out_sent,
++                                        bool *out_last_was_empty) {
++  const RamaConnectionConfig *rama = hs->config->rama.get();
++  uint16_t grease_sent[RAMA_SSL_MAX_EXTENSION_ORDER];
++  size_t num_grease = 0;
++  for (uint16_t id : rama->extension_order) {
++    const size_t len_before = CBB_len(extensions);
++    if (rama_is_grease(id)) {
++      // Each GREASE extension needs a distinct value.
++      uint16_t value = rama_grease_value(
++          hs, num_grease == 0 ? ssl_grease_extension1 : ssl_grease_extension2,
++          id);
++      const bool pinned = value == id && rama->grease_values ==
++                                             RAMA_SSL_GREASE_VALUES_PINNED;
++      for (size_t tries = 0; tries < 16; tries++) {
++        bool taken = false;
++        for (size_t j = 0; j < num_grease; j++) {
++          taken |= grease_sent[j] == value;
++        }
++        if (!taken) {
++          break;
++        }
++        if (pinned) {
++          OPENSSL_PUT_ERROR(SSL, SSL_R_DUPLICATE_EXTENSION);
++          ERR_add_error_dataf("rama: GREASE extension 0x%04x listed twice",
++                              (unsigned)id);
++          return false;
++        }
++        // Rotate to the next codepoint of the form 0xωaωa.
++        const uint16_t nibble = ((value >> 12) + 1) & 0xf;
++        value = (nibble << 12) | 0x0a00 | (nibble << 4) | 0x0a;
++      }
++      grease_sent[num_grease++] = value;
++      bool found;
++      Span<const uint8_t> body = rama_extension_body(rama, id, &found);
++      static const uint8_t kZero = 0;
++      if (!found && num_grease > 1) {
++        body = Span(&kZero, 1);  // Native GREASE: empty first, then one byte.
++      }
++      if (!rama_add_raw_extension(extensions, value, body)) {
++        return false;
++      }
++    } else if (id == TLSEXT_TYPE_padding || id == TLSEXT_TYPE_pre_shared_key) {
++      // Written natively: padding per the padding mode, and the PSK last.
++      continue;
++    } else {
++      uint32_t index;
++      if (tls_extension_find(&index, id) != nullptr) {
++        if (*out_sent & (uint64_t{1} << index)) {
++          continue;
++        }
++        *out_sent |= uint64_t{1} << index;
++        if (!kExtensions[index].add_clienthello(hs, extensions, extensions,
++                                                type)) {
++          OPENSSL_PUT_ERROR(SSL, SSL_R_ERROR_ADDING_EXTENSION);
++          ERR_add_error_dataf("extension %u", (unsigned)id);
++          return false;
++        }
++        if (CBB_len(extensions) != len_before) {
++          hs->extensions.sent |= (1u << index);
++        }
++      } else {
++        bool emit;
++        if (!rama_unknown_value(hs, SSL_R_UNEXPECTED_EXTENSION, "extension",
++                                id, &emit)) {
++          return false;
++        }
++        bool found;
++        if (emit && !rama_add_raw_extension(
++                        extensions, id, rama_extension_body(rama, id, &found))) {
++          return false;
++        }
++      }
++    }
++    const size_t bytes_written = CBB_len(extensions) - len_before;
++    if (bytes_written != 0) {
++      *out_last_was_empty = bytes_written == 4;
++    }
++  }
++  return true;
++}
++
+ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+                                              CBB *out_encoded) {
+   // When writing ClientHelloInner, we construct the real and encoded
+@@ -4410,7 +4895,7 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+ 
+   hs->inner_extensions_sent = 0;
+ 
+-  if (ssl->ctx->grease_enabled) {
++  if (rama_grease_enabled(hs, RAMA_SSL_GREASE_EXTENSIONS)) {
+     // Add a fake empty extension. See RFC 8701. This always matches
+     // `ssl_add_clienthello_tlsext`, so compress it.
+     uint16_t grease_ext = ssl_get_grease_value(hs, ssl_grease_extension1);
+@@ -4448,7 +4933,7 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+     }
+   }
+ 
+-  if (ssl->ctx->grease_enabled) {
++  if (rama_grease_enabled(hs, RAMA_SSL_GREASE_EXTENSIONS)) {
+     // Add a fake non-empty extension. See RFC 8701. This always matches
+     // `ssl_add_clienthello_tlsext`, so compress it.
+     uint16_t grease_ext = ssl_get_grease_value(hs, ssl_grease_extension2);
+@@ -4525,18 +5010,38 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+   // important to reset this value.
+   hs->extensions.sent = 0;
+ 
++  // A configured order may place GREASE and preserved extensions itself. With
++  // a real ECH config, ClientHelloInner references outer extensions natively,
++  // so only the order of known extensions applies.
++  const RamaConnectionConfig *rama = hs->config->rama.get();
++  const bool planned = rama != nullptr && rama->extension_order_set &&
++                       hs->selected_ech_config == nullptr;
++  const bool native_grease =
++      !(planned && rama_has_grease(rama->extension_order)) &&
++      rama_grease_enabled(hs, RAMA_SSL_GREASE_EXTENSIONS);
++
+   // Add a fake empty extension. See RFC 8701.
+-  if (ssl->ctx->grease_enabled &&
++  if (native_grease &&
+       !add_padding_extension(
+           &extensions, ssl_get_grease_value(hs, ssl_grease_extension1), 0)) {
+     return false;
+   }
+ 
+   bool last_was_empty = false;
++  uint64_t planned_sent = 0;
++  static_assert(kNumExtensions <= 64, "planned_sent is too small");
++  if (planned &&
++      !rama_add_planned_extensions(hs, &extensions, type, &planned_sent,
++                                   &last_was_empty)) {
++    return false;
++  }
+   for (size_t unpermuted = 0; unpermuted < kNumExtensions; unpermuted++) {
+     size_t i = hs->extension_permutation.empty()
+                    ? unpermuted
+                    : hs->extension_permutation[unpermuted];
++    if (planned_sent & (uint64_t{1} << i)) {
++      continue;  // Already written at its planned position.
++    }
+     const size_t len_before = CBB_len(&extensions);
+     if (!kExtensions[i].add_clienthello(hs, &extensions, &extensions, type)) {
+       OPENSSL_PUT_ERROR(SSL, SSL_R_ERROR_ADDING_EXTENSION);
+@@ -4553,7 +5058,7 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+     last_was_empty = (bytes_written == 4);
+   }
+ 
+-  if (ssl->ctx->grease_enabled) {
++  if (native_grease) {
+     // Add a fake non-empty extension. See RFC 8701.
+     if (!add_padding_extension(
+             &extensions, ssl_get_grease_value(hs, ssl_grease_extension2), 1)) {
+@@ -4566,8 +5071,19 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+   // bugs. We also apply this padding to ClientHelloOuter, to keep the wire
+   // images aligned.
+   size_t psk_len = ext_pre_shared_key_clienthello_length(hs, type);
+-  if (!SSL_is_dtls(ssl) && !SSL_is_quic(ssl) &&
++  const uint8_t padding =
++      rama == nullptr ? RAMA_SSL_PADDING_NATIVE : rama->padding;
++  if (padding == RAMA_SSL_PADDING_TO_LENGTH &&
+       !ssl->s3->used_hello_retry_request) {
++    // Pad the whole handshake message, header included, to the target.
++    msg_len += 2 /* length prefix */ + CBB_len(&extensions) + psk_len;
++    if (msg_len + 4 <= rama->padding_length &&
++        !add_padding_extension(&extensions, TLSEXT_TYPE_padding,
++                               rama->padding_length - msg_len - 4)) {
++      return false;
++    }
++  } else if (padding == RAMA_SSL_PADDING_NATIVE && !SSL_is_dtls(ssl) &&
++             !SSL_is_quic(ssl) && !ssl->s3->used_hello_retry_request) {
+     msg_len += 2 /* length prefix */ + CBB_len(&extensions) + psk_len;
+     // The length of the padding extension, excluding the four-byte extension
+     // header.
 diff --git a/ssl/handoff.cc b/ssl/handoff.cc
 index c8d9897..618bc2d 100644
 --- a/ssl/handoff.cc
@@ -382,20 +934,34 @@ index c8d9897..618bc2d 100644
    if (sk_SSL_CIPHER_num(SSL_get_ciphers(ssl)) == 0) {
      return false;
 diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
-index a4a53cd..f016691 100644
+index a4a53cd..2240ef0 100644
 --- a/ssl/handshake_client.cc
 +++ b/ssl/handshake_client.cc
-@@ -108,6 +108,26 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+@@ -102,12 +102,38 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
      return false;
    }
  
+-  // Add a fake cipher suite. See RFC 8701.
+-  if (ssl->ctx->grease_enabled &&
 +  const SSLCipherPreferenceList *cipher_list = ssl_get_cipher_preferences(ssl);
-+  if (!cipher_list->rama_raw_cipher_list.empty()) {
++  const Span<const uint16_t> raw = cipher_list->rama_raw_cipher_list;
++
++  // Add a fake cipher suite. See RFC 8701. GREASE codepoints in a raw list
++  // are slots of their own instead.
++  if (!rama_has_grease(raw) &&
++      rama_grease_enabled(hs, RAMA_SSL_GREASE_CIPHERS) &&
+       !CBB_add_u16(&child, ssl_get_grease_value(hs, ssl_grease_cipher))) {
+     return false;
+   }
+ 
++  if (!raw.empty()) {
 +    bool raw_has_fallback_scsv = false;
-+    for (uint16_t cipher : cipher_list->rama_raw_cipher_list) {
-+      // GREASE is generated above. Treat values in a raw fingerprint as
-+      // placeholders rather than emitting a second GREASE cipher.
-+      if (ssl->ctx->grease_enabled && (cipher & 0x0f0f) == 0x0a0a) {
++    for (uint16_t cipher : raw) {
++      if (rama_is_grease(cipher)) {
++        if (!CBB_add_u16(&child,
++                         rama_grease_value(hs, ssl_grease_cipher, cipher))) {
++          return false;
++        }
 +        continue;
 +      }
 +      raw_has_fallback_scsv |= cipher == SSL_CIPHER_FALLBACK_SCSV;
@@ -412,8 +978,12 @@ index a4a53cd..f016691 100644
    // Add TLS 1.3 ciphers. Order ChaCha20-Poly1305 relative to AES-GCM based on
    // hardware support.
    if (hs->max_version >= TLS1_3_VERSION) {
-@@ -444,7 +464,7 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
+@@ -442,9 +468,11 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
+   }
+ 
    ssl_setup_client_certificate_type(hs);
++  // GREASE values derive from this seed, so install it before any is used.
++  rama_ssl_seed_grease(hs);
    if (!ssl_setup_pre_shared_keys(hs) ||  //
        !ssl_setup_key_shares(hs, /*override_group_id=*/0) ||
 -      !ssl_setup_extension_permutation(hs) ||
@@ -422,7 +992,7 @@ index a4a53cd..f016691 100644
        !ssl_add_client_hello(hs)) {
      return ssl_hs_error;
 diff --git a/ssl/internal.h b/ssl/internal.h
-index 96f6d3d..42e7b61 100644
+index 96f6d3d..0a8338f 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
 @@ -297,10 +297,14 @@ struct SSLCipherPreferenceList {
@@ -477,7 +1047,7 @@ index 96f6d3d..42e7b61 100644
  // ssl_setup_extension_permutation computes a ClientHello extension permutation
  // for `hs`, if applicable. It returns true on success and false on error.
  bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs);
-@@ -3397,6 +3417,28 @@ struct ALPSConfig {
+@@ -3397,6 +3417,93 @@ struct ALPSConfig {
  //
  // See SSL_shed_handshake_config() for more about the conditions under which
  // configuration can be shed.
@@ -497,7 +1067,72 @@ index 96f6d3d..42e7b61 100644
 +  // tls13_server_ciphers is a server's TLS 1.3 cipher preference: the first one
 +  // the client offered wins. Empty keeps the native choice.
 +  Array<uint16_t> tls13_server_ciphers;
++
++  // grease_lists, when `grease_lists_set`, replaces the context's GREASE
++  // switches with `RAMA_SSL_GREASE_*` bits for lists without explicit slots.
++  bool grease_lists_set = false;
++  uint8_t grease_lists = 0;
++
++  // grease_values is a `RAMA_SSL_GREASE_VALUES_*` mode; `grease_seed` seeds
++  // `RAMA_SSL_GREASE_VALUES_SEEDED`.
++  uint8_t grease_values = RAMA_SSL_GREASE_VALUES_FRESH;
++  uint64_t grease_seed = 0;
++
++  // unknown_values is a `RAMA_SSL_UNKNOWN_*` policy for listed values this
++  // connection cannot negotiate.
++  uint8_t unknown_values = RAMA_SSL_UNKNOWN_DROP;
++
++  // padding is a `RAMA_SSL_PADDING_*` mode; `padding_length` is its target.
++  uint8_t padding = RAMA_SSL_PADDING_NATIVE;
++  uint16_t padding_length = 0;
++
++  // Lists as sent on the wire: GREASE codepoints mark GREASE slots and other
++  // values follow `unknown_values` when they cannot be negotiated.
++  bool groups_set = false;
++  Array<uint16_t> groups;
++  bool key_shares_set = false;
++  Array<uint16_t> key_shares;
++  bool versions_set = false;
++  Array<uint16_t> versions;
++  bool sigalgs_set = false;
++  Array<uint16_t> sigalgs;
++  bool extension_order_set = false;
++  Array<uint16_t> extension_order;
++
++  // extension_bodies holds the bodies of GREASE and preserved extensions,
++  // keyed by the extension ID listed in `extension_order`.
++  Vector<std::pair<uint16_t, Array<uint8_t>>> extension_bodies;
 +};
++
++// rama_is_grease returns whether `value` is an RFC 8701 GREASE codepoint.
++inline bool rama_is_grease(uint16_t value) {
++  return (value & 0x0f0f) == 0x0a0a && (value >> 8) == (value & 0xff);
++}
++
++// rama_has_grease returns whether `values` contains a GREASE codepoint.
++bool rama_has_grease(Span<const uint16_t> values);
++
++// rama_grease_enabled returns whether `hs` adds a native GREASE value to the
++// list named by the `RAMA_SSL_GREASE_*` bit `list`.
++bool rama_grease_enabled(const SSL_HANDSHAKE *hs, uint32_t list);
++
++// rama_grease_value returns the value of a GREASE slot of the list using
++// `index`, where the caller listed `codepoint`.
++uint16_t rama_grease_value(const SSL_HANDSHAKE *hs,
++                           enum ssl_grease_index_t index, uint16_t codepoint);
++
++// rama_unknown_value applies the connection's policy to `value`, which it
++// cannot negotiate in the named list. It returns false, with an error, when
++// the policy forbids it, and otherwise sets `*out_emit` to whether to send it.
++bool rama_unknown_value(const SSL_HANDSHAKE *hs, int reason, const char *list,
++                        uint16_t value, bool *out_emit);
++
++// rama_ssl_seed_grease installs a deterministic GREASE seed when configured.
++void rama_ssl_seed_grease(SSL_HANDSHAKE *hs);
++
++// rama_extension_is_native returns whether BoringSSL writes extension `id`
++// itself, so a caller cannot supply its body.
++bool rama_extension_is_native(uint16_t id);
 +
 +// rama_connection_config returns the per-connection settings of `config`,
 +// allocating them on first use, or nullptr on allocation failure.
@@ -506,7 +1141,7 @@ index 96f6d3d..42e7b61 100644
  struct SSL_CONFIG {
    static constexpr bool kAllowUniquePtr = true;
  
-@@ -3596,6 +3638,16 @@ struct SSL_CONFIG {
+@@ -3596,6 +3703,16 @@ struct SSL_CONFIG {
    // server_padding_enabled is true iff the server is willing to send additional
    // padding to clients that request it through the server padding extension.
    bool server_padding_enabled : 1;
@@ -523,7 +1158,7 @@ index 96f6d3d..42e7b61 100644
  };
  
  // From RFC 8446, used in determining PSK modes.
-@@ -4232,6 +4284,10 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+@@ -4232,6 +4349,10 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
    // permute_extensions is whether to permute extensions when sending messages.
    bool permute_extensions : 1;
  
@@ -667,7 +1302,7 @@ index 7799d79..4bb8f4d 100644
    switch (EVP_PKEY_id(key)) {
      case EVP_PKEY_RSA:
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index a0c746b..f991978 100644
+index a0c746b..ad23298 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
 @@ -364,6 +364,12 @@ void SSL_set_aes_hw_override_for_testing(SSL *ssl, bool override_value) {
@@ -832,7 +1467,7 @@ index a0c746b..f991978 100644
  int SSL_CTX_add_cert_compression_alg(SSL_CTX *ctx, uint16_t alg_id,
                                       ssl_cert_compression_func_t compress,
                                       ssl_cert_decompression_func_t decompress) {
-@@ -3284,6 +3412,31 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
+@@ -3284,6 +3412,222 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
    FromOpaque(ctx)->permute_extensions = !!enabled;
  }
  
@@ -841,24 +1476,215 @@ index a0c746b..f991978 100644
 +    MakeConstSpan(ids, ids_len));
 +}
 +
-+int RAMA_SSL_set_extension_order(SSL *ssl, const uint16_t *ids, size_t num) {
++// rama_client_hello_config returns the per-connection settings of a client
++// that has not yet written its ClientHello, or nullptr with an error.
++static RamaConnectionConfig *rama_client_hello_config(SSL *ssl) {
 +  auto *ssl_impl = FromOpaque(ssl);
-+  SSL_HANDSHAKE *hs = ssl_impl->s3->hs.get();
-+  // Only a client that has not yet written its ClientHello can be reordered.
++  const SSL_HANDSHAKE *hs = ssl_impl->s3->hs.get();
++  // Only a client that has not yet written its ClientHello can be shaped, so
++  // a HelloRetryRequest never sees a different shape.
 +  if (!ssl_impl->config || ssl_impl->server || hs == nullptr ||
 +      ssl_impl->s3->initial_handshake_complete || hs->state != 0) {
 +    OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
-+    return 0;
++    return nullptr;
 +  }
++  RamaConnectionConfig *rama = rama_connection_config(ssl_impl->config.get());
++  if (rama == nullptr) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_MALLOC_FAILURE);
++  }
++  return rama;
++}
++
++// rama_raw_list validates a raw list argument.
++static bool rama_raw_list(const uint16_t *ids, size_t num) {
 +  if (num > RAMA_SSL_MAX_EXTENSION_ORDER) {
 +    OPENSSL_PUT_ERROR(SSL, ERR_R_OVERFLOW);
-+    return 0;
++    return false;
 +  }
 +  if (ids == nullptr && num != 0) {
 +    OPENSSL_PUT_ERROR(SSL, ERR_R_PASSED_NULL_PARAMETER);
++    return false;
++  }
++  return true;
++}
++
++// rama_copy_unique copies `ids` without later duplicates. Every GREASE
++// codepoint is kept: each one marks its own slot.
++static bool rama_copy_unique(Array<uint16_t> *out, const uint16_t *ids,
++                             size_t num) {
++  Vector<uint16_t> unique;
++  for (size_t i = 0; i < num; i++) {
++    const bool repeated =
++        !rama_is_grease(ids[i]) &&
++        std::find(unique.begin(), unique.end(), ids[i]) != unique.end();
++    if (!repeated && !unique.Push(ids[i])) {
++      return false;
++    }
++  }
++  return out->CopyFrom(unique);
++}
++
++int RAMA_SSL_set_extension_order(SSL *ssl, const uint16_t *ids, size_t num) {
++  RamaConnectionConfig *rama = rama_client_hello_config(ssl);
++  if (rama == nullptr || !rama_raw_list(ids, num)) {
 +    return 0;
 +  }
-+  return rama_ssl_set_extension_order(hs, MakeConstSpan(ids, num));
++  SSL_HANDSHAKE *hs = FromOpaque(ssl)->s3->hs.get();
++  if (!rama_ssl_set_extension_order(hs, MakeConstSpan(ids, num)) ||
++      !rama_copy_unique(&rama->extension_order, ids, num)) {
++    return 0;
++  }
++  rama->extension_order_set = true;
++  return 1;
++}
++
++int RAMA_SSL_set_grease_lists(SSL *ssl, uint32_t lists) {
++  RamaConnectionConfig *rama = rama_client_hello_config(ssl);
++  if (rama == nullptr) {
++    return 0;
++  }
++  if (lists & ~uint32_t{0x3f}) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_OVERFLOW);
++    return 0;
++  }
++  rama->grease_lists = static_cast<uint8_t>(lists);
++  rama->grease_lists_set = true;
++  return 1;
++}
++
++int RAMA_SSL_set_grease_values(SSL *ssl, int mode, uint64_t seed) {
++  RamaConnectionConfig *rama = rama_client_hello_config(ssl);
++  if (rama == nullptr) {
++    return 0;
++  }
++  if (mode < RAMA_SSL_GREASE_VALUES_FRESH ||
++      mode > RAMA_SSL_GREASE_VALUES_PINNED) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_OVERFLOW);
++    return 0;
++  }
++  rama->grease_values = static_cast<uint8_t>(mode);
++  rama->grease_seed = seed;
++  return 1;
++}
++
++int RAMA_SSL_set_unknown_values(SSL *ssl, int policy) {
++  RamaConnectionConfig *rama = rama_client_hello_config(ssl);
++  if (rama == nullptr) {
++    return 0;
++  }
++  if (policy < RAMA_SSL_UNKNOWN_DROP || policy > RAMA_SSL_UNKNOWN_PRESERVE) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_OVERFLOW);
++    return 0;
++  }
++  rama->unknown_values = static_cast<uint8_t>(policy);
++  return 1;
++}
++
++int RAMA_SSL_set_padding(SSL *ssl, int mode, size_t length) {
++  RamaConnectionConfig *rama = rama_client_hello_config(ssl);
++  if (rama == nullptr) {
++    return 0;
++  }
++  if (mode < RAMA_SSL_PADDING_NATIVE || mode > RAMA_SSL_PADDING_TO_LENGTH ||
++      length > 0xffff) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_OVERFLOW);
++    return 0;
++  }
++  rama->padding = static_cast<uint8_t>(mode);
++  rama->padding_length = static_cast<uint16_t>(length);
++  return 1;
++}
++
++int RAMA_SSL_set_extension_body(SSL *ssl, uint16_t id, const uint8_t *body,
++                                size_t len) {
++  RamaConnectionConfig *rama = rama_client_hello_config(ssl);
++  if (rama == nullptr) {
++    return 0;
++  }
++  if (body == nullptr && len != 0) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_PASSED_NULL_PARAMETER);
++    return 0;
++  }
++  if (len > 0xffff) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_OVERFLOW);
++    return 0;
++  }
++  // BoringSSL builds the bodies of the extensions it implements.
++  if (!rama_is_grease(id) && rama_extension_is_native(id)) {
++    OPENSSL_PUT_ERROR(SSL, SSL_R_DUPLICATE_EXTENSION);
++    return 0;
++  }
++  Array<uint8_t> copy;
++  if (!copy.CopyFrom(Span(body, len))) {
++    return 0;
++  }
++  for (auto &entry : rama->extension_bodies) {
++    if (entry.first == id) {
++      entry.second = std::move(copy);
++      return 1;
++    }
++  }
++  return rama->extension_bodies.Push(std::make_pair(id, std::move(copy)));
++}
++
++int RAMA_SSL_set_raw_supported_groups(SSL *ssl, const uint16_t *ids,
++                                      size_t num) {
++  RamaConnectionConfig *rama = rama_client_hello_config(ssl);
++  if (rama == nullptr || !rama_raw_list(ids, num)) {
++    return 0;
++  }
++  // The groups BoringSSL supports also become the ones negotiated.
++  Vector<uint16_t> known;
++  for (size_t i = 0; i < num; i++) {
++    if (!rama_is_grease(ids[i]) && ssl_group_id_to_nid(ids[i]) != NID_undef &&
++        std::find(known.begin(), known.end(), ids[i]) == known.end() &&
++        !known.Push(ids[i])) {
++      return 0;
++    }
++  }
++  if (known.empty()) {
++    OPENSSL_PUT_ERROR(SSL, SSL_R_NO_GROUPS_SPECIFIED);
++    return 0;
++  }
++  auto *ssl_impl = FromOpaque(ssl);
++  if (!ssl_impl->config->supported_group_list.CopyFrom(known) ||
++      !rama_copy_unique(&rama->groups, ids, num)) {
++    return 0;
++  }
++  rama->groups_set = true;
++  return 1;
++}
++
++int RAMA_SSL_set_raw_key_shares(SSL *ssl, const uint16_t *ids, size_t num) {
++  RamaConnectionConfig *rama = rama_client_hello_config(ssl);
++  if (rama == nullptr || !rama_raw_list(ids, num) ||
++      !rama_copy_unique(&rama->key_shares, ids, num)) {
++    return 0;
++  }
++  rama->key_shares_set = true;
++  return 1;
++}
++
++int RAMA_SSL_set_raw_supported_versions(SSL *ssl, const uint16_t *ids,
++                                        size_t num) {
++  RamaConnectionConfig *rama = rama_client_hello_config(ssl);
++  if (rama == nullptr || !rama_raw_list(ids, num) ||
++      !rama_copy_unique(&rama->versions, ids, num)) {
++    return 0;
++  }
++  rama->versions_set = true;
++  return 1;
++}
++
++int RAMA_SSL_set_raw_signature_algorithms(SSL *ssl, const uint16_t *ids,
++                                          size_t num) {
++  RamaConnectionConfig *rama = rama_client_hello_config(ssl);
++  if (rama == nullptr || !rama_raw_list(ids, num) ||
++      !rama_copy_unique(&rama->sigalgs, ids, num)) {
++    return 0;
++  }
++  rama->sigalgs_set = true;
++  return 1;
 +}
 +
  void SSL_set_permute_extensions(SSL *ssl, int enabled) {
