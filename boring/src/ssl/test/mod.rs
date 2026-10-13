@@ -362,7 +362,7 @@ fn test_raw_cipher_list_bypasses_version_filtering() {
 }
 
 #[test]
-fn test_raw_cipher_list_keeps_protocol_signaling_values() {
+fn test_raw_cipher_list_is_exact_and_keeps_fallback_scsv() {
     let mut server = Server::builder();
     let captured = capture_client_hello_ciphers(&mut server);
     let server = server.build();
@@ -381,10 +381,8 @@ fn test_raw_cipher_list_keeps_protocol_signaling_values() {
         .unwrap();
     let _ = client.connect();
 
-    let captured = captured.lock().unwrap();
-    assert_eq!(captured[0].len(), 3);
-    assert_eq!(captured[0][0] & 0x0f0f, 0x0a0a);
-    assert_eq!(&captured[0][1..], &[0x1301, 0x5600]);
+    // GREASE adds no cipher to a raw list; fallback SCSV still follows it.
+    assert_eq!(*captured.lock().unwrap(), [[0x1301, 0x5600]]);
 }
 
 #[test]
@@ -467,6 +465,10 @@ fn test_tls13_rejects_unoffered_raw_cipher() {
     let addr = listener.local_addr().unwrap();
     let server = thread::spawn(move || {
         let mut socket = listener.accept().unwrap().0;
+        // A client that never writes must fail the test, not hang it.
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .unwrap();
         let mut record_header = [0; 5];
         socket.read_exact(&mut record_header).unwrap();
         assert_eq!(record_header[0], 22);
@@ -507,12 +509,14 @@ fn test_tls13_rejects_unoffered_raw_cipher() {
     ctx.set_raw_cipher_list(&[0x1301]).unwrap();
     let ssl = Ssl::new(&ctx.build()).unwrap();
     let error = ssl.connect(TcpStream::connect(addr).unwrap()).unwrap_err();
-    server.join().unwrap();
-
     let HandshakeError::Failure(handshake) = error else {
         panic!("expected a failed TLS handshake");
     };
-    let errors = handshake.error().ssl_error().unwrap().errors();
+    let errors = handshake.error().ssl_error().unwrap().errors().to_vec();
+    // Close the client's socket before waiting for the server.
+    drop(handshake);
+    server.join().unwrap();
+
     assert!(
         errors
             .iter()

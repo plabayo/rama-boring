@@ -12,8 +12,9 @@ use std::{ffi::CStr, fmt, slice, sync::Arc};
 
 bitflags::bitflags! {
     /// ClientHello lists that get a native GREASE value, first in the list (for
-    /// extensions: first and last). A list set with GREASE codepoints of its
-    /// own uses those slots instead.
+    /// extensions: first and last). This only applies to native lists: a list
+    /// or extension order set explicitly is exact, and its GREASE codepoints
+    /// are its only GREASE slots.
     #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
     pub struct GreaseLists: u32 {
         const CIPHERS = ffi::RAMA_SSL_GREASE_CIPHERS as u32;
@@ -40,6 +41,9 @@ pub enum GreaseValues {
 
 /// What to do with listed values a connection cannot negotiate: unknown
 /// extensions, groups, versions and signature algorithms.
+///
+/// Raw cipher lists are always sent as listed, and unknown key shares are
+/// always dropped (they need a key), whatever the policy.
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash)]
 pub enum UnknownValues {
     /// Leave them out.
@@ -48,7 +52,7 @@ pub enum UnknownValues {
     /// Fail the handshake, naming the value.
     Forbid,
     /// Send them as listed. If the server then selects or answers one, the
-    /// handshake fails. Unknown key shares are always dropped: they need a key.
+    /// handshake fails.
     Preserve,
 }
 
@@ -69,8 +73,9 @@ pub enum Padding {
 ///
 /// Lists (ciphers, groups, key shares, versions, signature algorithms and the
 /// extension order) are set with their own setters, exactly as they appear on
-/// the wire: a GREASE codepoint in a list marks a GREASE slot at that position.
-/// This shape decides what those GREASE slots become, what happens to values
+/// the wire: a GREASE codepoint in a list marks a GREASE slot at that position,
+/// and a set list has no other GREASE values. This shape decides what those
+/// GREASE slots become, which native lists get GREASE, what happens to values
 /// the connection cannot negotiate, the padding, and the bodies of GREASE and
 /// preserved extensions. Everything left unset keeps BoringSSL's behaviour.
 /// All of it is combined when the ClientHello is written, so the order in
@@ -94,8 +99,8 @@ impl ClientHelloShape {
         Self::default()
     }
 
-    /// Lists that get a native GREASE value, replacing the context's GREASE
-    /// settings for this connection.
+    /// Native lists that get a GREASE value, replacing the context's GREASE
+    /// settings for this connection. Unset, the context's settings apply.
     pub fn set_grease_lists(&mut self, lists: GreaseLists) -> &mut Self {
         self.grease_lists = Some(lists);
         self
@@ -266,7 +271,8 @@ impl SslContentType {
     pub const HANDSHAKE: Self = Self(ffi::SSL3_RT_HANDSHAKE);
     /// A record header (TLS over TCP only).
     pub const HEADER: Self = Self(ffi::SSL3_RT_HEADER);
-    /// The encrypted ClientHelloInner of an ECH handshake.
+    /// The plaintext ClientHelloInner that ECH encrypts, handshake header and
+    /// reconstructed outer extensions included.
     pub const CLIENT_HELLO_INNER: Self = Self(ffi::SSL3_RT_CLIENT_HELLO_INNER);
     /// A DTLS acknowledgement.
     pub const ACK: Self = Self(ffi::SSL3_RT_ACK);
@@ -367,7 +373,9 @@ impl SslContextBuilder {
     }
 
     /// Sets how many TLS 1.3 session tickets a server issues after each
-    /// handshake, capped at 16; zero disables tickets.
+    /// handshake, capped at 16; zero disables tickets. A connection reads it
+    /// from its session context, the one it was created with, even after a
+    /// context switch; [`SslRef::set_num_tickets`] overrides it per connection.
     #[corresponds(SSL_CTX_set_num_tickets)]
     pub fn set_num_tickets(&mut self, num_tickets: usize) {
         unsafe {
@@ -408,7 +416,11 @@ impl SslRef {
 
     /// Sets the cipher suite values this client offers, in order, replacing the
     /// context's list for this connection only. See
-    /// [`SslContextBuilder::set_raw_cipher_list`].
+    /// [`SslContextBuilder::set_raw_cipher_list`]: the list is exact, and its
+    /// GREASE codepoints are its only GREASE slots.
+    ///
+    /// A client must set it before writing its ClientHello, a server before its
+    /// handshake completes.
     #[corresponds(RAMA_SSL_set_raw_cipher_list)]
     pub fn set_raw_cipher_list(&mut self, cipher_list: &[u16]) -> Result<(), ErrorStack> {
         unsafe {
@@ -471,29 +483,60 @@ impl SslRef {
     }
 
     /// Sets this server's TLS 1.3 cipher preference: the first listed cipher
-    /// the client offered is selected, otherwise the native choice applies. A
-    /// relay can pin the cipher its other leg negotiated. An empty list restores
-    /// the native choice. Fails for an ID that is not a TLS 1.3 cipher suite.
+    /// the client offered is selected, otherwise the native choice applies. An
+    /// empty list restores the native choice. To accept only these ciphers, see
+    /// [`Self::set_strict_tls13_server_ciphers`].
     ///
-    /// TLS 1.2 ciphers follow [`Self::set_strict_cipher_list`].
+    /// Has no effect on a client. Fails once the handshake completed or for an
+    /// ID that is not a TLS 1.3 cipher suite. TLS 1.2 ciphers follow
+    /// [`Self::set_strict_cipher_list`].
     #[corresponds(RAMA_SSL_set_tls13_server_ciphers)]
     pub fn set_tls13_server_ciphers(&mut self, cipher_ids: &[u16]) -> Result<(), ErrorStack> {
+        self.tls13_server_ciphers(cipher_ids, false)
+    }
+
+    /// Like [`Self::set_tls13_server_ciphers`], but the handshake fails when the
+    /// client offered none of these ciphers. A relay pins the cipher its other
+    /// leg negotiated this way. Fails for an empty list.
+    #[corresponds(RAMA_SSL_set_tls13_server_ciphers)]
+    pub fn set_strict_tls13_server_ciphers(
+        &mut self,
+        cipher_ids: &[u16],
+    ) -> Result<(), ErrorStack> {
+        self.tls13_server_ciphers(cipher_ids, true)
+    }
+
+    fn tls13_server_ciphers(&mut self, cipher_ids: &[u16], strict: bool) -> Result<(), ErrorStack> {
         unsafe {
             cvt(ffi::RAMA_SSL_set_tls13_server_ciphers(
                 self.as_ptr(),
                 cipher_ids.as_ptr(),
                 cipher_ids.len(),
+                strict.into(),
             ))
             .map(|_| ())
         }
     }
 
+    /// Sets how many TLS 1.3 session tickets this server issues after its
+    /// handshake, capped at 16, replacing
+    /// [`SslContextBuilder::set_num_tickets`] for this connection; zero
+    /// disables tickets. Has no effect on a client. Fails once the handshake
+    /// completed.
+    #[corresponds(RAMA_SSL_set_num_tickets)]
+    pub fn set_num_tickets(&mut self, num_tickets: usize) -> Result<(), ErrorStack> {
+        unsafe { cvt(ffi::RAMA_SSL_set_num_tickets(self.as_ptr(), num_tickets)).map(|_| ()) }
+    }
+
     /// Selects which of the context's registered certificate compression
     /// algorithms this connection uses, in preference order: a client offers
-    /// them in this order and a server prefers them in this order. An empty
-    /// list disables certificate compression for this connection.
+    /// them in this order, and only accepts certificates compressed with one
+    /// of them; a server prefers them in this order. An empty list disables
+    /// certificate compression for this connection.
     ///
-    /// Fails for an algorithm the context did not register or a repeated one.
+    /// Fails for an algorithm the context did not register or a repeated one,
+    /// for a client once it wrote its ClientHello, and for a server once its
+    /// handshake completed.
     #[corresponds(RAMA_SSL_set_cert_compression_algs)]
     pub fn set_certificate_compression_algorithms(
         &mut self,
@@ -510,55 +553,50 @@ impl SslRef {
         }
     }
 
-    /// Applies a [`ClientHelloShape`] to this client before its handshake starts.
+    /// Applies a [`ClientHelloShape`] to this client before its handshake
+    /// starts, replacing any shape applied earlier as a whole.
     ///
-    /// Fails for a server, once the ClientHello was written, for an extension
-    /// body BoringSSL builds itself, or for a body over 65535 bytes.
+    /// Everything is validated first: on error, nothing changes. Fails for a
+    /// server, once the ClientHello was written, for an extension body
+    /// BoringSSL builds itself, or for a body over 65535 bytes.
+    #[corresponds(RAMA_SSL_set_client_hello_shape)]
     pub fn set_client_hello_shape(&mut self, shape: &ClientHelloShape) -> Result<(), ErrorStack> {
-        if shape
-            .extension_bodies
-            .iter()
-            .any(|(_, body)| body.len() > usize::from(u16::MAX))
-        {
-            return Err(ErrorStack::internal_error_str(
-                "extension body exceeds 65535 bytes",
-            ));
-        }
-        let (mode, seed) = match shape.grease_values {
+        let (grease_values, grease_seed) = match shape.grease_values {
             GreaseValues::Fresh => (ffi::RAMA_SSL_GREASE_VALUES_FRESH, 0),
             GreaseValues::Seeded(seed) => (ffi::RAMA_SSL_GREASE_VALUES_SEEDED, seed),
             GreaseValues::Pinned => (ffi::RAMA_SSL_GREASE_VALUES_PINNED, 0),
         };
-        let unknown = match shape.unknown_values {
+        let unknown_values = match shape.unknown_values {
             UnknownValues::Drop => ffi::RAMA_SSL_UNKNOWN_DROP,
             UnknownValues::Forbid => ffi::RAMA_SSL_UNKNOWN_FORBID,
             UnknownValues::Preserve => ffi::RAMA_SSL_UNKNOWN_PRESERVE,
         };
-        let (padding, length) = match shape.padding {
+        let (padding, padding_length) = match shape.padding {
             Padding::Native => (ffi::RAMA_SSL_PADDING_NATIVE, 0),
             Padding::Off => (ffi::RAMA_SSL_PADDING_OFF, 0),
             Padding::ToLength(length) => (ffi::RAMA_SSL_PADDING_TO_LENGTH, usize::from(length)),
         };
-        unsafe {
-            let ssl = self.as_ptr();
-            // Bodies go first: a rejected one fails before any other choice
-            // changes, and bodies only matter once the order lists their IDs.
-            for (id, body) in &shape.extension_bodies {
-                cvt(ffi::RAMA_SSL_set_extension_body(
-                    ssl,
-                    id.0,
-                    body.as_ptr(),
-                    body.len(),
-                ))?;
-            }
-            cvt(ffi::RAMA_SSL_set_grease_values(ssl, mode as _, seed))?;
-            cvt(ffi::RAMA_SSL_set_unknown_values(ssl, unknown as _))?;
-            cvt(ffi::RAMA_SSL_set_padding(ssl, padding as _, length))?;
-            if let Some(lists) = shape.grease_lists {
-                cvt(ffi::RAMA_SSL_set_grease_lists(ssl, lists.bits()))?;
-            }
-        }
-        Ok(())
+        let bodies: Vec<ffi::RAMA_SSL_EXTENSION_BODY> = shape
+            .extension_bodies
+            .iter()
+            .map(|(id, body)| ffi::RAMA_SSL_EXTENSION_BODY {
+                id: id.0,
+                body: body.as_ptr(),
+                len: body.len(),
+            })
+            .collect();
+        let native = ffi::RAMA_SSL_CLIENT_HELLO_SHAPE {
+            grease_lists_set: shape.grease_lists.is_some().into(),
+            grease_lists: shape.grease_lists.map_or(0, |lists| lists.bits()),
+            grease_values: grease_values as _,
+            grease_seed,
+            unknown_values: unknown_values as _,
+            padding: padding as _,
+            padding_length,
+            extension_bodies: bodies.as_ptr(),
+            num_extension_bodies: bodies.len(),
+        };
+        unsafe { cvt(ffi::RAMA_SSL_set_client_hello_shape(self.as_ptr(), &native)).map(|_| ()) }
     }
 
     /// Sets the groups this client lists in supported_groups, exactly as on the
@@ -579,7 +617,9 @@ impl SslRef {
 
     /// Sets the groups this client sends key shares for, in order, exactly as
     /// on the wire: GREASE codepoints are GREASE key shares. A group must also
-    /// be a supported group; others are never sent (they need a key).
+    /// be a supported group; others are never sent (they need a key), whatever
+    /// the [`UnknownValues`] policy. With no key share left, the client sends
+    /// an empty list, asking the server for a HelloRetryRequest.
     #[corresponds(RAMA_SSL_set_raw_key_shares)]
     pub fn set_raw_key_shares(&mut self, groups: &[u16]) -> Result<(), ErrorStack> {
         unsafe {
@@ -703,6 +743,17 @@ impl SslRef {
     #[must_use]
     pub fn secure_renegotiation_support(&self) -> bool {
         unsafe { ffi::SSL_get_secure_renegotiation_support(self.as_ptr()) == 1 }
+    }
+
+    /// The IANA ID of the group the handshake negotiated, if any: the raw value
+    /// behind [`Self::curve`], including groups without a name here.
+    #[corresponds(SSL_get_group_id)]
+    #[must_use]
+    pub fn group_id(&self) -> Option<u16> {
+        match unsafe { ffi::SSL_get_group_id(self.as_ptr()) } {
+            0 => None,
+            id => Some(id),
+        }
     }
 
     /// Seconds between the client's and server's view of a resumed ticket's age.

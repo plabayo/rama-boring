@@ -63,11 +63,14 @@
 //! A panic never unwinds through BoringSSL. A panicking callback, future,
 //! finish closure or signer fails its operation with an error that carries the
 //! panic message ("callback panicked: …"); pending asynchronous work is
-//! dropped and never resumed. A panicking transport stream fails the operation
-//! with an I/O error and is never used again. Callbacks that only observe
-//! (info, keylog, new and removed sessions) and session lookups cannot fail the
+//! dropped and never resumed; a panic while dropping it, or a waker, is
+//! contained too. A panicking transport stream fails the operation with an I/O
+//! error and is never used again. Callbacks that only observe (info, keylog,
+//! message, new and removed sessions) and session lookups cannot fail the
 //! handshake: their panics are contained, and a lookup reports a cache miss.
-//! The panic hook still runs for every panic.
+//! A verify callback that panics records a failed verification, which, as for
+//! any verification result, only fails the handshake when the verify mode
+//! requires it. The panic hook still runs for every panic.
 use crate::libc_types::{c_char, c_int, c_uchar, c_uint};
 use foreign_types::{ForeignType, ForeignTypeRef, Opaque};
 use openssl_macros::corresponds;
@@ -1611,9 +1614,10 @@ impl SslContextBuilder {
     /// Sets the exact cipher suite vector sent in the ClientHello.
     ///
     /// Unknown values and duplicates are preserved. The list is not filtered by
-    /// protocol version, authentication requirements, or local support. Configured
-    /// GREASE and fallback SCSV values may still be added around this list. If the
-    /// list already contains either signaling value, it is not added a second time.
+    /// protocol version, authentication requirements, or local support. The list
+    /// is exact: a GREASE codepoint is a GREASE slot at its position (with a fresh
+    /// value unless [`GreaseValues::Pinned`]), and context GREASE adds no other
+    /// GREASE cipher. Fallback SCSV is not added a second time.
     ///
     /// This is a cipher-list setter, so setter ordering matters: calling it after
     /// [`SslContextBuilder::set_compliance_policy`] replaces the policy's TLS 1.2
@@ -2110,6 +2114,9 @@ impl SslContextBuilder {
     }
 
     /// Set's whether the context should enable GREASE.
+    ///
+    /// This adds GREASE values to native lists only: a raw list or extension
+    /// order is exact, and its GREASE codepoints are its only GREASE slots.
     #[corresponds(SSL_CTX_set_grease_enabled)]
     pub fn set_grease_enabled(&mut self, enabled: bool) {
         unsafe { ffi::SSL_CTX_set_grease_enabled(self.as_ptr(), enabled as _) }
@@ -2129,7 +2136,13 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_set_grease_sigalgs_enabled(self.as_ptr(), enabled as _) }
     }
 
-    /// Configures whether ClientHello extensions should be in the provided order.
+    /// Sets the default ClientHello extension order of this context's
+    /// connections, with the semantics of [`SslRef::set_extension_order`]: the
+    /// order is exact, GREASE codepoints are its only GREASE extensions, and
+    /// unknown IDs are dropped. Extensions it does not list follow
+    /// [`Self::set_permute_extensions`].
+    ///
+    /// Fails for more than 256 IDs or more than 16 GREASE codepoints.
     #[corresponds(RAMA_SSL_CTX_set_extension_order)]
     pub fn set_extension_order(&mut self, ids: &[u16]) -> Result<(), ErrorStack> {
         unsafe {
@@ -3282,15 +3295,16 @@ impl SslRef {
     /// context and its session cache untouched and overrides both context ordering and
     /// random permutation. Listed extensions are emitted first in the requested order;
     /// unlisted ones follow in native canonical order, so an empty slice selects
-    /// canonical order. A GREASE codepoint is a GREASE extension at that position
-    /// (its value and body follow [`ClientHelloShape`]); listing one replaces the
-    /// native first and last GREASE extensions. IDs BoringSSL does not implement
-    /// follow [`UnknownValues`] (dropped by default), duplicates are ignored, and
-    /// padding and pre_shared_key keep their native positions. A later call
-    /// replaces the order.
+    /// canonical order. The order is exact: a GREASE codepoint is a GREASE
+    /// extension at that position (its value and body follow
+    /// [`ClientHelloShape`]), and there are no other GREASE extensions. IDs
+    /// BoringSSL does not implement follow [`UnknownValues`] (dropped by
+    /// default), duplicates are ignored, and padding and pre_shared_key keep
+    /// their native positions. A later call replaces the order.
     ///
-    /// Fails for a server, once the ClientHello was written, or for more than
-    /// 256 IDs.
+    /// Fails for a server, once the ClientHello was written, for more than 256
+    /// IDs, or for more than 16 GREASE codepoints (each GREASE extension needs
+    /// a distinct value).
     #[corresponds(RAMA_SSL_set_extension_order)]
     pub fn set_extension_order(&mut self, ids: &[u16]) -> Result<(), ErrorStack> {
         unsafe {

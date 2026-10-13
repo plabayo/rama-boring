@@ -4,7 +4,7 @@ use super::{
     PrivateKeyMethodError, SelectCertError, Ssl, SslAlert, SslContextBuilder, SslRef, SslSession,
     SslSignatureAlgorithm, SslVerifyError, SslVerifyMode,
 };
-use crate::{error::ErrorStack, ex_data::Index, ffi};
+use crate::{error::ErrorStack, ex_data::Index, ffi, unwind};
 use foreign_types::ForeignTypeRef;
 use std::convert::identity;
 use std::future::Future;
@@ -97,7 +97,9 @@ fn invalidate<F: Send + 'static>(
     match state {
         CallbackState::Idle => false,
         _ => {
-            *state = CallbackState::Invalidated;
+            // Cancellation runs where unwinding is not allowed, such as after a
+            // callback panicked: a panicking future destructor is contained.
+            unwind::drop_contained(std::mem::replace(state, CallbackState::Invalidated));
             true
         }
     }
@@ -136,20 +138,33 @@ pub(super) fn invalidate_custom_verify(ssl: &mut SslRef) {
 
 // QUIC retains TLS state through its transport drain, so aborting the handshake
 // must drop every pending callback future without waiting for SSL destruction.
+// Every drop here is contained: cancellation also runs after a callback
+// panicked, where a panicking destructor must not unwind into BoringSSL.
 pub(super) fn cancel_pending(ssl: &mut SslRef) {
     context_changed(ssl);
     if let Some(state) = ssl.ex_data_mut(*SELECT_PRIVATE_KEY_METHOD_FUTURE_INDEX) {
-        state.get_mut().take();
+        unwind::drop_contained(state.get_mut().take());
     }
     cancel_session_lookup(ssl);
-    ssl.set_task_waker(None);
+    unwind::drop_contained(ssl.replace_ex_data(*TASK_WAKER_INDEX, None));
 }
 
 // A panicking session lookup reports a miss; its future must not be resumed.
 pub(super) fn cancel_session_lookup(ssl: &mut SslRef) {
     if let Some(state) = ssl.ex_data_mut(*SELECT_GET_SESSION_FUTURE_INDEX) {
-        state.get_mut().take();
+        unwind::drop_contained(state.get_mut().take());
     }
+}
+
+// Polls a future the caller owns on its stack. If the poll panics, the future
+// is dropped, contained, once that unwind is caught, and the unwind resumes: a
+// destructor that panics as well cannot abort the process by panicking during
+// the unwind.
+fn poll_owned<T>(
+    future: &mut ExDataFuture<T>,
+    cx: &mut Context<'_>,
+) -> Result<Poll<T>, Box<dyn std::any::Any + Send>> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx)))
 }
 
 pub(super) fn context_changed(ssl: &mut SslRef) {
@@ -430,7 +445,14 @@ fn with_callback_state<H, T: 'static, E: Copy + 'static>(
         ) {
             return Poll::Ready(Err(invalidated_error));
         }
-        match future.as_mut().poll(&mut Context::from_waker(&waker)) {
+        let polled = match poll_owned(&mut future, &mut Context::from_waker(&waker)) {
+            Ok(polled) => polled,
+            Err(payload) => {
+                unwind::drop_contained(future);
+                std::panic::resume_unwind(payload)
+            }
+        };
+        match polled {
             Poll::Pending => {
                 *callback_state(ssl_mut(handle), index) = CallbackState::Pending(future);
                 Poll::Pending
@@ -641,7 +663,14 @@ fn with_ex_data_future<H, R, T, E>(
     } else {
         let mut fut = create_fut(ssl_handle)?;
 
-        match fut.as_mut().poll(&mut ctx) {
+        let polled = match poll_owned(&mut fut, &mut ctx) {
+            Ok(polled) => polled,
+            Err(payload) => {
+                unwind::drop_contained(fut);
+                std::panic::resume_unwind(payload)
+            }
+        };
+        match polled {
             Poll::Ready(fut_result) => Poll::Ready(into_result(fut_result)),
             Poll::Pending => {
                 get_ssl_mut(ssl_handle).replace_ex_data(index, MutOnly::new(Some(fut)));
