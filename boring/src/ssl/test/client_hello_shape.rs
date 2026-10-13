@@ -984,7 +984,8 @@ fn context_extension_orders_are_exact() {
             .any(|id| is_grease(*id) || *id == ENCRYPT_THEN_MAC),
         "{ids:x?}"
     );
-    // A connection order replaces the context's; an empty one is native.
+    // A connection order replaces the context's; an empty one is canonical
+    // and, being set, exact: no GREASE extensions.
     let mut ssl = client(|ctx| {
         ctx.set_grease_enabled(true);
         ctx.set_extension_order(&[SUPPORTED_GROUPS, KEY_SHARE])
@@ -994,13 +995,8 @@ fn context_extension_orders_are_exact() {
     let (hellos, client) = hellos_of(ssl, Ssl::new(&server()).unwrap());
     client.done();
     let ids = hellos[0].ids();
-    // Native GREASE: first and last (before padding, if any).
-    assert!(is_grease(ids[0]), "{ids:x?}");
-    assert_eq!(
-        ids.iter().filter(|id| is_grease(**id)).count(),
-        2,
-        "{ids:x?}"
-    );
+    assert!(!ids.iter().any(|id| is_grease(*id)), "{ids:x?}");
+    assert_ne!(ids[..2], [SUPPORTED_GROUPS, KEY_SHARE], "{ids:x?}");
 }
 
 /// "Compresses" by copying.

@@ -8,7 +8,7 @@ use crate::{
 type RecordedSecret = (bool, EncryptionLevel, u16, Vec<u8>);
 
 #[derive(Default)]
-pub(super) struct Record {
+pub(crate) struct Record {
     output: Mutex<Vec<(EncryptionLevel, Vec<u8>)>>,
     secrets: Mutex<Vec<RecordedSecret>>,
     alerts: Mutex<Vec<u8>>,
@@ -67,7 +67,7 @@ impl QuicMethod for Record {
     }
 }
 
-fn contexts() -> (SslContext, SslContext, Arc<Mutex<Option<SslSession>>>) {
+pub(crate) fn contexts() -> (SslContext, SslContext, Arc<Mutex<Option<SslSession>>>) {
     contexts_with_order(None)
 }
 
@@ -112,7 +112,7 @@ fn contexts_with_order(
     (client.build(), server.build(), tickets)
 }
 
-fn connection(ctx: &SslContext, server: bool, record: Arc<Record>) -> QuicConnection {
+pub(crate) fn connection(ctx: &SslContext, server: bool, record: Arc<Record>) -> QuicConnection {
     let ssl = Ssl::new(ctx).unwrap();
     let mut conn = QuicConnection::new(ssl, record).unwrap();
     if server {
@@ -144,7 +144,7 @@ fn step(conn: &mut QuicConnection) -> Result<(), QuicError> {
     Ok(())
 }
 
-fn pump(
+pub(crate) fn pump(
     client: &mut QuicConnection,
     server: &mut QuicConnection,
     c: &Record,

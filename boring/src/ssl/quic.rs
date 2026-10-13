@@ -488,4 +488,4 @@ static METHOD: ffi::SSL_QUIC_METHOD = ffi::SSL_QUIC_METHOD {
 };
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

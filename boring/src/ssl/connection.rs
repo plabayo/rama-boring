@@ -27,6 +27,11 @@ bitflags::bitflags! {
 }
 
 /// How GREASE values are chosen.
+///
+/// Fresh and seeded GREASE slots of one list get distinct values (a key share
+/// must not repeat a group), and the n-th GREASE values of supported_groups and
+/// key_share match, as browsers send them. A list holds at most 16 GREASE
+/// slots, one per GREASE codepoint; setters reject more.
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Hash)]
 pub enum GreaseValues {
     /// Random per connection, as browsers do.

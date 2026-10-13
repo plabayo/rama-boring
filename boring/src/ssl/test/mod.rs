@@ -1899,3 +1899,4 @@ mod panic_safety;
 mod renegotiation;
 mod session_order;
 pub(crate) mod wire;
+mod wire_fuzz;

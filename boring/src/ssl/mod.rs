@@ -3295,7 +3295,7 @@ impl SslRef {
     /// context and its session cache untouched and overrides both context ordering and
     /// random permutation. Listed extensions are emitted first in the requested order;
     /// unlisted ones follow in native canonical order, so an empty slice selects
-    /// canonical order. The order is exact: a GREASE codepoint is a GREASE
+    /// canonical order (without GREASE extensions). The order is exact: a GREASE codepoint is a GREASE
     /// extension at that position (its value and body follow
     /// [`ClientHelloShape`]), and there are no other GREASE extensions. IDs
     /// BoringSSL does not implement follow [`UnknownValues`] (dropped by
