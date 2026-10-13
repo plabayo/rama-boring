@@ -1,5 +1,5 @@
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 3b48c2a..453f143 100644
+index 3b48c2a..1cc2a86 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
 @@ -1739,8 +1739,17 @@ OPENSSL_EXPORT int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx,
@@ -42,7 +42,7 @@ index 3b48c2a..453f143 100644
  
  // QUIC integration.
  //
-@@ -5565,7 +5580,184 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
+@@ -5565,7 +5580,186 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
  
@@ -50,7 +50,8 @@ index 3b48c2a..453f143 100644
 +// RAMA_SSL_CTX_set_extension_order sets the default ClientHello extension
 +// order of connections on |ctx|, as |RAMA_SSL_set_extension_order| does for
 +// one connection, except that extensions it does not list follow in a random
-+// order. It returns one on success and zero on error.
++// order. An empty order selects the canonical order, without GREASE
++// extensions. It returns one on success and zero on error.
 +OPENSSL_EXPORT int RAMA_SSL_CTX_set_extension_order(SSL_CTX *ctx, const uint16_t *ids, size_t num);
 +
 +// RAMA_SSL_set_raw_cipher_list sets the cipher suite values this |ssl| offers,
@@ -211,10 +212,11 @@ index 3b48c2a..453f143 100644
 +
 +// RAMA_SSL_set_extension_order sets the ClientHello extension order for this
 +// client |ssl| before its handshake begins, without changing its |SSL_CTX|. It
-+// overrides context ordering and permutation. The order is exact: listed
-+// extensions come first, in order; GREASE codepoints are its only GREASE
-+// extensions; unknown IDs follow the unknown-value policy; later duplicates
-+// are skipped. Remaining extensions follow in canonical order. PSK stays last
++// overrides context ordering and permutation. The order is a prefix: listed
++// extensions come first, in order, and the other extensions |ssl| enables
++// follow in canonical order; it decides order, not which extensions are sent.
++// GREASE codepoints are its only GREASE extensions; unknown IDs follow the
++// unknown-value policy; later duplicates are skipped. PSK stays last
 +// and padding stays native. An empty list selects the canonical order, without
 +// GREASE extensions, even when the context permutes or has an order. A later call replaces the previous order;
 +// the order persists across |SSL_clear| like the rest of the configuration.
@@ -251,7 +253,7 @@ index f4b3484..30cf143 100644
  #define TLSEXT_MAXLEN_host_name 255
  
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
-index 90238d9..8ea1d28 100644
+index 90238d9..1b82b46 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
 @@ -35,6 +35,7 @@
@@ -555,15 +557,20 @@ index 90238d9..8ea1d28 100644
  
      if (first &&
          (!CBB_add_u16(out_compressible, TLSEXT_TYPE_cert_compression) ||
-@@ -3393,6 +3591,7 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
+@@ -3392,7 +3590,11 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
+     return false;
    }
  
-   size_t best_index = num_algs;
+-  size_t best_index = num_algs;
++  // Ranks come from the context's registry or, when set, the connection's
++  // preference list, which may be longer than the registry after a context
++  // switch; SIZE_MAX means none.
++  size_t best_index = SIZE_MAX;
 +  uint16_t best_alg_id = 0;
    size_t given_alg_idx = 0;
  
    while (CBS_len(&alg_ids) > 0) {
-@@ -3406,8 +3605,22 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
+@@ -3406,8 +3608,22 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
      for (size_t i = 0; i < num_algs; i++) {
        const auto &alg = ctx->cert_compression_algs[i];
        if (alg.alg_id == alg_id && alg.compress != nullptr) {
@@ -574,7 +581,7 @@ index 90238d9..8ea1d28 100644
 +        const RamaConnectionConfig *rama = hs->config->rama.get();
 +        if (rama != nullptr && rama->cert_compression_set) {
 +          const auto &prefs = rama->cert_compression_algs;
-+          rank = num_algs;
++          rank = SIZE_MAX;
 +          for (size_t j = 0; j < prefs.size(); j++) {
 +            if (prefs[j] == alg_id) {
 +              rank = j;
@@ -588,8 +595,12 @@ index 90238d9..8ea1d28 100644
          }
          break;
        }
-@@ -3424,7 +3637,7 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
-   if (best_index < num_algs &&
+@@ -3421,10 +3637,10 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
+     }
+   }
+ 
+-  if (best_index < num_algs &&
++  if (best_index != SIZE_MAX &&
        ssl_protocol_version(hs->ssl) >= TLS1_3_VERSION) {
      hs->cert_compression_negotiated = true;
 -    hs->cert_compression_alg_id = ctx->cert_compression_algs[best_index].alg_id;
@@ -597,7 +608,7 @@ index 90238d9..8ea1d28 100644
    }
  
    return true;
-@@ -4260,6 +4473,13 @@ static const struct tls_extension kExtensions[] = {
+@@ -4260,6 +4476,13 @@ static const struct tls_extension kExtensions[] = {
          cert_compression_parse_clienthello,
          cert_compression_add_serverhello,
      },
@@ -611,7 +622,7 @@ index 90238d9..8ea1d28 100644
      {
          TLSEXT_TYPE_delegated_credential,
          ext_delegated_credential_add_clienthello,
-@@ -4342,6 +4562,194 @@ static_assert(kNumExtensions <=
+@@ -4342,6 +4565,196 @@ static_assert(kNumExtensions <=
                    sizeof(((SSL_HANDSHAKE *)nullptr)->extensions.received) * 8,
                "too many extensions for received bitset");
  
@@ -796,17 +807,19 @@ index 90238d9..8ea1d28 100644
 +  if (!hs->extension_permutation.empty()) {
 +    return true;
 +  }
-+  const auto &ids = hs->ssl->ctx->rama_ssl_extension_order;
-+  if (ids.empty()) {
++  const SSLContext *ctx = hs->ssl->ctx.get();
++  if (!ctx->rama_ssl_extension_order_set) {
 +    return ssl_setup_extension_permutation(hs);
 +  }
-+  return rama_ssl_build_extension_order(hs, ids, true);
++  // An explicitly empty order selects the canonical order.
++  const auto &ids = ctx->rama_ssl_extension_order;
++  return ids.empty() || rama_ssl_build_extension_order(hs, ids, true);
 +}
 +
  bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs) {
    if (!hs->config->permute_extensions) {
      return true;
-@@ -4390,6 +4798,133 @@ static bool add_padding_extension(CBB *cbb, uint16_t ext, size_t len) {
+@@ -4390,6 +4803,133 @@ static bool add_padding_extension(CBB *cbb, uint16_t ext, size_t len) {
    return CBB_flush(cbb);
  }
  
@@ -940,7 +953,7 @@ index 90238d9..8ea1d28 100644
  static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
                                               CBB *out_encoded) {
    // When writing ClientHelloInner, we construct the real and encoded
-@@ -4410,7 +4945,7 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+@@ -4410,7 +4950,7 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
  
    hs->inner_extensions_sent = 0;
  
@@ -949,7 +962,7 @@ index 90238d9..8ea1d28 100644
      // Add a fake empty extension. See RFC 8701. This always matches
      // `ssl_add_clienthello_tlsext`, so compress it.
      uint16_t grease_ext = ssl_get_grease_value(hs, ssl_grease_extension1);
-@@ -4448,7 +4983,7 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+@@ -4448,7 +4988,7 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
      }
    }
  
@@ -958,22 +971,24 @@ index 90238d9..8ea1d28 100644
      // Add a fake non-empty extension. See RFC 8701. This always matches
      // `ssl_add_clienthello_tlsext`, so compress it.
      uint16_t grease_ext = ssl_get_grease_value(hs, ssl_grease_extension2);
-@@ -4525,18 +5060,44 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+@@ -4525,18 +5065,46 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
    // important to reset this value.
    hs->extensions.sent = 0;
  
 +  // A configured order, of the connection or else of the context, is exact:
 +  // GREASE extensions appear at its GREASE slots only, and unknown extensions
-+  // follow the unknown-value policy. An empty connection order selects the
-+  // canonical order, without GREASE extensions. With a real ECH config, ClientHelloInner references outer
-+  // extensions natively, so only the order of known extensions applies.
++  // follow the unknown-value policy. An empty order selects the canonical
++  // order, without GREASE extensions. With a real ECH config,
++  // ClientHelloInner references outer extensions natively, so only the order
++  // of known extensions applies.
 +  const RamaConnectionConfig *rama = hs->config->rama.get();
++  const bool connection_order = rama != nullptr && rama->extension_order_set;
 +  const Span<const uint16_t> order =
-+      rama != nullptr && rama->extension_order_set
++      connection_order
 +          ? Span<const uint16_t>(rama->extension_order)
 +          : Span<const uint16_t>(ssl->ctx->rama_ssl_extension_order);
 +  const bool planned =
-+      ((rama != nullptr && rama->extension_order_set) || !order.empty()) &&
++      (connection_order || ssl->ctx->rama_ssl_extension_order_set) &&
 +      hs->selected_ech_config == nullptr;
 +  const bool native_grease =
 +      !planned && rama_grease_enabled(hs, RAMA_SSL_GREASE_EXTENSIONS);
@@ -1004,7 +1019,7 @@ index 90238d9..8ea1d28 100644
      const size_t len_before = CBB_len(&extensions);
      if (!kExtensions[i].add_clienthello(hs, &extensions, &extensions, type)) {
        OPENSSL_PUT_ERROR(SSL, SSL_R_ERROR_ADDING_EXTENSION);
-@@ -4553,7 +5114,7 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+@@ -4553,7 +5121,7 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
      last_was_empty = (bytes_written == 4);
    }
  
@@ -1013,7 +1028,7 @@ index 90238d9..8ea1d28 100644
      // Add a fake non-empty extension. See RFC 8701.
      if (!add_padding_extension(
              &extensions, ssl_get_grease_value(hs, ssl_grease_extension2), 1)) {
-@@ -4566,8 +5127,19 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+@@ -4566,8 +5134,19 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
    // bugs. We also apply this padding to ClientHelloOuter, to keep the wire
    // images aligned.
    size_t psk_len = ext_pre_shared_key_clienthello_length(hs, type);
@@ -1034,7 +1049,7 @@ index 90238d9..8ea1d28 100644
      msg_len += 2 /* length prefix */ + CBB_len(&extensions) + psk_len;
      // The length of the padding extension, excluding the four-byte extension
      // header.
-@@ -4627,16 +5199,40 @@ bool ssl_add_serverhello_tlsext(SSL_HANDSHAKE *hs, CBB *out) {
+@@ -4627,16 +5206,40 @@ bool ssl_add_serverhello_tlsext(SSL_HANDSHAKE *hs, CBB *out) {
      goto err;
    }
  
@@ -1157,7 +1172,7 @@ index a4a53cd..d50bead 100644
        !ssl_add_client_hello(hs)) {
      return ssl_hs_error;
 diff --git a/ssl/internal.h b/ssl/internal.h
-index 96f6d3d..d1efb07 100644
+index 96f6d3d..1b2f67c 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
 @@ -297,10 +297,14 @@ struct SSLCipherPreferenceList {
@@ -1347,13 +1362,15 @@ index 96f6d3d..d1efb07 100644
  };
  
  // From RFC 8446, used in determining PSK modes.
-@@ -4232,6 +4373,10 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+@@ -4232,6 +4373,12 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
    // permute_extensions is whether to permute extensions when sending messages.
    bool permute_extensions : 1;
  
-+  // rama_ssl_extension_order, if not empty, will use this
-+  // as the order to be used to write the ssl extensions.
++  // rama_ssl_extension_order, when `rama_ssl_extension_order_set`, is the
++  // default ClientHello extension order of connections on this context; an
++  // empty one selects the canonical order.
 +  bssl::Array<uint16_t> rama_ssl_extension_order;
++  bool rama_ssl_extension_order_set = false;
 +
    // allow_unknown_alpn_protos is whether the client allows unsolicited ALPN
    // protocols from the peer.
@@ -1494,7 +1511,7 @@ index 7799d79..c32d06b 100644
    switch (EVP_PKEY_id(key)) {
      case EVP_PKEY_RSA:
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index a0c746b..eb8522e 100644
+index a0c746b..14bc36b 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
 @@ -364,6 +364,12 @@ void SSL_set_aes_hw_override_for_testing(SSL *ssl, bool override_value) {
@@ -1689,7 +1706,7 @@ index a0c746b..eb8522e 100644
  int SSL_CTX_add_cert_compression_alg(SSL_CTX *ctx, uint16_t alg_id,
                                       ssl_cert_compression_func_t compress,
                                       ssl_cert_decompression_func_t decompress) {
-@@ -3284,6 +3442,218 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
+@@ -3284,6 +3442,231 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
    FromOpaque(ctx)->permute_extensions = !!enabled;
  }
  
@@ -1743,9 +1760,13 @@ index a0c746b..eb8522e 100644
 +
 +int RAMA_SSL_CTX_set_extension_order(SSL_CTX *ctx, const uint16_t *ids,
 +                                     size_t num) {
-+  return rama_raw_list(ids, num) &&
-+         rama_copy_unique(&FromOpaque(ctx)->rama_ssl_extension_order, ids,
-+                          num);
++  auto *ctx_impl = FromOpaque(ctx);
++  if (!rama_raw_list(ids, num) ||
++      !rama_copy_unique(&ctx_impl->rama_ssl_extension_order, ids, num)) {
++    return 0;
++  }
++  ctx_impl->rama_ssl_extension_order_set = true;
++  return 1;
 +}
 +
 +int RAMA_SSL_set_extension_order(SSL *ssl, const uint16_t *ids, size_t num) {
@@ -1864,11 +1885,20 @@ index a0c746b..eb8522e 100644
 +    OPENSSL_PUT_ERROR(SSL, SSL_R_NO_GROUPS_SPECIFIED);
 +    return 0;
 +  }
-+  auto *ssl_impl = FromOpaque(ssl);
-+  if (!ssl_impl->config->supported_group_list.CopyFrom(known) ||
-+      !rama_copy_unique(&rama->groups, ids, num)) {
++  // Keep the invariants every native group setter keeps: one flag per group,
++  // and native key share selections only while they still fit the groups.
++  SSL_CONFIG *config = FromOpaque(ssl)->config.get();
++  Array<uint16_t> groups;
++  Array<uint32_t> flags;
++  Array<uint16_t> listed;
++  if (!groups.CopyFrom(known) || !flags.Init(known.size()) ||
++      !rama_copy_unique(&listed, ids, num)) {
 +    return 0;
 +  }
++  config->supported_group_list = std::move(groups);
++  config->supported_group_list_flags = std::move(flags);
++  clear_key_shares_if_invalid(config);
++  rama->groups = std::move(listed);
 +  rama->groups_set = true;
 +  return 1;
 +}

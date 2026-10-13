@@ -288,7 +288,11 @@ impl QuicConnection {
                 .and_then(Option::as_ref)
                 .is_some_and(|waker| waker.will_wake(cx.waker()));
         if !installed && !self.failed {
-            self.ssl.set_task_waker(Some(cx.waker().clone()));
+            // The replaced waker's destructor is contained like other cleanup.
+            let replaced = self
+                .ssl
+                .replace_ex_data(*TASK_WAKER_INDEX, Some(cx.waker().clone()));
+            crate::unwind::drop_contained(replaced);
             self.task_waker = true;
         }
         match self.handshake() {
@@ -323,7 +327,8 @@ impl QuicConnection {
     #[inline(never)]
     fn release_task_waker(&mut self, result: &Result<HandshakeStatus, QuicError>) {
         if !matches!(result, Err(QuicError::Tls(error)) if callback_pending(error.code())) {
-            self.ssl.set_task_waker(None);
+            let released = self.ssl.replace_ex_data(*TASK_WAKER_INDEX, None);
+            crate::unwind::drop_contained(released);
             self.task_waker = false;
         }
     }

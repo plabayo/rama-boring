@@ -219,7 +219,8 @@ impl Session {
 /// The length of the whole handshake message at the front of `buffer`, once complete.
 fn message_len(buffer: &[u8]) -> Option<usize> {
     let header = buffer.get(..4)?;
-    let len = 4 + usize::from_be_bytes([0, 0, 0, 0, 0, header[1], header[2], header[3]]);
+    let len =
+        4 + (usize::from(header[1]) << 16 | usize::from(header[2]) << 8 | usize::from(header[3]));
     (buffer.len() >= len).then_some(len)
 }
 

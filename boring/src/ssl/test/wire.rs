@@ -1,12 +1,13 @@
 //! Strict parsing of TLS handshake messages for wire-level tests.
 //!
 //! Every read is length-checked and every length prefix must be consumed
-//! exactly, as BoringSSL's own parser requires: malformed input yields `None`,
-//! never a panic and never a partial result. A test oracle built on this cannot
-//! accept a message BoringSSL would reject. The property tests below check
-//! that parsing never panics, that it inverts encoding, and that any truncation
-//! or trailing byte is rejected; a differential test checks it against
-//! BoringSSL's own view of real ClientHellos.
+//! exactly, as BoringSSL's own parser requires: structurally malformed input
+//! yields `None`, never a panic and never a partial result. Semantic rules
+//! (duplicate extensions, value ranges, empty vectors) are left to the tests
+//! that need them. The property tests below check that parsing never panics,
+//! that it inverts encoding, and that any truncation or trailing byte is
+//! rejected; a differential test checks it against BoringSSL's own view of
+//! real ClientHellos.
 
 /// A cursor over bytes where every read is checked.
 #[derive(Debug, Clone, Copy)]
@@ -33,8 +34,10 @@ impl<'a> Reader<'a> {
     }
 
     fn u24(&mut self) -> Option<usize> {
-        self.bytes(3)
-            .map(|bytes| usize::from_be_bytes([0, 0, 0, 0, 0, bytes[0], bytes[1], bytes[2]]))
+        // Width-independent: `usize` is 4 bytes on 32-bit targets.
+        self.bytes(3).map(|bytes| {
+            usize::from(bytes[0]) << 16 | usize::from(bytes[1]) << 8 | usize::from(bytes[2])
+        })
     }
 
     /// The contents of a one-byte length prefix.

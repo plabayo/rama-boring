@@ -67,7 +67,7 @@ where
         let custom_verify_idx = SslContext::cached_ex_index::<F>();
 
         // SSL_set_SSL_CTX preserves the verification callback installed at SSL_new.
-        let ssl_context = ssl.ex_data(*SESSION_CTX_INDEX).cloned();
+        let ssl_context = unwind::LeakOnUnwind::new(ssl.ex_data(*SESSION_CTX_INDEX).cloned());
         let callback = ssl_context
             .as_ref()
             .and_then(|ctx| ctx.ex_data(custom_verify_idx))
@@ -121,10 +121,11 @@ where
     F: Fn(&mut SslRef) -> Result<(), SslVerifyError> + 'static + Sync + Send,
 {
     let callback = |ssl: &mut SslRef| {
-        let callback = ssl
-            .ex_data(Ssl::cached_ex_index::<Arc<F>>())
-            .cloned()
-            .ok_or(SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR))?;
+        let callback = unwind::LeakOnUnwind::new(
+            ssl.ex_data(Ssl::cached_ex_index::<Arc<F>>())
+                .cloned()
+                .ok_or(SslVerifyError::Invalid(SslAlert::INTERNAL_ERROR))?,
+        );
 
         callback(ssl)
     };
@@ -194,7 +195,7 @@ where
         let psk_sl = unsafe { slice::from_raw_parts_mut(psk, max_psk_len as usize) };
 
         // SSL_new copies this callback; routing does not replace it.
-        let ssl_context = ssl.ex_data(*SESSION_CTX_INDEX).cloned();
+        let ssl_context = unwind::LeakOnUnwind::new(ssl.ex_data(*SESSION_CTX_INDEX).cloned());
         let Some(callback) = ssl_context
             .as_ref()
             .and_then(|ctx| ctx.ex_data(SslContext::cached_ex_index::<F>()))
@@ -239,7 +240,7 @@ where
         let psk_sl = unsafe { slice::from_raw_parts_mut(psk, max_psk_len as usize) };
 
         // SSL_new copies this callback; routing does not replace it.
-        let ssl_context = ssl.ex_data(*SESSION_CTX_INDEX).cloned();
+        let ssl_context = unwind::LeakOnUnwind::new(ssl.ex_data(*SESSION_CTX_INDEX).cloned());
         let Some(callback) = ssl_context
             .as_ref()
             .and_then(|ctx| ctx.ex_data(SslContext::cached_ex_index::<F>()))
@@ -275,12 +276,13 @@ where
             // NOTE(nox): I'm pretty sure this Arc<F> is unnecessary here as there is
             // no way to get a `&mut SslRef` from a `&mut X509StoreContextRef`, and I
             // don't understand how this callback is different from `raw_verify` above.
-            let callback = ctx
-                .ex_data(ssl_idx)
-                .expect("BUG: store context missing ssl")
-                .ex_data(Ssl::cached_ex_index::<Arc<F>>())
-                .expect("BUG: ssl verify callback missing")
-                .clone();
+            let callback = unwind::LeakOnUnwind::new(
+                ctx.ex_data(ssl_idx)
+                    .expect("BUG: store context missing ssl")
+                    .ex_data(Ssl::cached_ex_index::<Arc<F>>())
+                    .expect("BUG: ssl verify callback missing")
+                    .clone(),
+            );
 
             c_int::from(callback(preverify_ok != 0, ctx))
         },
@@ -359,7 +361,7 @@ where
         let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
 
         // BoringSSL invokes the ticket callback from the original session context.
-        let ssl_context = ssl.ex_data(*SESSION_CTX_INDEX).cloned();
+        let ssl_context = unwind::LeakOnUnwind::new(ssl.ex_data(*SESSION_CTX_INDEX).cloned());
         let Some(callback) = ssl_context
             .as_ref()
             .and_then(|ctx| ctx.ex_data(SslContext::cached_ex_index::<F>()))
@@ -414,7 +416,7 @@ where
         let out = unsafe { &mut *out };
         let outlen = unsafe { &mut *outlen };
 
-        let ssl_context = ssl.ssl_context().to_owned();
+        let ssl_context = unwind::LeakOnUnwind::new(ssl.ssl_context().to_owned());
         let callback = ssl_context
             .ex_data(SslContext::cached_ex_index::<F>())
             .expect("BUG: alpn callback missing");
@@ -442,7 +444,8 @@ where
             // SAFETY: boring provides valid inputs.
             let client_hello = ClientHello(unsafe { &*client_hello });
 
-            let ssl_context = client_hello.ssl().ssl_context().to_owned();
+            let ssl_context =
+                unwind::LeakOnUnwind::new(client_hello.ssl().ssl_context().to_owned());
             let callback = ssl_context
                 .ex_data(SslContext::cached_ex_index::<F>())
                 .expect("BUG: select cert callback missing");
@@ -470,7 +473,7 @@ where
             // SAFETY: boring provides valid inputs.
             let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
 
-            let ssl_context = ssl.ssl_context().to_owned();
+            let ssl_context = unwind::LeakOnUnwind::new(ssl.ssl_context().to_owned());
             let callback = ssl_context
                 .ex_data(SslContext::cached_ex_index::<F>())
                 .expect("BUG: ocsp callback missing");
@@ -716,8 +719,11 @@ where
             // Keep native owners alive independently of `ssl` while the callback can
             // mutate the connection. Credential-specific methods take precedence over
             // the legacy context method.
-            let credential = ssl.selected_credential().map(ToOwned::to_owned);
-            let ssl_context = super::credential::selected_credential_context(ssl).to_owned();
+            let credential =
+                unwind::LeakOnUnwind::new(ssl.selected_credential().map(ToOwned::to_owned));
+            let ssl_context = unwind::LeakOnUnwind::new(
+                super::credential::selected_credential_context(ssl).to_owned(),
+            );
             let Some(method) = credential
                 .as_ref()
                 .and_then(|cred| cred.ex_data(super::SslCredential::cached_ex_index::<M>()))
@@ -984,7 +990,11 @@ pub(super) unsafe extern "C" fn raw_ssl_msg<F>(
             let message =
                 unsafe { super::SslMessage::from_raw(write_p, version, content_type, buf, len) };
             // Clone the Arc: the callback may replace itself.
-            let Some(callback) = ssl.ex_data(Ssl::cached_ex_index::<Arc<F>>()).cloned() else {
+            let Some(callback) = ssl
+                .ex_data(Ssl::cached_ex_index::<Arc<F>>())
+                .cloned()
+                .map(unwind::LeakOnUnwind::new)
+            else {
                 return;
             };
             callback(ssl, message);

@@ -463,7 +463,9 @@ fn with_callback_state<H, T: 'static, E: Copy + 'static>(
                 Poll::Pending
             }
             Poll::Ready(result) => {
-                drop(future);
+                // Dropped before the result is used, where a panic could not be
+                // contained once the result's own unwind began.
+                unwind::drop_contained(future);
                 Poll::Ready(result.and_then(|value| finish(handle, value)))
             }
         }
@@ -665,11 +667,10 @@ fn with_ex_data_future<H, R, T, E>(
     let mut ctx = Context::from_waker(&waker);
 
     if let Some(data @ Some(_)) = ssl.ex_data_mut(index).map(MutOnly::get_mut) {
-        let fut_result = into_result(ready!(data.as_mut().unwrap().as_mut().poll(&mut ctx)));
+        let output = ready!(data.as_mut().unwrap().as_mut().poll(&mut ctx));
+        unwind::drop_contained(data.take());
 
-        *data = None;
-
-        Poll::Ready(fut_result)
+        Poll::Ready(into_result(output))
     } else {
         let mut fut = create_fut(ssl_handle)?;
 
@@ -681,7 +682,10 @@ fn with_ex_data_future<H, R, T, E>(
             }
         };
         match polled {
-            Poll::Ready(fut_result) => Poll::Ready(into_result(fut_result)),
+            Poll::Ready(fut_result) => {
+                unwind::drop_contained(fut);
+                Poll::Ready(into_result(fut_result))
+            }
             Poll::Pending => {
                 get_ssl_mut(ssl_handle).replace_ex_data(index, MutOnly::new(Some(fut)));
 

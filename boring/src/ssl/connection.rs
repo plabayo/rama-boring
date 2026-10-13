@@ -70,16 +70,22 @@ pub enum Padding {
     /// No padding extension.
     Off,
     /// Pad the ClientHello, handshake header included, to this many bytes when
-    /// shorter.
+    /// it is at least 4 bytes shorter (the padding extension's own header).
+    ///
+    /// Padding is placed last, before pre_shared_key. Like native padding (and
+    /// browsers), it only applies to the first ClientHello: a ClientHello sent
+    /// after a HelloRetryRequest is not padded.
     ToLength(u16),
 }
 
 /// The cross-cutting choices that shape one connection's ClientHello.
 ///
 /// Lists (ciphers, groups, key shares, versions, signature algorithms and the
-/// extension order) are set with their own setters, exactly as they appear on
-/// the wire: a GREASE codepoint in a list marks a GREASE slot at that position,
-/// and a set list has no other GREASE values. This shape decides what those
+/// extension order) are set with their own setters, as they appear on the wire:
+/// a GREASE codepoint in a list marks a GREASE slot at that position, and a set
+/// list has no other GREASE values. The extension order orders: the extensions
+/// it lists come first, then the other extensions this connection enables,
+/// natively. Which extensions are sent follows from the connection's settings. This shape decides what those
 /// GREASE slots become, which native lists get GREASE, what happens to values
 /// the connection cannot negotiate, the padding, and the bodies of GREASE and
 /// preserved extensions. Everything left unset keeps BoringSSL's behaviour.

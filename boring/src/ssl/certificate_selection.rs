@@ -192,12 +192,14 @@ unsafe extern "C" fn context_callback(ssl: *mut ffi::SSL, _: *mut c_void) -> c_i
         || {
             // Retain the callback even if it replaces itself or switches SSL contexts.
             let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
-            let callback = ssl
-                .ssl_context()
-                .ex_data(*CONTEXT_CALLBACK_INDEX)
-                .expect("BUG: certificate callback missing")
-                .0
-                .clone();
+            // Leaked, not dropped, if the callback panics after replacing itself.
+            let callback = unwind::LeakOnUnwind::new(
+                ssl.ssl_context()
+                    .ex_data(*CONTEXT_CALLBACK_INDEX)
+                    .expect("BUG: certificate callback missing")
+                    .0
+                    .clone(),
+            );
             callback_result(callback(CertificateSelection(ssl)))
         },
         |message| {
@@ -213,10 +215,11 @@ unsafe extern "C" fn connection_callback(ssl: *mut ffi::SSL, _: *mut c_void) -> 
     unwind::catch(
         || {
             let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
-            let callback = ssl
-                .ex_data(*CONNECTION_CALLBACK_INDEX)
-                .and_then(|callback| callback.0.clone())
-                .expect("BUG: connection certificate callback missing");
+            let callback = unwind::LeakOnUnwind::new(
+                ssl.ex_data(*CONNECTION_CALLBACK_INDEX)
+                    .and_then(|callback| callback.0.clone())
+                    .expect("BUG: connection certificate callback missing"),
+            );
             callback_result(callback(CertificateSelection(ssl)))
         },
         |message| {

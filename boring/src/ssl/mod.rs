@@ -2137,9 +2137,10 @@ impl SslContextBuilder {
     }
 
     /// Sets the default ClientHello extension order of this context's
-    /// connections, with the semantics of [`SslRef::set_extension_order`]: the
-    /// order is exact, GREASE codepoints are its only GREASE extensions, and
-    /// unknown IDs are dropped. Extensions it does not list follow in a random
+    /// connections, with the semantics of [`SslRef::set_extension_order`]: a
+    /// prefix order whose GREASE codepoints are its only GREASE extensions,
+    /// even when empty, and whose unknown IDs are dropped. Extensions it does
+    /// not list follow in a random order; an empty order selects canonical
     /// order.
     ///
     /// Fails for more than 256 IDs or more than 16 GREASE codepoints.
@@ -3288,19 +3289,22 @@ impl SslRef {
         unsafe { ffi::SSL_set_permute_extensions(self.as_ptr(), enabled as _) }
     }
 
-    /// Sets this client's ClientHello extension order before its handshake starts,
-    /// exactly as on the wire.
+    /// Sets this client's ClientHello extension order before its handshake starts.
     ///
     /// Unlike [`SslContextBuilder::set_extension_order`], this leaves the shared
     /// context and its session cache untouched and overrides both context ordering and
-    /// random permutation. Listed extensions are emitted first in the requested order;
-    /// unlisted ones follow in native canonical order, so an empty slice selects
-    /// canonical order (without GREASE extensions). The order is exact: a GREASE codepoint is a GREASE
-    /// extension at that position (its value and body follow
-    /// [`ClientHelloShape`]), and there are no other GREASE extensions. IDs
-    /// BoringSSL does not implement follow [`UnknownValues`] (dropped by
-    /// default), duplicates are ignored, and padding and pre_shared_key keep
-    /// their native positions. A later call replaces the order.
+    /// random permutation. The order is a prefix: listed extensions are emitted
+    /// first in the requested order, and the other extensions this connection
+    /// enables follow in native canonical order. It decides order, not which
+    /// extensions are sent; listing an extension the connection does not
+    /// enable sends nothing for it. An empty slice selects canonical order.
+    ///
+    /// GREASE is exact: a GREASE codepoint is a GREASE extension at that
+    /// position (its value and body follow [`ClientHelloShape`]), and there are
+    /// no other GREASE extensions, even for an empty order. IDs BoringSSL does
+    /// not implement follow [`UnknownValues`] (dropped by default), duplicates
+    /// are ignored, and padding and pre_shared_key keep their native positions.
+    /// A later call replaces the order.
     ///
     /// Fails for a server, once the ClientHello was written, for more than 256
     /// IDs, or for more than 16 GREASE codepoints (each GREASE extension needs
