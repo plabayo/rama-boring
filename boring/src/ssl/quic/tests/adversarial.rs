@@ -496,7 +496,11 @@ fn server_hello_selecting_an_unknown_or_unlisted_cipher_is_rejected() {
         });
         let (result, seen) = session.relay(SERVER_HELLO, |message| {
             let mut hello = ServerHello::parse(message).unwrap();
-            assert_eq!(hello.cipher, AES_128_GCM);
+            // With standard preferences the native choice depends on AES
+            // hardware; the raw list leaves only AES-128-GCM.
+            if raw {
+                assert_eq!(hello.cipher, AES_128_GCM);
+            }
             hello.cipher = selected;
             hello.reencode(message).unwrap()
         });

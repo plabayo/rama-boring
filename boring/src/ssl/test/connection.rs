@@ -104,10 +104,16 @@ fn tls13_server_cipher_preference_is_per_connection() {
         .set_raw_cipher_list(&[0x1301, 0x1302, 0x1303])
         .unwrap();
     let client = client.build();
+    // Natively, a server without AES hardware prefers ChaCha20-Poly1305.
+    let native = if unsafe { crate::ffi::EVP_has_aes_hardware() } != 0 {
+        0x1301
+    } else {
+        0x1303
+    };
     for (preference, expected) in [
         (&[0x1303][..], 0x1303),
         (&[0x1302, 0x1303], 0x1302),
-        (&[][..], 0x1301),
+        (&[][..], native),
     ] {
         let mut ssl = Ssl::new(&server).unwrap();
         ssl.set_tls13_server_ciphers(preference).unwrap();
