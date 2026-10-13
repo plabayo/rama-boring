@@ -573,3 +573,195 @@ isolated_test! {
         }
     }
 }
+
+/// When an async future panics: on its first poll (while the callback owns it)
+/// or after being pending once (while the connection holds it).
+#[derive(Clone, Copy, Debug)]
+enum PanicAt {
+    FirstPoll,
+    SecondPoll,
+}
+
+/// A future that panics at `at`, and whose destructor panics as well: the
+/// cleanup after the first panic must contain the second.
+struct Bomb<T> {
+    at: PanicAt,
+    polled: bool,
+    _drop: PanicOnDrop,
+    _output: std::marker::PhantomData<fn() -> T>,
+}
+
+fn bomb<T: 'static>(at: PanicAt) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>> {
+    Box::pin(Bomb {
+        at,
+        polled: false,
+        _drop: PanicOnDrop,
+        _output: std::marker::PhantomData,
+    })
+}
+
+impl<T> std::future::Future for Bomb<T> {
+    type Output = T;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<T> {
+        if matches!(self.at, PanicAt::SecondPoll) && !self.polled {
+            self.polled = true;
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
+        }
+        panic!("poll")
+    }
+}
+
+const PANICS: [PanicAt; 2] = [PanicAt::FirstPoll, PanicAt::SecondPoll];
+
+isolated_test! {
+    fn async_certificate_selection_cleanup_is_contained() {
+        for at in PANICS {
+            let mut server = server_context();
+            server.set_async_certificate_callback(move |_| Ok(bomb(at)));
+            let mut server = Ssl::new(&server.build()).unwrap();
+            server.set_task_waker(Some(Waker::noop().clone()));
+            let client = Ssl::new(&client_context().build()).unwrap();
+            handshake(client, server).1.panicked("poll");
+        }
+    }
+}
+
+isolated_test! {
+    fn async_select_certificate_cleanup_is_contained() {
+        for at in PANICS {
+            let mut server = server_context();
+            server.set_async_select_certificate_callback(move |_| Ok(bomb(at)));
+            let mut server = Ssl::new(&server.build()).unwrap();
+            server.set_task_waker(Some(Waker::noop().clone()));
+            let client = Ssl::new(&client_context().build()).unwrap();
+            handshake(client, server).1.panicked("poll");
+        }
+    }
+}
+
+isolated_test! {
+    fn async_custom_verify_cleanup_is_contained() {
+        for at in PANICS {
+            let mut client = client_context();
+            client.set_async_custom_verify_callback(SslVerifyMode::PEER, move |_| Ok(bomb(at)));
+            let mut client = Ssl::new(&client.build()).unwrap();
+            client.set_task_waker(Some(Waker::noop().clone()));
+            let server = Ssl::new(&server_context().build()).unwrap();
+            handshake(client, server).0.panicked("poll");
+        }
+    }
+}
+
+/// Signs with a [`Bomb`].
+struct BombSigner(PanicAt);
+
+impl crate::ssl::AsyncPrivateKeyMethod for BombSigner {
+    fn sign(
+        &self,
+        _: &mut SslRef,
+        _: &[u8],
+        _: SslSignatureAlgorithm,
+        _: &mut [u8],
+    ) -> Result<crate::ssl::BoxPrivateKeyMethodFuture, crate::ssl::AsyncPrivateKeyMethodError> {
+        Ok(bomb(self.0))
+    }
+
+    fn decrypt(
+        &self,
+        _: &mut SslRef,
+        _: &[u8],
+        _: &mut [u8],
+    ) -> Result<crate::ssl::BoxPrivateKeyMethodFuture, crate::ssl::AsyncPrivateKeyMethodError> {
+        Ok(bomb(self.0))
+    }
+}
+
+isolated_test! {
+    fn async_signing_cleanup_is_contained() {
+        for at in PANICS {
+            let mut server = server_context();
+            server.set_async_private_key_method(BombSigner(at));
+            let mut server = Ssl::new(&server.build()).unwrap();
+            server.set_task_waker(Some(Waker::noop().clone()));
+            let client = Ssl::new(&client_context().build()).unwrap();
+            handshake(client, server).1.panicked("poll");
+        }
+    }
+}
+
+isolated_test! {
+    fn async_session_lookup_cleanup_is_contained() {
+        for at in PANICS {
+            let mut server = server_context();
+            server
+                .set_max_proto_version(Some(SslVersion::TLS1_2))
+                .unwrap();
+            server.set_options(SslOptions::NO_TICKET);
+            server.set_session_id_context(b"bomb").unwrap();
+            server.set_session_cache_mode(
+                SslSessionCacheMode::SERVER | SslSessionCacheMode::NO_INTERNAL_LOOKUP,
+            );
+            let lookups = Arc::new(AtomicUsize::new(0));
+            let count = lookups.clone();
+            unsafe {
+                server.set_async_get_session_callback(move |_, _| {
+                    count.fetch_add(1, SeqCst);
+                    Some(bomb(at))
+                });
+            }
+            let server = server.build();
+            let mut client = client_context();
+            client.set_session_cache_mode(SslSessionCacheMode::CLIENT);
+            let client = client.build();
+            let accept = |server: &SslContext| {
+                let mut ssl = Ssl::new(server).unwrap();
+                ssl.set_task_waker(Some(Waker::noop().clone()));
+                ssl
+            };
+            let (first, _) = handshake(Ssl::new(&client).unwrap(), accept(&server));
+            let session = first.done().ssl().session().unwrap().to_owned();
+            let mut resuming = Ssl::new(&client).unwrap();
+            // Same client context and server as the session's origin.
+            unsafe { resuming.set_session(&session).unwrap() };
+            // A panicking lookup is a miss: a full handshake follows.
+            let (second, _) = handshake(resuming, accept(&server));
+            assert!(!second.done().ssl().session_reused(), "{at:?}");
+            assert!(lookups.load(SeqCst) >= 1, "{at:?}");
+        }
+    }
+}
+
+/// A waker whose clones panic when dropped.
+fn exploding_waker() -> Waker {
+    use std::task::{RawWaker, RawWakerVTable};
+    fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+    fn wake(_: *const ()) {}
+    fn drop(_: *const ()) {
+        panic!("waker")
+    }
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake, drop);
+    // SAFETY: the vtable functions ignore the data pointer.
+    unsafe { Waker::from_raw(clone(std::ptr::null())) }
+}
+
+isolated_test! {
+    fn panicking_waker_destructors_are_contained() {
+        for at in PANICS {
+            let mut server = server_context();
+            server.set_async_certificate_callback(move |_| Ok(bomb(at)));
+            let mut server = Ssl::new(&server.build()).unwrap();
+            server.set_task_waker(Some(exploding_waker()));
+            let client = Ssl::new(&client_context().build()).unwrap();
+            let (_, server) = handshake(client, server);
+            // Either panic may surface first; the process survives both.
+            server.failed();
+        }
+    }
+}

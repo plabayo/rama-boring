@@ -63,6 +63,37 @@ pub(crate) fn drop_contained<T>(value: T) {
     }
 }
 
+/// Owns a value whose destructor may panic while the stack holding it unwinds
+/// from another panic, which would abort the process. On that path the value
+/// is leaked instead; otherwise it drops normally.
+pub(crate) struct LeakOnUnwind<T>(std::mem::ManuallyDrop<T>);
+
+impl<T> LeakOnUnwind<T> {
+    #[inline(always)]
+    pub(crate) fn new(value: T) -> Self {
+        Self(std::mem::ManuallyDrop::new(value))
+    }
+}
+
+impl<T> std::ops::Deref for LeakOnUnwind<T> {
+    type Target = T;
+
+    #[inline(always)]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> Drop for LeakOnUnwind<T> {
+    #[inline(always)]
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            // SAFETY: dropped exactly once, here.
+            unsafe { std::mem::ManuallyDrop::drop(&mut self.0) }
+        }
+    }
+}
+
 #[cold]
 #[inline(never)]
 fn drop_payload(payload: Box<dyn Any + Send>) {

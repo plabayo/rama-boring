@@ -422,7 +422,12 @@ fn with_callback_state<H, T: 'static, E: Copy + 'static>(
     invalidated_error: E,
 ) -> Poll<Result<(), E>> {
     let ssl = ssl_mut(handle);
-    let Some(waker) = ssl.ex_data(*TASK_WAKER_INDEX).cloned().flatten() else {
+    let Some(waker) = ssl
+        .ex_data(*TASK_WAKER_INDEX)
+        .cloned()
+        .flatten()
+        .map(unwind::LeakOnUnwind::new)
+    else {
         if let Some(state) = ssl.ex_data_mut(index).map(MutOnly::get_mut) {
             *state = CallbackState::Invalidated;
         }
@@ -645,7 +650,12 @@ fn with_ex_data_future<H, R, T, E>(
     missing_waker_error: E,
 ) -> Poll<Result<T, E>> {
     let ssl = get_ssl_mut(ssl_handle);
-    let Some(waker) = ssl.ex_data(*TASK_WAKER_INDEX).cloned().flatten() else {
+    let Some(waker) = ssl
+        .ex_data(*TASK_WAKER_INDEX)
+        .cloned()
+        .flatten()
+        .map(unwind::LeakOnUnwind::new)
+    else {
         if let Some(data) = ssl.ex_data_mut(index).map(MutOnly::get_mut) {
             *data = None;
         }
