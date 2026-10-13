@@ -134,6 +134,19 @@ pub(super) fn invalidate_custom_verify(ssl: &mut SslRef) {
     }
 }
 
+// QUIC retains TLS state through its transport drain, so aborting the handshake
+// must drop every pending callback future without waiting for SSL destruction.
+pub(super) fn cancel_pending(ssl: &mut SslRef) {
+    context_changed(ssl);
+    if let Some(state) = ssl.ex_data_mut(*SELECT_PRIVATE_KEY_METHOD_FUTURE_INDEX) {
+        state.get_mut().take();
+    }
+    if let Some(state) = ssl.ex_data_mut(*SELECT_GET_SESSION_FUTURE_INDEX) {
+        state.get_mut().take();
+    }
+    ssl.set_task_waker(None);
+}
+
 pub(super) fn context_changed(ssl: &mut SslRef) {
     invalidate(ssl, *SELECT_CERT_STATE_INDEX);
     invalidate_certificate_selection(ssl);

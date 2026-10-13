@@ -1911,3 +1911,47 @@ fn ex_data_drop() {
     assert_eq!(102, d1.load(Relaxed));
     assert_eq!(202, d2.load(Relaxed));
 }
+
+#[test]
+fn per_session_extension_order_overrides_without_mutating_shared_context() {
+    let mut server = Server::builder();
+    server.expected_connections_count(5);
+    let captured = capture_client_hello_extensions(&mut server);
+    let server = server.build();
+    let mut client = server.client();
+    client.ctx().set_alpn_protos(b"\x08http/1.1").unwrap();
+    client.ctx().set_extension_order(&[43, 16]).unwrap();
+    let client = client.build();
+    for ids in [&[16, 43][..], &[43, 16][..], &[][..]] {
+        let mut connection = client.builder();
+        connection.ssl().set_extension_order(ids).unwrap();
+        connection
+            .ssl()
+            .set_extension_order(&[43; 257])
+            .unwrap_err();
+        let mut connected = connection.connect();
+        connected.ssl_mut().set_extension_order(ids).unwrap_err();
+    }
+    // A sibling from the retained context still inherits its original order.
+    let _sibling = client.builder().connect();
+    let mut canonical = server.client();
+    canonical.ctx().set_alpn_protos(b"\x08http/1.1").unwrap();
+    let _canonical = canonical.connect();
+    let captures = captured.lock().unwrap();
+    assert_eq!(&captures[0][..2], &[16, 43]);
+    assert_eq!(&captures[1][..2], &[43, 16]);
+    assert_eq!(&captures[3][..2], &[43, 16]);
+    assert_eq!(captures[2], captures[4]);
+}
+
+#[test]
+fn per_session_extension_order_bounds_and_server_role() {
+    let ctx = SslContext::builder(SslMethod::tls()).unwrap().build();
+    let mut ssl = Ssl::new(&ctx).unwrap();
+    ssl.set_extension_order(&[43; 256]).unwrap();
+    ssl.set_extension_order(&[43; 257]).unwrap_err();
+    let mut server = ssl.setup_accept(io::Cursor::new(Vec::<u8>::new()));
+    server.ssl_mut().set_extension_order(&[43]).unwrap_err();
+}
+
+mod session_order;

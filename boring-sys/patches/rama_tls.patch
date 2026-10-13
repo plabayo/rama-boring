@@ -1,5 +1,5 @@
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 3b48c2a08..46a6094c6 100644
+index 3b48c2a..88e997a 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
 @@ -1739,8 +1739,17 @@ OPENSSL_EXPORT int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx,
@@ -42,7 +42,7 @@ index 3b48c2a08..46a6094c6 100644
  
  // QUIC integration.
  //
-@@ -5565,7 +5580,13 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
+@@ -5565,7 +5580,30 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
  
@@ -53,12 +53,29 @@ index 3b48c2a08..46a6094c6 100644
 +// order instead of a random one.
 +OPENSSL_EXPORT int RAMA_SSL_CTX_set_extension_order(SSL_CTX *ctx, const uint16_t *ids, size_t num);
 +
++// RAMA_SSL_MAX_EXTENSION_ORDER is the most IDs |RAMA_SSL_set_extension_order|
++// accepts.
++#define RAMA_SSL_MAX_EXTENSION_ORDER 256
++
++// RAMA_SSL_set_extension_order sets the initial ClientHello order for this
++// client |ssl| before its handshake begins, without changing its |SSL_CTX|. It
++// overrides context ordering and permutation. Recognized IDs are ordered
++// first; duplicates and unsupported IDs are skipped. Remaining extensions
++// retain canonical order. An empty list selects canonical order even when the
++// context permutes. TLS-specific placement rules, including PSK-last and GREASE
++// placement, remain enforced by the native encoder. A later call replaces the
++// previous order; |SSL_clear| discards it. It returns one on success and zero
++// on failure: for a server, once the ClientHello was written, or for more than
++// |RAMA_SSL_MAX_EXTENSION_ORDER| IDs.
++OPENSSL_EXPORT int RAMA_SSL_set_extension_order(SSL *ssl, const uint16_t *ids,
++                                                size_t num);
++
 +// SSL_set_permute_extensions configures whether sockets on |ssl| should
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_set_permute_extensions(SSL *ssl, int enabled);
  
 diff --git a/include/openssl/tls1.h b/include/openssl/tls1.h
-index f4b348481..30cf14375 100644
+index f4b3484..30cf143 100644
 --- a/include/openssl/tls1.h
 +++ b/include/openssl/tls1.h
 @@ -93,6 +93,9 @@ extern "C" {
@@ -80,7 +97,7 @@ index f4b348481..30cf14375 100644
  #define TLSEXT_MAXLEN_host_name 255
  
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
-index 90238d912..2c3f3ad34 100644
+index 90238d9..8cad3e5 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
 @@ -3303,6 +3303,32 @@ static bool ext_quic_transport_params_add_serverhello_legacy(SSL_HANDSHAKE *hs,
@@ -161,15 +178,13 @@ index 90238d912..2c3f3ad34 100644
      {
          TLSEXT_TYPE_delegated_credential,
          ext_delegated_credential_add_clienthello,
-@@ -4342,6 +4399,74 @@ static_assert(kNumExtensions <=
+@@ -4342,6 +4399,90 @@ static_assert(kNumExtensions <=
                    sizeof(((SSL_HANDSHAKE *)nullptr)->extensions.received) * 8,
                "too many extensions for received bitset");
  
-+bool rama_ssl_setup_extension_order(SSL_HANDSHAKE *hs) {
-+    SSLImpl *const ssl = hs->ssl;
-+    if (ssl->ctx->rama_ssl_extension_order.empty()) {
-+        return ssl_setup_extension_permutation(hs);
-+    }
++static bool rama_ssl_build_extension_order(SSL_HANDSHAKE *hs,
++                                           Span<const uint16_t> ids,
++                                           bool permute_remaining) {
 +
 +    static_assert(kNumExtensions <= UINT8_MAX,
 +                  "extensions_permutation type is too small");
@@ -181,7 +196,7 @@ index 90238d912..2c3f3ad34 100644
 +    bool seen[kNumExtensions] = {0};
 +    int permIndex = 0;
 +
-+    for (uint16_t id : ssl->ctx->rama_ssl_extension_order) {
++    for (uint16_t id : ids) {
 +        size_t j;
 +        for (j = 0; j < kNumExtensions; j++) {
 +            if (kExtensions[j].value == id) {
@@ -210,7 +225,7 @@ index 90238d912..2c3f3ad34 100644
 +        permutation[permIndex++] = i;
 +    }
 +
-+    if (rem > 1) {
++    if (rem > 1 && permute_remaining) {
 +        size_t seeds_num = rem - 1;
 +        uint32_t *seeds = static_cast<uint32_t *>(OPENSSL_malloc(seeds_num * sizeof(uint32_t)));
 +        if (!seeds) {
@@ -233,11 +248,29 @@ index 90238d912..2c3f3ad34 100644
 +    return true;
 +}
 +
++bool rama_ssl_set_extension_order(SSL_HANDSHAKE *hs, Span<const uint16_t> ids) {
++  // Build into the existing handshake permutation. Ordinary handshakes gain no
++  // allocation, configuration field, or per-context order cache.
++  return rama_ssl_build_extension_order(hs, ids, false);
++}
++
++bool rama_ssl_setup_extension_order(SSL_HANDSHAKE *hs) {
++  // A per-session plan outranks context order and opaque random permutation.
++  if (!hs->extension_permutation.empty()) {
++    return true;
++  }
++  const auto &ids = hs->ssl->ctx->rama_ssl_extension_order;
++  if (ids.empty()) {
++    return ssl_setup_extension_permutation(hs);
++  }
++  return rama_ssl_build_extension_order(hs, ids, true);
++}
++
  bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs) {
    if (!hs->config->permute_extensions) {
      return true;
 diff --git a/ssl/handoff.cc b/ssl/handoff.cc
-index c8d989796..618bc2d78 100644
+index c8d9897..618bc2d 100644
 --- a/ssl/handoff.cc
 +++ b/ssl/handoff.cc
 @@ -169,7 +169,9 @@ static bool apply_remote_features(SSLImpl *ssl, CBS *in) {
@@ -252,7 +285,7 @@ index c8d989796..618bc2d78 100644
    if (sk_SSL_CIPHER_num(SSL_get_ciphers(ssl)) == 0) {
      return false;
 diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
-index a4a53cda6..f0166914f 100644
+index a4a53cd..f016691 100644
 --- a/ssl/handshake_client.cc
 +++ b/ssl/handshake_client.cc
 @@ -108,6 +108,26 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
@@ -292,7 +325,7 @@ index a4a53cda6..f0166914f 100644
        !ssl_add_client_hello(hs)) {
      return ssl_hs_error;
 diff --git a/ssl/internal.h b/ssl/internal.h
-index 96f6d3d3d..6b313687f 100644
+index 96f6d3d..9e915c7 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
 @@ -297,10 +297,14 @@ struct SSLCipherPreferenceList {
@@ -332,7 +365,7 @@ index 96f6d3d3d..6b313687f 100644
  uint32_t ssl_cipher_auth_mask_for_key(const EVP_PKEY *key, bool sign_ok);
  
  // ssl_cipher_uses_certificate_auth returns whether `cipher` authenticates the
-@@ -2234,6 +2246,11 @@ bool tls13_process_new_session_ticket(SSLImpl *ssl, const SSLMessage &msg);
+@@ -2234,6 +2246,14 @@ bool tls13_process_new_session_ticket(SSLImpl *ssl, const SSLMessage &msg);
  UniquePtr<SSL_SESSION> tls13_create_session_with_ticket(SSLImpl *ssl,
                                                          CBS *body);
  
@@ -341,10 +374,13 @@ index 96f6d3d3d..6b313687f 100644
 +// to ssl_setup_extension_permutation otherwise.
 +bool rama_ssl_setup_extension_order(SSL_HANDSHAKE *hs);
 +
++// Set an explicit initial client-handshake order without modifying its context.
++bool rama_ssl_set_extension_order(SSL_HANDSHAKE *hs, Span<const uint16_t> ids);
++
  // ssl_setup_extension_permutation computes a ClientHello extension permutation
  // for `hs`, if applicable. It returns true on success and false on error.
  bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs);
-@@ -3596,6 +3613,11 @@ struct SSL_CONFIG {
+@@ -3596,6 +3616,11 @@ struct SSL_CONFIG {
    // server_padding_enabled is true iff the server is willing to send additional
    // padding to clients that request it through the server padding extension.
    bool server_padding_enabled : 1;
@@ -356,7 +392,7 @@ index 96f6d3d3d..6b313687f 100644
  };
  
  // From RFC 8446, used in determining PSK modes.
-@@ -4232,6 +4254,10 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+@@ -4232,6 +4257,10 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
    // permute_extensions is whether to permute extensions when sending messages.
    bool permute_extensions : 1;
  
@@ -368,7 +404,7 @@ index 96f6d3d3d..6b313687f 100644
    // protocols from the peer.
    bool allow_unknown_alpn_protos : 1;
 diff --git a/ssl/ssl_cipher.cc b/ssl/ssl_cipher.cc
-index 7799d79f9..4bb8f4d4a 100644
+index 7799d79..4bb8f4d 100644
 --- a/ssl/ssl_cipher.cc
 +++ b/ssl/ssl_cipher.cc
 @@ -622,10 +622,15 @@ bool SSLCipherPreferenceList::Init(UniquePtr<STACK_OF(SSL_CIPHER)> ciphers_arg,
@@ -500,7 +536,7 @@ index 7799d79f9..4bb8f4d4a 100644
    switch (EVP_PKEY_id(key)) {
      case EVP_PKEY_RSA:
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index a0c746b38..1113f1a91 100644
+index a0c746b..23f4aef 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
 @@ -364,6 +364,12 @@ void SSL_set_aes_hw_override_for_testing(SSL *ssl, bool override_value) {
@@ -586,7 +622,7 @@ index a0c746b38..1113f1a91 100644
  int SSL_CTX_add_cert_compression_alg(SSL_CTX *ctx, uint16_t alg_id,
                                       ssl_cert_compression_func_t compress,
                                       ssl_cert_decompression_func_t decompress) {
-@@ -3284,6 +3333,11 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
+@@ -3284,6 +3333,31 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
    FromOpaque(ctx)->permute_extensions = !!enabled;
  }
  
@@ -595,11 +631,31 @@ index a0c746b38..1113f1a91 100644
 +    MakeConstSpan(ids, ids_len));
 +}
 +
++int RAMA_SSL_set_extension_order(SSL *ssl, const uint16_t *ids, size_t num) {
++  auto *ssl_impl = FromOpaque(ssl);
++  SSL_HANDSHAKE *hs = ssl_impl->s3->hs.get();
++  // Only a client that has not yet written its ClientHello can be reordered.
++  if (!ssl_impl->config || ssl_impl->server || hs == nullptr ||
++      ssl_impl->s3->initial_handshake_complete || hs->state != 0) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
++    return 0;
++  }
++  if (num > RAMA_SSL_MAX_EXTENSION_ORDER) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_OVERFLOW);
++    return 0;
++  }
++  if (ids == nullptr && num != 0) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_PASSED_NULL_PARAMETER);
++    return 0;
++  }
++  return rama_ssl_set_extension_order(hs, MakeConstSpan(ids, num));
++}
++
  void SSL_set_permute_extensions(SSL *ssl, int enabled) {
    auto *ssl_impl = FromOpaque(ssl);
    if (!ssl_impl->config) {
 diff --git a/ssl/tls13_client.cc b/ssl/tls13_client.cc
-index f134ebb57..403c69656 100644
+index f134ebb..403c696 100644
 --- a/ssl/tls13_client.cc
 +++ b/ssl/tls13_client.cc
 @@ -204,11 +204,19 @@ static enum ssl_hs_wait_t do_read_hello_retry_request(SSL_HANDSHAKE *hs) {

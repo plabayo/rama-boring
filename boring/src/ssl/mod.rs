@@ -3260,6 +3260,29 @@ impl SslRef {
         unsafe { ffi::SSL_set_permute_extensions(self.as_ptr(), enabled as _) }
     }
 
+    /// Sets this client's ClientHello extension order before its handshake starts.
+    ///
+    /// Unlike [`SslContextBuilder::set_extension_order`], this leaves the shared
+    /// context and its session cache untouched and overrides both context ordering and
+    /// random permutation. Recognized IDs are emitted first in the requested order;
+    /// unsupported and duplicate IDs are ignored. Unlisted extensions keep native
+    /// canonical order, so an empty slice selects canonical order. Native PSK-last
+    /// and GREASE placement rules still apply. A later call replaces the order.
+    ///
+    /// Fails for a server, once the ClientHello was written, or for more than
+    /// 256 IDs.
+    #[corresponds(RAMA_SSL_set_extension_order)]
+    pub fn set_extension_order(&mut self, ids: &[u16]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt(ffi::RAMA_SSL_set_extension_order(
+                self.as_ptr(),
+                ids.as_ptr(),
+                ids.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
     /// Like [`SslContextBuilder::set_alpn_protos`].
     ///
     /// [`SslContextBuilder::set_alpn_protos`]: struct.SslContextBuilder.html#method.set_alpn_protos

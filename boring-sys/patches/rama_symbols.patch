@@ -19,16 +19,17 @@ index 6e68c58d1..6b30e4f56 100644
  #pragma redefine_extname MD4 BORINGSSL_ADD_USER_LABEL_AND_PREFIX(MD4)
  #pragma redefine_extname MD4_Final BORINGSSL_ADD_USER_LABEL_AND_PREFIX(MD4_Final)
  #pragma redefine_extname MD4_Init BORINGSSL_ADD_USER_LABEL_AND_PREFIX(MD4_Init)
-@@ -1721,6 +1731,8 @@
+@@ -1721,6 +1731,9 @@
  #pragma redefine_extname POLICY_MAPPINGS_it BORINGSSL_ADD_USER_LABEL_AND_PREFIX(POLICY_MAPPINGS_it)
  #pragma redefine_extname POLICY_MAPPING_free BORINGSSL_ADD_USER_LABEL_AND_PREFIX(POLICY_MAPPING_free)
  #pragma redefine_extname POLICY_MAPPING_new BORINGSSL_ADD_USER_LABEL_AND_PREFIX(POLICY_MAPPING_new)
 +#pragma redefine_extname RAMA_SSL_CTX_set_extension_order BORINGSSL_ADD_USER_LABEL_AND_PREFIX(RAMA_SSL_CTX_set_extension_order)
++#pragma redefine_extname RAMA_SSL_set_extension_order BORINGSSL_ADD_USER_LABEL_AND_PREFIX(RAMA_SSL_set_extension_order)
 +#pragma redefine_extname RAMA_SSL_CTX_set_raw_cipher_list BORINGSSL_ADD_USER_LABEL_AND_PREFIX(RAMA_SSL_CTX_set_raw_cipher_list)
  #pragma redefine_extname RAND_OpenSSL BORINGSSL_ADD_USER_LABEL_AND_PREFIX(RAND_OpenSSL)
  #pragma redefine_extname RAND_SSLeay BORINGSSL_ADD_USER_LABEL_AND_PREFIX(RAND_SSLeay)
  #pragma redefine_extname RAND_add BORINGSSL_ADD_USER_LABEL_AND_PREFIX(RAND_add)
-@@ -2373,6 +2385,7 @@
+@@ -2373,6 +2386,7 @@
  #pragma redefine_extname SSL_set_compliance_policy BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_compliance_policy)
  #pragma redefine_extname SSL_set_connect_state BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_connect_state)
  #pragma redefine_extname SSL_set_custom_verify BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_custom_verify)
@@ -36,7 +37,7 @@ index 6e68c58d1..6b30e4f56 100644
  #pragma redefine_extname SSL_set_early_data_enabled BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_early_data_enabled)
  #pragma redefine_extname SSL_set_enable_ech_grease BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_enable_ech_grease)
  #pragma redefine_extname SSL_set_ex_data BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_ex_data)
-@@ -2402,6 +2415,7 @@
+@@ -2402,6 +2416,7 @@
  #pragma redefine_extname SSL_set_quic_use_legacy_codepoint BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_quic_use_legacy_codepoint)
  #pragma redefine_extname SSL_set_quiet_shutdown BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_quiet_shutdown)
  #pragma redefine_extname SSL_set_read_ahead BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_read_ahead)
@@ -44,7 +45,7 @@ index 6e68c58d1..6b30e4f56 100644
  #pragma redefine_extname SSL_set_reject_unusable_ech_config BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_reject_unusable_ech_config)
  #pragma redefine_extname SSL_set_renegotiate_mode BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_renegotiate_mode)
  #pragma redefine_extname SSL_set_resumption_across_names_enabled BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_resumption_across_names_enabled)
-@@ -4550,6 +4564,16 @@
+@@ -4550,6 +4565,16 @@
  #define ISSUING_DIST_POINT_free BORINGSSL_ADD_PREFIX(ISSUING_DIST_POINT_free)
  #define ISSUING_DIST_POINT_it BORINGSSL_ADD_PREFIX(ISSUING_DIST_POINT_it)
  #define ISSUING_DIST_POINT_new BORINGSSL_ADD_PREFIX(ISSUING_DIST_POINT_new)
@@ -61,16 +62,17 @@ index 6e68c58d1..6b30e4f56 100644
  #define MD4 BORINGSSL_ADD_PREFIX(MD4)
  #define MD4_Final BORINGSSL_ADD_PREFIX(MD4_Final)
  #define MD4_Init BORINGSSL_ADD_PREFIX(MD4_Init)
-@@ -4858,6 +4882,8 @@
+@@ -4858,6 +4883,9 @@
  #define POLICY_MAPPINGS_it BORINGSSL_ADD_PREFIX(POLICY_MAPPINGS_it)
  #define POLICY_MAPPING_free BORINGSSL_ADD_PREFIX(POLICY_MAPPING_free)
  #define POLICY_MAPPING_new BORINGSSL_ADD_PREFIX(POLICY_MAPPING_new)
 +#define RAMA_SSL_CTX_set_extension_order BORINGSSL_ADD_PREFIX(RAMA_SSL_CTX_set_extension_order)
++#define RAMA_SSL_set_extension_order BORINGSSL_ADD_PREFIX(RAMA_SSL_set_extension_order)
 +#define RAMA_SSL_CTX_set_raw_cipher_list BORINGSSL_ADD_PREFIX(RAMA_SSL_CTX_set_raw_cipher_list)
  #define RAND_OpenSSL BORINGSSL_ADD_PREFIX(RAND_OpenSSL)
  #define RAND_SSLeay BORINGSSL_ADD_PREFIX(RAND_SSLeay)
  #define RAND_add BORINGSSL_ADD_PREFIX(RAND_add)
-@@ -5510,6 +5536,7 @@
+@@ -5510,6 +5538,7 @@
  #define SSL_set_compliance_policy BORINGSSL_ADD_PREFIX(SSL_set_compliance_policy)
  #define SSL_set_connect_state BORINGSSL_ADD_PREFIX(SSL_set_connect_state)
  #define SSL_set_custom_verify BORINGSSL_ADD_PREFIX(SSL_set_custom_verify)
@@ -78,7 +80,7 @@ index 6e68c58d1..6b30e4f56 100644
  #define SSL_set_early_data_enabled BORINGSSL_ADD_PREFIX(SSL_set_early_data_enabled)
  #define SSL_set_enable_ech_grease BORINGSSL_ADD_PREFIX(SSL_set_enable_ech_grease)
  #define SSL_set_ex_data BORINGSSL_ADD_PREFIX(SSL_set_ex_data)
-@@ -5539,6 +5566,7 @@
+@@ -5539,6 +5568,7 @@
  #define SSL_set_quic_use_legacy_codepoint BORINGSSL_ADD_PREFIX(SSL_set_quic_use_legacy_codepoint)
  #define SSL_set_quiet_shutdown BORINGSSL_ADD_PREFIX(SSL_set_quiet_shutdown)
  #define SSL_set_read_ahead BORINGSSL_ADD_PREFIX(SSL_set_read_ahead)

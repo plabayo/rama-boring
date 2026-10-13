@@ -1,6 +1,9 @@
 //! Transport-independent TLS handshakes for QUIC.
 
-use super::{error::InnerError, Error, ErrorCode, Ssl, SslCipherRef, SslRef};
+use super::{
+    async_callbacks::TASK_WAKER_INDEX, error::InnerError, Error, ErrorCode, Ssl, SslCipherRef,
+    SslRef,
+};
 use crate::{cvt, error::ErrorStack, ffi};
 use foreign_types::{ForeignType, ForeignTypeRef};
 use std::{
@@ -8,6 +11,7 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     slice,
     sync::{Arc, Mutex},
+    task::{Context, Poll},
 };
 
 /// TLS encryption level, independent of QUIC packet number spaces.
@@ -113,6 +117,8 @@ pub struct QuicConnection {
     callbacks: Arc<Callbacks>,
     failed: bool,
     early_data_rejected: bool,
+    // Only `poll_handshake` installs a task waker, so synchronous use skips it.
+    task_waker: bool,
 }
 
 impl fmt::Debug for QuicConnection {
@@ -139,6 +145,7 @@ impl QuicConnection {
             callbacks,
             failed: false,
             early_data_rejected: false,
+            task_waker: false,
         })
     }
 
@@ -247,6 +254,57 @@ impl QuicConnection {
         self.check_boolean_result(ret)
     }
 
+    /// Permanently stop TLS and drop pending asynchronous callback work now.
+    ///
+    /// A QUIC transport may retain this connection while it drains packets. After
+    /// this call no callback factory, future or finish closure runs again and every
+    /// operation returns [`QuicError::InvalidState`]. Repeated calls are harmless.
+    /// This does not undo external effects or cancel independently spawned tasks.
+    pub fn abort_handshake(&mut self) {
+        self.failed = true;
+        self.task_waker = false;
+        super::async_callbacks::cancel_pending(&mut self.ssl);
+    }
+
+    /// Advance the handshake like [`Self::handshake`], registering the waker of `cx`
+    /// for asynchronous certificate selection, verification, session lookup and
+    /// private-key callbacks.
+    ///
+    /// `Pending` means such a callback is waiting: poll again once woken, without
+    /// waiting for peer input. `Ready(Ok(HandshakeStatus::WantRead))` instead waits
+    /// for peer CRYPTO data. While pending, the latest waker stays installed, so a
+    /// [`Self::handshake`] call in between resumes the same work instead of
+    /// abandoning it. The waker is released once a step no longer waits on a
+    /// callback. Cancel with [`Self::abort_handshake`] or by dropping this connection.
+    ///
+    /// A synchronous callback that requests a retry also yields `Pending`, but
+    /// nothing wakes the task for it.
+    pub fn poll_handshake(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<HandshakeStatus, QuicError>> {
+        let installed = self.task_waker
+            && self
+                .ssl
+                .ex_data(*TASK_WAKER_INDEX)
+                .and_then(Option::as_ref)
+                .is_some_and(|waker| waker.will_wake(cx.waker()));
+        if !installed && !self.failed {
+            self.ssl.set_task_waker(Some(cx.waker().clone()));
+            self.task_waker = true;
+        }
+        match self.handshake() {
+            Err(QuicError::Tls(error)) if callback_pending(error.code()) => Poll::Pending,
+            result => Poll::Ready(result),
+        }
+    }
+
+    /// Advance the handshake.
+    ///
+    /// A [`QuicError::Tls`] whose [`Error::would_block`] holds reports a callback
+    /// waiting on asynchronous work. It is not terminal: call again once that work
+    /// is ready. Asynchronous callbacks need the task waker that
+    /// [`Self::poll_handshake`] installs; without one they fail the handshake.
     pub fn handshake(&mut self) -> Result<HandshakeStatus, QuicError> {
         if self.failed {
             return Err(QuicError::InvalidState);
@@ -255,7 +313,21 @@ impl QuicConnection {
             ffi::ERR_clear_error();
         }
         let ret = unsafe { ffi::SSL_do_handshake(self.ssl.as_ptr()) };
-        self.check_result(ret)
+        let result = self.check_result(ret);
+        if self.task_waker {
+            self.release_task_waker(&result);
+        }
+        result
+    }
+
+    // Out of line so synchronous handshakes keep a single untaken branch.
+    #[cold]
+    #[inline(never)]
+    fn release_task_waker(&mut self, result: &Result<HandshakeStatus, QuicError>) {
+        if !matches!(result, Err(QuicError::Tls(error)) if callback_pending(error.code())) {
+            self.ssl.set_task_waker(None);
+            self.task_waker = false;
+        }
     }
 
     fn check_boolean_result(&mut self, ret: i32) -> Result<(), QuicError> {
@@ -294,12 +366,28 @@ impl QuicConnection {
             self.early_data_rejected = true;
             return Ok(HandshakeStatus::EarlyDataRejected);
         }
-        self.failed = true;
+        // Retry codes describe paused callback work, not a poisoned session.
+        if !callback_pending(code) {
+            self.failed = true;
+        }
         Err(QuicError::Tls(Error {
             code,
             cause: Some(InnerError::Ssl(ErrorStack::get())),
         }))
     }
+}
+
+// The retry codes of `Error::would_block`, excluding transport readiness.
+fn callback_pending(code: ErrorCode) -> bool {
+    matches!(
+        code,
+        ErrorCode::WANT_X509_LOOKUP
+            | ErrorCode::PENDING_CERTIFICATE
+            | ErrorCode::WANT_CERTIFICATE_VERIFY
+            | ErrorCode::WANT_PRIVATE_KEY_OPERATION
+            | ErrorCode::PENDING_SESSION
+            | ErrorCode::PENDING_TICKET
+    )
 }
 
 // Each trampoline catches both user panics and conversion failures before returning to C.

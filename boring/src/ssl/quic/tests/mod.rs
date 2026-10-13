@@ -8,7 +8,7 @@ use crate::{
 type RecordedSecret = (bool, EncryptionLevel, u16, Vec<u8>);
 
 #[derive(Default)]
-struct Record {
+pub(super) struct Record {
     output: Mutex<Vec<(EncryptionLevel, Vec<u8>)>>,
     secrets: Mutex<Vec<RecordedSecret>>,
     alerts: Mutex<Vec<u8>>,
@@ -68,6 +68,12 @@ impl QuicMethod for Record {
 }
 
 fn contexts() -> (SslContext, SslContext, Arc<Mutex<Option<SslSession>>>) {
+    contexts_with_order(None)
+}
+
+fn contexts_with_order(
+    order: Option<&[u16]>,
+) -> (SslContext, SslContext, Arc<Mutex<Option<SslSession>>>) {
     let mut server = SslContext::builder(SslMethod::tls()).unwrap();
     server
         .set_min_proto_version(Some(SslVersion::TLS1_3))
@@ -76,11 +82,11 @@ fn contexts() -> (SslContext, SslContext, Arc<Mutex<Option<SslSession>>>) {
         .set_max_proto_version(Some(SslVersion::TLS1_3))
         .unwrap();
     server
-        .set_certificate(&X509::from_pem(include_bytes!("../../../test/cert.pem")).unwrap())
+        .set_certificate(&X509::from_pem(include_bytes!("../../../../test/cert.pem")).unwrap())
         .unwrap();
     server
         .set_private_key(
-            &PKey::private_key_from_pem(include_bytes!("../../../test/key.pem")).unwrap(),
+            &PKey::private_key_from_pem(include_bytes!("../../../../test/key.pem")).unwrap(),
         )
         .unwrap();
     server.set_session_id_context(b"quic-test").unwrap();
@@ -94,6 +100,9 @@ fn contexts() -> (SslContext, SslContext, Arc<Mutex<Option<SslSession>>>) {
     client
         .set_max_proto_version(Some(SslVersion::TLS1_3))
         .unwrap();
+    if let Some(order) = order {
+        client.set_extension_order(order).unwrap();
+    }
     client.set_verify(SslVerifyMode::NONE);
     client.set_alpn_protos(b"\x02h3").unwrap();
     client.set_session_cache_mode(SslSessionCacheMode::CLIENT);
@@ -364,3 +373,35 @@ fn changed_early_data_context_rejects_early_data_but_resumes_tls() {
         .iter()
         .any(|(_, level, _, _)| *level == EncryptionLevel::EarlyData));
 }
+
+#[test]
+fn errors_expose_their_cause_and_connections_their_progress() {
+    use std::error::Error as _;
+    let (ctx, _, _) = contexts();
+    let mut client = connection(&ctx, false, Arc::new(Record::default()));
+    assert_eq!(
+        format!("{client:?}"),
+        "QuicConnection { finished: false, .. }"
+    );
+    // A client may receive a full certificate flight at the Handshake level.
+    assert!(client.max_handshake_flight_len(EncryptionLevel::Handshake) >= 16 * 1024);
+    assert!(client.max_handshake_flight_len(EncryptionLevel::Initial) > 1);
+
+    let tls = client
+        .provide_data(EncryptionLevel::Application, b"invalid")
+        .unwrap_err();
+    assert!(matches!(tls, QuicError::Tls(_)));
+    assert!(tls.source().is_some());
+    let callback = QuicError::Callback(ErrorStack::get());
+    assert!(callback.source().is_some());
+    assert!(callback.to_string().starts_with("QUIC callback failed"));
+    for error in [QuicError::CallbackPanicked, QuicError::InvalidState] {
+        assert!(error.source().is_none());
+        assert!(!error.to_string().is_empty());
+    }
+}
+
+mod async_handshake;
+mod extension_order;
+mod mitm;
+mod support;
