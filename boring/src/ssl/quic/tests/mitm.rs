@@ -759,12 +759,38 @@ fn expected(scenario: &Scenario) -> Expected {
     }
 }
 
+/// Whether the relay ever waits at `point` in `scenario`.
+fn reachable(point: Point, scenario: &Scenario) -> bool {
+    let origin_asks = scenario.origin != OriginAuth::None;
+    let presents = (origin_asks || scenario.ingress_auth) && scenario.client != ClientCert::None;
+    match point {
+        Point::Issuer => true,
+        Point::IssuedSigning => scenario.async_signers,
+        Point::Upstream => origin_asks,
+        Point::MappedSigning => {
+            scenario.async_signers
+                && origin_asks
+                && presents
+                && scenario.client == ClientCert::Trusted
+        }
+        Point::Policy => presents,
+    }
+}
+
 #[track_caller]
 fn check(scenario: Scenario) -> Outcome {
     let outcome = Relay::new(scenario).run();
     outcome.assert_safe(&scenario);
     let context = format!("{scenario:?} events={:?}", outcome.events);
-    if scenario.cancel_at.is_some() {
+    if let Some(point) = scenario.cancel_at {
+        assert_eq!(outcome.cancelled, reachable(point, &scenario), "{context}");
+    }
+    if outcome.cancelled {
+        // Cancellation closes every leg and nothing resumes afterwards.
+        assert!(
+            !outcome.client && !outcome.ingress && !outcome.egress && !outcome.origin,
+            "{context}"
+        );
         return outcome;
     }
     let expected = expected(&scenario);
@@ -980,8 +1006,42 @@ fn scenarios() -> impl Strategy<Value = Scenario> {
         )
 }
 
+#[test]
+fn relay_contract_holds_for_every_discrete_scenario() {
+    // Every combination of the discrete dimensions, with fragmentation varied
+    // deterministically; the property test below samples fragmentation freely.
+    const CHUNKS: [usize; 5] = [1, 7, 97, 211, 1200];
+    let mut count = 0;
+    for origin in [OriginAuth::None, OriginAuth::Optional, OriginAuth::Required] {
+        for client in [ClientCert::None, ClientCert::Trusted, ClientCert::Untrusted] {
+            for ingress_auth in [false, true] {
+                for mapped_untrusted in [false, true] {
+                    for async_signers in [false, true] {
+                        for legacy in [(false, false), (false, true), (true, false), (true, true)] {
+                            for cancel_at in std::iter::once(None).chain(POINTS.map(Some)) {
+                                check(Scenario {
+                                    origin,
+                                    client,
+                                    ingress_auth,
+                                    mapped_untrusted,
+                                    async_signers,
+                                    legacy,
+                                    chunk: CHUNKS[count % CHUNKS.len()],
+                                    cancel_at,
+                                });
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(count, 3 * 3 * 2 * 2 * 2 * 4 * 6);
+}
+
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(160))]
+    #![proptest_config(ProptestConfig::with_cases(64))]
 
     #[test]
     fn relay_contract_holds_for_every_scenario(scenario in scenarios()) {

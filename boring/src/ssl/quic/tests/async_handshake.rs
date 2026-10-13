@@ -416,8 +416,9 @@ fn pending_poll_keeps_one_waker_and_releases_it_when_ready() {
     let waker = count.waker();
     let mut cx = Context::from_waker(&waker);
     assert!(server.conn.poll_handshake(&mut cx).is_pending());
-    // Installed on the connection and registered by the pending future.
-    assert_eq!(count.live(), 2);
+    // Installed on the connection and registered by the pending future, besides
+    // the test's own handle.
+    assert_eq!(count.live(), 3);
     let clones = count.clones.load(std::sync::atomic::Ordering::SeqCst);
     assert!(server.conn.poll_handshake(&mut cx).is_pending());
     // The installed waker is reused: only the callback's transient clone and the
@@ -426,7 +427,7 @@ fn pending_poll_keeps_one_waker_and_releases_it_when_ready() {
         count.clones.load(std::sync::atomic::Ordering::SeqCst) - clones,
         2
     );
-    assert_eq!(count.live(), 2);
+    assert_eq!(count.live(), 3);
 
     let other = CloneCount::new();
     let other_waker = other.waker();
@@ -434,8 +435,8 @@ fn pending_poll_keeps_one_waker_and_releases_it_when_ready() {
         .conn
         .poll_handshake(&mut Context::from_waker(&other_waker))
         .is_pending());
-    assert_eq!(count.live(), 0, "a replaced waker must be released");
-    assert_eq!(other.live(), 2);
+    assert_eq!(count.live(), 1, "a replaced waker must be released");
+    assert_eq!(other.live(), 3);
 
     gate.open();
     assert_eq!(other.wakes.load(std::sync::atomic::Ordering::SeqCst), 1);
@@ -445,10 +446,10 @@ fn pending_poll_keeps_one_waker_and_releases_it_when_ready() {
             .poll_handshake(&mut Context::from_waker(&other_waker)),
         Poll::Ready(Ok(HandshakeStatus::WantRead))
     ));
-    assert_eq!(other.live(), 0, "a finished step must release its waker");
+    assert_eq!(other.live(), 1, "a finished step must release its waker");
     settle(&mut client, &mut server, 9);
     assert!(client.is_complete() && server.is_complete());
-    assert_eq!(other.live(), 0);
+    assert_eq!(other.live(), 1);
 }
 
 #[test]
@@ -463,9 +464,9 @@ fn abort_releases_the_installed_waker() {
         .is_pending());
     server.abort();
     // Only the gate's own registration remains; it holds no TLS state.
-    assert_eq!(count.live(), 1);
+    assert_eq!(count.live(), 2);
     gate.open();
-    assert_eq!(count.live(), 0);
+    assert_eq!(count.live(), 1);
 }
 
 #[test]
@@ -700,4 +701,127 @@ fn early_selection_finish_can_route_to_another_context() {
     settle(&mut client, &mut server, 1200);
     assert!(client.is_complete() && server.is_complete());
     assert_eq!(gate.finished(), 1);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Resolution {
+    Open,
+    Fail,
+    AbortBefore,
+    AbortAfterResult,
+}
+
+#[test]
+fn every_schedule_at_every_wait_keeps_the_contract() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let mut schedules = 0;
+    for wait in WAITS {
+        for spurious in 0..3 {
+            for sync_step in [false, true] {
+                for swap_waker in [false, true] {
+                    for resolution in [
+                        Resolution::Open,
+                        Resolution::Fail,
+                        Resolution::AbortBefore,
+                        Resolution::AbortAfterResult,
+                    ] {
+                        for resume_with_poll in [false, true] {
+                            let case = format!(
+                                "{wait:?} spurious={spurious} sync={sync_step} swap={swap_waker} \
+                                 {resolution:?} poll={resume_with_poll}"
+                            );
+                            let gate = Gate::new();
+                            let (mut client, mut server) = handshake_waiting_at(wait, &gate);
+                            let (waiting, _) = waiting_side(wait, &mut client, &mut server);
+                            for _ in 0..spurious {
+                                waiting.poll();
+                            }
+                            if sync_step {
+                                match waiting.conn.handshake() {
+                                    Err(QuicError::Tls(error)) => {
+                                        assert!(error.would_block(), "{case}")
+                                    }
+                                    other => panic!("{case}: {other:?}"),
+                                }
+                            }
+                            let swapped = CloneCount::new();
+                            if swap_waker {
+                                let waker = swapped.waker();
+                                assert!(
+                                    waiting
+                                        .conn
+                                        .poll_handshake(&mut Context::from_waker(&waker))
+                                        .is_pending(),
+                                    "{case}"
+                                );
+                            }
+                            assert_eq!((gate.created(), gate.dropped()), (1, 0), "{case}");
+                            let own_wakes = waiting.wake.get();
+
+                            match resolution {
+                                Resolution::Open | Resolution::AbortAfterResult => gate.open(),
+                                Resolution::Fail => gate.fail(),
+                                Resolution::AbortBefore => {}
+                            }
+                            if resolution != Resolution::AbortBefore {
+                                // The most recent waker, and only it, is woken.
+                                if swap_waker {
+                                    assert_eq!(swapped.wakes.load(SeqCst), 1, "{case}");
+                                    assert_eq!(waiting.wake.get(), own_wakes, "{case}");
+                                } else {
+                                    assert_eq!(waiting.wake.get(), own_wakes + 1, "{case}");
+                                }
+                            }
+                            if matches!(
+                                resolution,
+                                Resolution::AbortBefore | Resolution::AbortAfterResult
+                            ) {
+                                waiting.abort();
+                                assert_poisoned(waiting);
+                                assert_eq!(gate.finished(), 0, "{case}");
+                                assert_eq!(gate.dropped(), 1, "{case}");
+                                drop((client, server));
+                                gate.assert_released();
+                                // The policy itself may still hold its registration;
+                                // TLS holds none once it resolves.
+                                gate.open();
+                                assert_eq!(swapped.live(), 0, "{case}");
+                                schedules += 1;
+                                continue;
+                            }
+
+                            if resume_with_poll {
+                                waiting.poll();
+                            } else {
+                                match waiting.conn.handshake() {
+                                    Ok(_) => waiting.pending = false,
+                                    Err(error) => waiting.error = Some(error),
+                                }
+                            }
+                            if resolution == Resolution::Fail {
+                                assert!(
+                                    matches!(waiting.error, Some(QuicError::Tls(ref e)) if !e.would_block()),
+                                    "{case}: {:?}",
+                                    waiting.error
+                                );
+                                assert_eq!(gate.finished(), 0, "{case}");
+                                assert_poisoned(waiting);
+                            } else {
+                                assert_eq!(gate.finished(), 1, "{case}");
+                                assert!(waiting.has_output(), "{case}");
+                                settle(&mut client, &mut server, 5);
+                                assert!(client.is_complete() && server.is_complete(), "{case}");
+                            }
+                            drop((client, server));
+                            gate.assert_released();
+                            assert_eq!(gate.created(), 1, "{case}");
+                            assert_eq!(swapped.live(), 0, "{case}: waker leaked");
+                            schedules += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert_eq!(schedules, 7 * 3 * 2 * 2 * 4 * 2);
 }

@@ -326,3 +326,54 @@ proptest! {
         prop_assert_eq!(client.conn.ssl().selected_alpn_protocol(), Some(&b"h3"[..]));
     }
 }
+
+#[test]
+fn structured_orders_cover_every_position_and_noise_placement() {
+    // Systematic counterpart of the property test: every extension at the front
+    // and at the back, every adjacent swap, duplicates and noise at every position,
+    // on both transport parameter codepoints, with and without permutation.
+    const NOISE: [u16; 4] = [0x0a0a, 0xfafa, 0xfeed, PRE_SHARED_KEY];
+    let (client_ctx, _) = &*CONTEXTS;
+    let mut cases = 0;
+    for legacy in [false, true] {
+        let canonical = emitted(client_ctx, legacy, None).1;
+        let n = canonical.len();
+        let mut requests: Vec<Vec<u16>> = vec![
+            Vec::new(),
+            canonical.clone(),
+            canonical.iter().rev().copied().collect(),
+        ];
+        for i in 0..n {
+            requests.push(vec![canonical[i]]);
+            let mut last: Vec<_> = canonical.clone();
+            let id = last.remove(i);
+            last.push(id);
+            requests.push(last);
+            requests.push(vec![canonical[i], canonical[i], canonical[(i + 1) % n]]);
+        }
+        for i in 0..n - 1 {
+            let mut swapped = canonical.clone();
+            swapped.swap(i, i + 1);
+            requests.push(swapped);
+        }
+        for noise in NOISE {
+            for at in 0..=n {
+                let mut noisy = canonical.iter().rev().copied().collect::<Vec<_>>();
+                noisy.insert(at, noise);
+                requests.push(noisy);
+            }
+        }
+        for requested in &requests {
+            for permute in [false, true] {
+                let (_, order) = emitted_with(client_ctx, legacy, permute, Some(requested));
+                assert_eq!(
+                    order,
+                    expected(requested, &canonical),
+                    "legacy={legacy} permute={permute} requested={requested:?}"
+                );
+                cases += 1;
+            }
+        }
+    }
+    assert!(cases > 200, "{cases}");
+}

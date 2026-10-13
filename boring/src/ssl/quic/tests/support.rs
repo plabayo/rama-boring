@@ -73,7 +73,9 @@ impl CloneCount {
         }))
     }
 
+    /// A new handle; counted like a clone so `live` includes the caller's own.
     pub(super) fn waker(&'static self) -> Waker {
+        self.clones.fetch_add(1, SeqCst);
         // SAFETY: the vtable only ever reads a leaked, immortal `CloneCount`.
         unsafe {
             Waker::from_raw(RawWaker::new(
@@ -83,7 +85,7 @@ impl CloneCount {
         }
     }
 
-    /// Clones minus drops: wakers the TLS stack or a future still retains.
+    /// Handles still alive, including any the test itself holds.
     pub(super) fn live(&self) -> usize {
         self.clones.load(SeqCst) - self.drops.load(SeqCst)
     }
