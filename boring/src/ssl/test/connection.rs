@@ -520,3 +520,190 @@ fn negotiated_state_getters() {
         [SslSignatureAlgorithm::ECDSA_SECP256R1_SHA256]
     );
 }
+
+/// Extension IDs of a handshake message as observed.
+fn message_extension_ids(message: &[u8]) -> Vec<u16> {
+    let mut fields = match message[0] {
+        // ServerHello: version, random, session id, cipher and compression.
+        2 => {
+            let session_id = usize::from(message[4 + 2 + 32]);
+            &message[4 + 2 + 32 + 1 + session_id + 2 + 1 + 2..]
+        }
+        // EncryptedExtensions: just the extensions.
+        8 => &message[4 + 2..],
+        other => panic!("unexpected handshake message {other}"),
+    };
+    let mut ids = Vec::new();
+    while !fields.is_empty() {
+        ids.push(u16::from_be_bytes([fields[0], fields[1]]));
+        let len = usize::from(u16::from_be_bytes([fields[2], fields[3]]));
+        fields = &fields[4 + len..];
+    }
+    ids
+}
+
+/// The server's ServerHello and EncryptedExtensions extension orders, with the
+/// order set from the server's early ClientHello callback, as a relay does.
+fn server_orders(order: Option<Vec<u16>>, tls12: bool, alpn: bool) -> (Vec<u16>, Vec<u16>) {
+    let seen = Seen::default();
+    let mut client = if tls12 {
+        self::tls12(client_context())
+    } else {
+        client_context()
+    };
+    if alpn {
+        client.set_alpn_protos(b"\x02h2").unwrap();
+    }
+    let mut client = Ssl::new(&client.build()).unwrap();
+    client.set_hostname("order.test").unwrap();
+    client.set_msg_callback(observe(&seen));
+    let mut server = server_context();
+    server.set_alpn_select_callback(|_, protocols| {
+        crate::ssl::select_next_proto(b"\x02h2", protocols).ok_or(crate::ssl::AlpnError::NOACK)
+    });
+    server.set_servername_callback(|_, _| Ok(()));
+    server.set_select_certificate_callback(move |mut hello| {
+        if let Some(order) = &order {
+            hello.ssl_mut().set_server_extension_order(order).unwrap();
+        }
+        Ok(())
+    });
+    let (client, server) = handshake(client, Ssl::new(&server.build()).unwrap());
+    client.done();
+    server.done();
+    let seen = seen.lock().unwrap();
+    let ids = |handshake_type: u8| {
+        seen.iter()
+            .find(|(written, _, ty, _)| !written && *ty == Some(handshake_type))
+            .map(|(.., bytes)| message_extension_ids(bytes))
+            .unwrap_or_default()
+    };
+    (ids(2), ids(8))
+}
+
+const SERVER_NAME: u16 = 0;
+const ALPN: u16 = 16;
+const SUPPORTED_VERSIONS: u16 = 43;
+const KEY_SHARE: u16 = 51;
+const RENEGOTIATE: u16 = 0xff01;
+
+#[test]
+fn server_extension_order_applies_to_tls13_server_hello_and_encrypted_extensions() {
+    let (hello, encrypted) = server_orders(None, false, true);
+    assert_eq!(hello, [KEY_SHARE, SUPPORTED_VERSIONS], "native");
+    assert_eq!(encrypted, [SERVER_NAME, ALPN], "native");
+
+    let (hello, encrypted) = server_orders(
+        Some(vec![SUPPORTED_VERSIONS, ALPN, KEY_SHARE, SERVER_NAME]),
+        false,
+        true,
+    );
+    assert_eq!(hello, [SUPPORTED_VERSIONS, KEY_SHARE]);
+    assert_eq!(encrypted, [ALPN, SERVER_NAME]);
+
+    // Unlisted extensions keep their native order after the listed ones.
+    let (hello, encrypted) = server_orders(Some(vec![ALPN]), false, true);
+    assert_eq!(hello, [KEY_SHARE, SUPPORTED_VERSIONS]);
+    assert_eq!(encrypted, [ALPN, SERVER_NAME]);
+}
+
+#[test]
+fn server_extension_order_applies_to_tls12_server_hello() {
+    let (native, _) = server_orders(None, true, true);
+    assert!(native.len() > 2, "{native:?}");
+    let (ordered, _) = server_orders(Some(vec![ALPN, RENEGOTIATE]), true, true);
+    assert_eq!(ordered[..2], [ALPN, RENEGOTIATE]);
+    // Same set, only reordered.
+    let (mut sorted_native, mut sorted_ordered) = (native.clone(), ordered.clone());
+    sorted_native.sort_unstable();
+    sorted_ordered.sort_unstable();
+    assert_eq!(sorted_native, sorted_ordered);
+    let rest: Vec<_> = native
+        .iter()
+        .copied()
+        .filter(|id| ![ALPN, RENEGOTIATE].contains(id))
+        .collect();
+    assert_eq!(ordered[2..], rest[..], "the rest keeps native order");
+}
+
+#[test]
+fn server_extension_order_never_answers_unoffered_extensions() {
+    // The order lists ALPN, but this client offered none.
+    let (_, encrypted) = server_orders(Some(vec![ALPN, SERVER_NAME]), false, false);
+    assert_eq!(encrypted, [SERVER_NAME]);
+
+    let (connected, _) = handshake(
+        Ssl::new(&client_context().build()).unwrap(),
+        Ssl::new(&server_context().build()).unwrap(),
+    );
+    let mut connected = connected.done();
+    assert!(connected
+        .ssl_mut()
+        .set_server_extension_order(&[ALPN])
+        .is_err());
+    let mut ssl = Ssl::new(&server_context().build()).unwrap();
+    assert!(ssl.set_server_extension_order(&[ALPN; 257]).is_err());
+}
+
+/// A real TLS 1.2 ClientHello with one extension removed, as a record.
+fn client_hello_record_without(extension: u16) -> Vec<u8> {
+    let hello = Arc::new(Mutex::new(Vec::new()));
+    let sink = hello.clone();
+    let mut client = Ssl::new(&tls12(client_context()).build()).unwrap();
+    client.set_msg_callback(move |_, message| {
+        if message.is_written() && message.handshake_type() == Some(1) {
+            *sink.lock().unwrap() = message.bytes().to_vec();
+        }
+    });
+    let (a, _b) = super::memory::ends();
+    let _ = client.connect(a);
+    let message = hello.lock().unwrap().clone();
+    // Rebuild the body without the extension.
+    let body = &message[4..];
+    let session_id = usize::from(body[2 + 32]);
+    let mut at = 2 + 32 + 1 + session_id;
+    at += 2 + usize::from(u16::from_be_bytes([body[at], body[at + 1]]));
+    at += 1 + usize::from(body[at]);
+    let (head, mut fields) = (&body[..at], &body[at + 2..]);
+    let mut extensions = Vec::new();
+    while !fields.is_empty() {
+        let id = u16::from_be_bytes([fields[0], fields[1]]);
+        let len = usize::from(u16::from_be_bytes([fields[2], fields[3]]));
+        if id != extension {
+            extensions.extend_from_slice(&fields[..4 + len]);
+        }
+        fields = &fields[4 + len..];
+    }
+    let mut body = head.to_vec();
+    body.extend_from_slice(&u16::try_from(extensions.len()).unwrap().to_be_bytes());
+    body.extend_from_slice(&extensions);
+    let mut record = vec![0x16, 0x03, 0x01];
+    record.extend_from_slice(&u16::try_from(4 + body.len()).unwrap().to_be_bytes());
+    record.push(1);
+    record.extend_from_slice(&u32::try_from(body.len()).unwrap().to_be_bytes()[1..]);
+    record.extend_from_slice(&body);
+    record
+}
+
+#[test]
+fn server_extension_order_never_answers_extensions_the_client_omitted() {
+    // BoringSSL's TLS 1.2 ec_point_formats writer does not check the client
+    // offered it: only the received-extension check keeps it out.
+    const EC_POINT_FORMATS: u16 = 11;
+    let record = client_hello_record_without(EC_POINT_FORMATS);
+    for order in [None, Some(vec![EC_POINT_FORMATS, ALPN])] {
+        let (client_end, server_end) = super::memory::ends();
+        let mut ssl = Ssl::new(&tls12(server_context()).build()).unwrap();
+        if let Some(order) = &order {
+            ssl.set_server_extension_order(order).unwrap();
+        }
+        server_end.rx.lock().unwrap().extend(record.iter().copied());
+        let _ = ssl.accept(server_end);
+        let response: Vec<u8> = client_end.rx.lock().unwrap().iter().copied().collect();
+        assert_eq!(response[0], 0x16, "a handshake record answers: {order:?}");
+        let server_hello = &response[5..];
+        let len = usize::from(server_hello[3]) | usize::from(server_hello[2]) << 8;
+        let ids = message_extension_ids(&server_hello[..4 + len]);
+        assert!(!ids.contains(&EC_POINT_FORMATS), "{order:?}: {ids:?}");
+    }
+}

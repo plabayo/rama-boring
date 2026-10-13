@@ -451,6 +451,25 @@ impl SslRef {
         }
     }
 
+    /// Orders this server's response extensions within its ServerHello and
+    /// EncryptedExtensions: listed extensions first, in order, then the rest
+    /// natively. A relay can mirror the order its origin used. Only what the
+    /// server answers is ordered; extensions the client did not send are never
+    /// added. It takes effect when set before the ServerHello is written, for
+    /// example from the early ClientHello callback. Fails once the handshake
+    /// completed or for more than 256 IDs.
+    #[corresponds(RAMA_SSL_set_server_extension_order)]
+    pub fn set_server_extension_order(&mut self, ids: &[u16]) -> Result<(), ErrorStack> {
+        unsafe {
+            cvt(ffi::RAMA_SSL_set_server_extension_order(
+                self.as_ptr(),
+                ids.as_ptr(),
+                ids.len(),
+            ))
+            .map(|_| ())
+        }
+    }
+
     /// Sets this server's TLS 1.3 cipher preference: the first listed cipher
     /// the client offered is selected, otherwise the native choice applies. A
     /// relay can pin the cipher its other leg negotiated. An empty list restores
