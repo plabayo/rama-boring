@@ -573,6 +573,7 @@ fn reverification_on_resumption_is_opt_in() {
     }
 }
 
+mod adversarial;
 mod async_handshake;
 mod extension_order;
 mod mitm;

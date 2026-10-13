@@ -1,5 +1,5 @@
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 3b48c2a..2c36822 100644
+index 3b48c2a..fac719e 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
 @@ -1739,8 +1739,17 @@ OPENSSL_EXPORT int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx,
@@ -49,8 +49,8 @@ index 3b48c2a..2c36822 100644
 -// SSL_set_permute_extensions configures whether sockets on `ssl` should
 +// RAMA_SSL_CTX_set_extension_order sets the default ClientHello extension
 +// order of connections on |ctx|, as |RAMA_SSL_set_extension_order| does for
-+// one connection; extensions it does not list follow the context's
-+// permutation setting. It returns one on success and zero on error.
++// one connection, except that extensions it does not list follow in a random
++// order. It returns one on success and zero on error.
 +OPENSSL_EXPORT int RAMA_SSL_CTX_set_extension_order(SSL_CTX *ctx, const uint16_t *ids, size_t num);
 +
 +// RAMA_SSL_set_raw_cipher_list sets the cipher suite values this |ssl| offers,

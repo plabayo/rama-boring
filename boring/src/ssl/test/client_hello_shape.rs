@@ -755,3 +755,291 @@ fn shape_bodies_replace_and_are_bounded() {
     let too_large = ClientHelloShape::new().with_extension_body(id, vec![0; 0x1_0000]);
     assert!(ssl.set_client_hello_shape(&too_large).is_err());
 }
+
+#[test]
+fn a_rejected_shape_changes_nothing() {
+    let grease = ExtensionType::from(0x0a0a);
+    let mut ssl = client(|_| {});
+    ssl.set_raw_key_shares(&[X25519, P256]).unwrap();
+    ssl.set_extension_order(&[0x0a0a, SUPPORTED_GROUPS])
+        .unwrap();
+    let applied = ClientHelloShape::new()
+        .with_grease_values(GreaseValues::Pinned)
+        .with_padding(Padding::Off)
+        .with_extension_body(grease, [1]);
+    ssl.set_client_hello_shape(&applied).unwrap();
+    // A valid body before an invalid one: neither, nor anything else, applies.
+    let rejected = ClientHelloShape::new()
+        .with_padding(Padding::ToLength(700))
+        .with_extension_body(grease, [2, 3])
+        .with_extension_body(ExtensionType::SERVER_NAME, [0]);
+    assert!(ssl.set_client_hello_shape(&rejected).is_err());
+    let (hellos, client) = hellos_of(ssl, Ssl::new(&server()).unwrap());
+    client.done();
+    let hello = &hellos[0];
+    assert_eq!(hello.ids()[0], 0x0a0a, "values stay pinned");
+    assert_eq!(hello.body(0x0a0a), Some(&[1][..]));
+    assert!(hello.body(PADDING).is_none(), "padding stays off");
+}
+
+#[test]
+fn a_later_shape_replaces_the_earlier_one_as_a_whole() {
+    let hello = |shapes: &[ClientHelloShape]| {
+        let mut ssl = client(|ctx| ctx.set_grease_enabled(true));
+        ssl.set_raw_key_shares(&[X25519, P256]).unwrap();
+        ssl.set_extension_order(&[0x0a0a, SUPPORTED_GROUPS])
+            .unwrap();
+        for shape in shapes {
+            ssl.set_client_hello_shape(shape).unwrap();
+        }
+        let (hellos, client) = hellos_of(ssl, Ssl::new(&server()).unwrap());
+        client.done();
+        hellos[0].clone()
+    };
+    let first = ClientHelloShape::new()
+        .with_grease_lists(GreaseLists::empty())
+        .with_padding(Padding::Off)
+        .with_extension_body(ExtensionType::from(0x0a0a), [1, 2]);
+    let shaped = hello(std::slice::from_ref(&first));
+    assert_eq!(shaped.body(shaped.ids()[0]), Some(&[1, 2][..]));
+    assert!(!is_grease(shaped.groups()[0]), "no native GREASE");
+    // A default shape restores every default, including the context's GREASE.
+    let reset = hello(&[first, ClientHelloShape::new()]);
+    assert_eq!(reset.body(reset.ids()[0]), Some(&[][..]));
+    assert!(is_grease(reset.groups()[0]), "context GREASE is back");
+    assert_eq!(reset.len, 512, "padding is native again");
+}
+
+#[test]
+fn key_shares_without_a_supported_group_request_a_retry() {
+    const UNKNOWN: u16 = 0xfefe;
+    for policy in [
+        UnknownValues::Drop,
+        UnknownValues::Forbid,
+        UnknownValues::Preserve,
+    ] {
+        for shares in [
+            &[][..],
+            &[UNKNOWN],
+            &[FFDHE2048],
+            &[0x0a0a],
+            &[UNKNOWN, 0x0a0a],
+        ] {
+            let mut ssl = client(|_| {});
+            ssl.set_client_hello_shape(&ClientHelloShape::new().with_unknown_values(policy))
+                .unwrap();
+            ssl.set_raw_supported_groups(&[X25519, P256]).unwrap();
+            ssl.set_raw_key_shares(shares).unwrap();
+            let (hellos, client) = hellos_of(ssl, Ssl::new(&server()).unwrap());
+            let client = client.done();
+            let what = format!("{policy:?} {shares:x?}");
+            // Unknown key shares are dropped whatever the policy: what is left
+            // is GREASE at most, so the server asks for a real one.
+            assert!(client.ssl().used_hello_retry_request(), "{what}");
+            let sent = hellos[0].key_shares();
+            assert!(
+                sent.iter().all(|group| is_grease(*group)),
+                "{what}: {sent:x?}"
+            );
+            assert_eq!(sent.len(), shares.iter().filter(|g| is_grease(**g)).count());
+            assert_eq!(hellos[1].key_shares().len(), 1, "{what}");
+        }
+        // A supported share next to an unknown one: no retry needed.
+        let mut ssl = client(|_| {});
+        ssl.set_client_hello_shape(&ClientHelloShape::new().with_unknown_values(policy))
+            .unwrap();
+        ssl.set_raw_supported_groups(&[X25519, P256]).unwrap();
+        ssl.set_raw_key_shares(&[UNKNOWN, X25519]).unwrap();
+        let (hellos, client) = hellos_of(ssl, Ssl::new(&server()).unwrap());
+        assert!(!client.done().ssl().used_hello_retry_request());
+        assert_eq!(hellos[0].key_shares(), [X25519], "{policy:?}");
+    }
+}
+
+#[test]
+fn extension_orders_have_at_most_sixteen_grease_slots() {
+    let all: Vec<u16> = (0..16)
+        .map(|n| (n << 12) | 0x0a00 | (n << 4) | 0x0a)
+        .collect();
+    for values in [
+        GreaseValues::Fresh,
+        GreaseValues::Pinned,
+        GreaseValues::Seeded(9),
+    ] {
+        for listed in [all.clone(), vec![0x0a0a; 16]] {
+            let mut ssl = client(|_| {});
+            ssl.set_raw_key_shares(&[X25519]).unwrap();
+            ssl.set_extension_order(&listed).unwrap();
+            ssl.set_client_hello_shape(&ClientHelloShape::new().with_grease_values(values))
+                .unwrap();
+            let (hellos, client) = hellos_of(ssl, Ssl::new(&server()).unwrap());
+            let what = format!("{values:?} {:x?}", &listed[..2]);
+            if matches!(values, GreaseValues::Pinned) && listed[0] == listed[1] {
+                // Pinned repeats cannot be made distinct.
+                client.panicked_or_failed_with("listed twice");
+                continue;
+            }
+            client.done();
+            let mut grease: Vec<u16> = hellos[0]
+                .ids()
+                .into_iter()
+                .filter(|id| is_grease(*id))
+                .collect();
+            assert_eq!(grease.len(), 16, "{what}");
+            if matches!(values, GreaseValues::Pinned) {
+                assert_eq!(grease, all, "{what}");
+            }
+            grease.sort_unstable();
+            grease.dedup();
+            assert_eq!(grease.len(), 16, "{what}: distinct values");
+        }
+    }
+    // A 17th slot cannot have a distinct value: rejected up front.
+    let mut seventeen = all.clone();
+    seventeen.push(0x0a0a);
+    let mut ssl = client(|_| {});
+    assert!(ssl.set_extension_order(&seventeen).is_err());
+    let mut ctx = client_context();
+    assert!(ctx.set_extension_order(&seventeen).is_err());
+    assert!(ctx.set_extension_order(&all).is_ok());
+}
+
+/// Every list set explicitly, without GREASE codepoints of its own.
+fn exact_lists(ssl: &mut Ssl) {
+    ssl.set_raw_cipher_list(&[0x1301, 0x1302, 0xc02b]).unwrap();
+    ssl.set_raw_supported_groups(&[X25519, P256]).unwrap();
+    ssl.set_raw_key_shares(&[X25519]).unwrap();
+    ssl.set_raw_supported_versions(&[0x0304, 0x0303]).unwrap();
+    ssl.set_raw_signature_algorithms(&[0x0403, 0x0804]).unwrap();
+    ssl.set_extension_order(&[KEY_SHARE, SUPPORTED_VERSIONS, SUPPORTED_GROUPS])
+        .unwrap();
+}
+
+#[test]
+fn set_lists_are_exact_whatever_grease_is_enabled() {
+    for (context, lists) in [
+        (true, None),
+        (false, Some(GreaseLists::all())),
+        (true, Some(GreaseLists::all())),
+    ] {
+        let enable = |ctx: &mut SslContextBuilder| {
+            ctx.set_grease_enabled(context);
+            ctx.set_grease_sigalgs_enabled(context);
+        };
+        let shaped = |ssl: &mut Ssl| {
+            if let Some(lists) = lists {
+                ssl.set_client_hello_shape(&ClientHelloShape::new().with_grease_lists(lists))
+                    .unwrap();
+            }
+        };
+        let mut exact = client(enable);
+        exact_lists(&mut exact);
+        shaped(&mut exact);
+        let (hellos, client_side) = hellos_of(exact, Ssl::new(&server()).unwrap());
+        client_side.done();
+        let what = format!("{context} {lists:?}");
+        assert_eq!(hellos[0].grease(), [], "{what}: set lists get no GREASE");
+        assert_eq!(hellos[0].ciphers, [0x1301, 0x1302, 0xc02b], "{what}");
+
+        // The same switches still GREASE every native list.
+        let mut native = client(enable);
+        shaped(&mut native);
+        let (hellos, client_side) = hellos_of(native, Ssl::new(&server()).unwrap());
+        client_side.done();
+        let hello = &hellos[0];
+        assert!(is_grease(hello.ciphers[0]), "{what}");
+        assert!(is_grease(hello.groups()[0]), "{what}");
+        assert!(is_grease(hello.key_shares()[0]), "{what}");
+        assert!(is_grease(hello.versions()[0]), "{what}");
+        assert!(is_grease(hello.sigalgs()[0]), "{what}");
+        assert_eq!(
+            hello.ids().iter().filter(|id| is_grease(**id)).count(),
+            2,
+            "{what}"
+        );
+    }
+}
+
+#[test]
+fn context_extension_orders_are_exact() {
+    let hello = |order: &[u16]| {
+        let ssl = client(|ctx| {
+            ctx.set_grease_enabled(true);
+            ctx.set_extension_order(order).unwrap();
+        });
+        let (hellos, client) = hellos_of(ssl, Ssl::new(&server()).unwrap());
+        client.done();
+        hellos[0].ids()
+    };
+    // GREASE extensions appear at the order's slots only.
+    let ids = hello(&[0x0a0a, SUPPORTED_GROUPS, KEY_SHARE, 0x0a0a]);
+    assert!(is_grease(ids[0]) && is_grease(ids[3]), "{ids:x?}");
+    assert_eq!(ids[1..3], [SUPPORTED_GROUPS, KEY_SHARE]);
+    assert_eq!(ids.iter().filter(|id| is_grease(**id)).count(), 2);
+    // An order without slots has no GREASE extensions; unknown IDs are dropped.
+    let ids = hello(&[SUPPORTED_GROUPS, ENCRYPT_THEN_MAC, KEY_SHARE]);
+    assert_eq!(ids[..2], [SUPPORTED_GROUPS, KEY_SHARE]);
+    assert!(
+        !ids.iter()
+            .any(|id| is_grease(*id) || *id == ENCRYPT_THEN_MAC),
+        "{ids:x?}"
+    );
+    // A connection order replaces the context's; an empty one is native.
+    let mut ssl = client(|ctx| {
+        ctx.set_grease_enabled(true);
+        ctx.set_extension_order(&[SUPPORTED_GROUPS, KEY_SHARE])
+            .unwrap();
+    });
+    ssl.set_extension_order(&[]).unwrap();
+    let (hellos, client) = hellos_of(ssl, Ssl::new(&server()).unwrap());
+    client.done();
+    let ids = hellos[0].ids();
+    // Native GREASE: first and last (before padding, if any).
+    assert!(is_grease(ids[0]), "{ids:x?}");
+    assert_eq!(
+        ids.iter().filter(|id| is_grease(**id)).count(),
+        2,
+        "{ids:x?}"
+    );
+}
+
+/// "Compresses" by copying.
+struct Copying;
+
+impl crate::ssl::CertificateCompressor for Copying {
+    const ALGORITHM: crate::ssl::CertificateCompressionAlgorithm =
+        crate::ssl::CertificateCompressionAlgorithm(0xff01);
+    const CAN_COMPRESS: bool = true;
+    const CAN_DECOMPRESS: bool = true;
+
+    fn compress<W: std::io::Write>(&self, input: &[u8], output: &mut W) -> std::io::Result<()> {
+        output.write_all(input)
+    }
+    fn decompress<W: std::io::Write>(&self, input: &[u8], output: &mut W) -> std::io::Result<()> {
+        output.write_all(input)
+    }
+}
+
+#[test]
+fn wire_settings_are_fixed_once_the_client_hello_is_written() {
+    let algorithms = [<Copying as crate::ssl::CertificateCompressor>::ALGORITHM];
+    let mut ctx = client_context();
+    ctx.add_certificate_compression_algorithm(Copying).unwrap();
+    let mut ssl = Ssl::new(&ctx.build()).unwrap();
+    assert!(ssl.set_raw_cipher_list(&[0x1301]).is_ok());
+    assert!(ssl
+        .set_certificate_compression_algorithms(&algorithms)
+        .is_ok());
+    let (a, _b) = super::memory::ends();
+    let Err(crate::ssl::HandshakeError::WouldBlock(mut mid)) = ssl.connect(a) else {
+        panic!("the client waits for the server");
+    };
+    let ssl = mid.ssl_mut();
+    assert!(ssl.set_raw_cipher_list(&[0x1302]).is_err());
+    assert!(ssl.set_certificate_compression_algorithms(&[]).is_err());
+    assert!(ssl.set_raw_supported_groups(&[X25519]).is_err());
+    assert!(ssl.set_extension_order(&[]).is_err());
+    assert!(ssl
+        .set_client_hello_shape(&ClientHelloShape::new())
+        .is_err());
+}

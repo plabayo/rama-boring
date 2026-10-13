@@ -2139,8 +2139,8 @@ impl SslContextBuilder {
     /// Sets the default ClientHello extension order of this context's
     /// connections, with the semantics of [`SslRef::set_extension_order`]: the
     /// order is exact, GREASE codepoints are its only GREASE extensions, and
-    /// unknown IDs are dropped. Extensions it does not list follow
-    /// [`Self::set_permute_extensions`].
+    /// unknown IDs are dropped. Extensions it does not list follow in a random
+    /// order.
     ///
     /// Fails for more than 256 IDs or more than 16 GREASE codepoints.
     #[corresponds(RAMA_SSL_CTX_set_extension_order)]

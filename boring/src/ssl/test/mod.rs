@@ -570,14 +570,27 @@ fn short_extension_order_with_suppressed_alps_is_safe_and_ordered() {
     assert!(!order.contains(&17_613));
 }
 
-fn expected_emitted_prefix(requested: &[u16], emitted: &[u16]) -> Vec<u16> {
+/// The emitted order a requested order must start with: an order is exact, so
+/// each GREASE codepoint is a GREASE extension (`None`, its value is fresh) at
+/// its position, and known IDs follow once each.
+fn expected_emitted_prefix(requested: &[u16], emitted: &[u16]) -> Vec<Option<u16>> {
     let mut prefix = Vec::new();
     for id in requested {
-        if emitted.contains(id) && !prefix.contains(id) {
-            prefix.push(*id);
+        if wire::is_grease(*id) {
+            prefix.push(None);
+        } else if emitted.contains(id) && !prefix.contains(&Some(*id)) {
+            prefix.push(Some(*id));
         }
     }
     prefix
+}
+
+/// An emitted order with GREASE values as `None`.
+fn grease_masked(emitted: &[u16]) -> Vec<Option<u16>> {
+    emitted
+        .iter()
+        .map(|id| (!wire::is_grease(*id)).then_some(*id))
+        .collect()
 }
 
 // Every extension ID in the patched BoringSSL kExtensions table, in a
@@ -606,7 +619,8 @@ fn complete_extension_order_is_emitted_verbatim() {
     let emitted = captured.first().unwrap();
     let expected = expected_emitted_prefix(&ALL_KNOWN_EXTENSION_IDS, emitted);
     assert_eq!(
-        emitted, &expected,
+        grease_masked(emitted),
+        expected,
         "a complete requested order must determine the entire emitted order"
     );
 }
@@ -634,7 +648,7 @@ fn nearly_complete_extension_order_is_an_emitted_prefix() {
     let emitted = captured.first().unwrap();
     let expected = expected_emitted_prefix(&requested, emitted);
     assert!(
-        emitted.starts_with(&expected),
+        grease_masked(emitted).starts_with(&expected),
         "requested {expected:?}, emitted {emitted:?}"
     );
 }
@@ -666,14 +680,22 @@ proptest! {
 
         let mut client = server.client();
         client.ctx().set_alpn_protos(b"\x02h2").unwrap();
-        client.ctx().set_extension_order(&requested).unwrap();
+        let grease = requested.iter().filter(|id| wire::is_grease(**id)).count();
+        let set = client.ctx().set_extension_order(&requested);
+        // Each GREASE extension needs a distinct value: at most 16 slots.
+        prop_assert_eq!(set.is_ok(), grease <= 16);
+        if set.is_err() {
+            return Ok(());
+        }
         let _ = client.connect();
 
         let captured = captured.lock().unwrap();
         let emitted = captured.first().unwrap();
         let expected_prefix = expected_emitted_prefix(&requested, emitted);
-        prop_assert!(emitted.starts_with(&expected_prefix),
+        prop_assert!(grease_masked(emitted).starts_with(&expected_prefix),
             "requested {expected_prefix:?}, emitted {emitted:?}");
+        // The order's slots are its only GREASE extensions.
+        prop_assert_eq!(emitted.iter().filter(|id| wire::is_grease(**id)).count(), grease);
     }
 }
 
@@ -1874,5 +1896,6 @@ mod client_hello_shape;
 mod connection;
 mod memory;
 mod panic_safety;
+mod renegotiation;
 mod session_order;
 pub(crate) mod wire;

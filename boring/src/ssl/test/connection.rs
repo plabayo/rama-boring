@@ -665,3 +665,93 @@ fn server_extension_order_never_answers_extensions_the_client_omitted() {
         assert!(!ids.contains(&EC_POINT_FORMATS), "{order:?}: {ids:?}");
     }
 }
+
+#[test]
+fn strict_tls13_server_ciphers_fail_without_a_match() {
+    let server = server_context().build();
+    let offers = |ciphers: &[u16]| {
+        let mut client = Ssl::new(&client_context().build()).unwrap();
+        client.set_raw_cipher_list(ciphers).unwrap();
+        client
+    };
+    let negotiate = |client: Ssl, strict: &[u16]| {
+        let mut ssl = Ssl::new(&server).unwrap();
+        ssl.set_strict_tls13_server_ciphers(strict).unwrap();
+        handshake(client, ssl)
+    };
+    // A strict list still picks the first cipher the client offered.
+    let (client, _) = negotiate(offers(&[0x1301, 0x1302]), &[0x1302, 0x1301]);
+    assert_eq!(
+        client.done().ssl().current_cipher().unwrap().protocol_id(),
+        0x1302
+    );
+    // Without a match the handshake fails instead of falling back.
+    let (_, server_side) = negotiate(offers(&[0x1301]), &[0x1302]);
+    server_side.panicked_or_failed_with("NO_SHARED_CIPHER");
+    // A preference falls back for the same offer.
+    let mut ssl = Ssl::new(&server).unwrap();
+    ssl.set_tls13_server_ciphers(&[0x1302]).unwrap();
+    let client = handshake(offers(&[0x1301]), ssl).0.done();
+    assert_eq!(client.ssl().current_cipher().unwrap().protocol_id(), 0x1301);
+    // A strict cipher the compliance policy forbids is no match either.
+    let mut ssl = Ssl::new(&server).unwrap();
+    ssl.set_compliance_policy(crate::ssl::CompliancePolicy::FIPS_202205)
+        .unwrap();
+    ssl.set_strict_tls13_server_ciphers(&[0x1303]).unwrap();
+    handshake(offers(&[0x1303, 0x1301]), ssl)
+        .1
+        .panicked_or_failed_with("NO_SHARED_CIPHER");
+    // A strict list cannot be empty; a preference can.
+    let mut ssl = Ssl::new(&server).unwrap();
+    assert!(ssl.set_strict_tls13_server_ciphers(&[]).is_err());
+    assert!(ssl.set_tls13_server_ciphers(&[]).is_ok());
+}
+
+#[test]
+fn ticket_count_is_per_connection() {
+    let mut server = server_context();
+    server.set_num_tickets(2);
+    let server = server.build();
+    let client = client_context().build();
+    for (count, expected) in [(None, 2), (Some(0), 0), (Some(5), 5), (Some(100), 16)] {
+        let seen = Seen::default();
+        let mut client = Ssl::new(&client).unwrap();
+        client.set_msg_callback(observe(&seen));
+        let mut ssl = Ssl::new(&server).unwrap();
+        if let Some(count) = count {
+            ssl.set_num_tickets(count).unwrap();
+        }
+        let (client, server) = handshake(client, ssl);
+        let (mut client, mut server) = (client.done(), server.done());
+        // Tickets follow the handshake; reading application data reads them.
+        exchange(&mut client, &mut server);
+        let tickets = handshake_types(&seen, false)
+            .into_iter()
+            .filter(|kind| *kind == 4)
+            .count();
+        assert_eq!(tickets, expected, "{count:?}");
+        // The count is fixed once the handshake completed.
+        assert!(server.ssl_mut().set_num_tickets(1).is_err());
+    }
+}
+
+#[test]
+fn negotiated_group_ids_are_raw() {
+    const X25519: u16 = 0x001d;
+    const P256: u16 = 0x0017;
+    const X25519_MLKEM768: u16 = 0x11ec;
+    for group in [X25519, P256, X25519_MLKEM768] {
+        let mut client = Ssl::new(&client_context().build()).unwrap();
+        client.set_raw_supported_groups(&[group]).unwrap();
+        client.set_raw_key_shares(&[group]).unwrap();
+        assert_eq!(client.group_id(), None, "before the handshake");
+        let mut server = server_context();
+        server
+            .set_curves_list("X25519MLKEM768:X25519:P-256")
+            .unwrap();
+        let (client, server) = handshake(client, Ssl::new(&server.build()).unwrap());
+        let (client, server) = (client.done(), server.done());
+        assert_eq!(client.ssl().group_id(), Some(group));
+        assert_eq!(server.ssl().group_id(), Some(group));
+    }
+}

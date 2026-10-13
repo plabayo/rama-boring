@@ -210,6 +210,94 @@ impl<'a> ServerHello<'a> {
     pub(crate) fn ids(&self) -> Vec<u16> {
         ids(&self.extensions)
     }
+
+    /// This cipher suite and these extensions as a whole ServerHello, keeping
+    /// every other field of `original`; `None` if `original` is not a
+    /// well-formed ServerHello.
+    pub(crate) fn reencode(&self, original: &[u8]) -> Option<Vec<u8>> {
+        let (2, body) = message(original)? else {
+            return None;
+        };
+        ServerHello::parse(original)?;
+        let mut fields = Reader::new(body);
+        fields.bytes(2 + 32)?;
+        fields.prefixed_u8()?;
+        let kept = body.len() - fields.rest().len();
+        let mut out = body[..kept].to_vec();
+        out.extend_from_slice(&self.cipher.to_be_bytes());
+        // The legacy compression method.
+        out.push(body[kept + 2]);
+        push_u16_prefixed(&mut out, &encode_extensions(&self.extensions));
+        Some(encode_message(2, &out))
+    }
+}
+
+/// The group and key exchange of a `key_share` extension body sent in a
+/// ServerHello.
+pub(crate) fn server_key_share(body: &[u8]) -> Option<(u16, &[u8])> {
+    let mut fields = Reader::new(body);
+    let group = fields.u16()?;
+    let key = fields.prefixed_u16()?.rest();
+    fields.finish()?;
+    Some((group, key))
+}
+
+pub(crate) fn encode_server_key_share(group: u16, key: &[u8]) -> Vec<u8> {
+    let mut body = group.to_be_bytes().to_vec();
+    push_u16_prefixed(&mut body, key);
+    body
+}
+
+/// Parses a whole CertificateVerify message: the signature algorithm and the
+/// signature.
+pub(crate) fn certificate_verify(bytes: &[u8]) -> Option<(u16, &[u8])> {
+    let (15, body) = message(bytes)? else {
+        return None;
+    };
+    let mut fields = Reader::new(body);
+    let algorithm = fields.u16()?;
+    let signature = fields.prefixed_u16()?.rest();
+    fields.finish()?;
+    Some((algorithm, signature))
+}
+
+pub(crate) fn encode_certificate_verify(algorithm: u16, signature: &[u8]) -> Vec<u8> {
+    let mut body = algorithm.to_be_bytes().to_vec();
+    push_u16_prefixed(&mut body, signature);
+    encode_message(15, &body)
+}
+
+/// Parses a whole CompressedCertificate message: the algorithm, the
+/// uncompressed length and the compressed Certificate body.
+pub(crate) fn compressed_certificate(bytes: &[u8]) -> Option<(u16, usize, &[u8])> {
+    let (25, body) = message(bytes)? else {
+        return None;
+    };
+    let mut fields = Reader::new(body);
+    let algorithm = fields.u16()?;
+    let uncompressed_len = fields.u24()?;
+    let compressed = fields.prefixed_u24()?.rest();
+    fields.finish()?;
+    Some((algorithm, uncompressed_len, compressed))
+}
+
+pub(crate) fn encode_compressed_certificate(
+    algorithm: u16,
+    uncompressed_len: usize,
+    compressed: &[u8],
+) -> Vec<u8> {
+    let mut body = algorithm.to_be_bytes().to_vec();
+    body.extend_from_slice(&u24_bytes(uncompressed_len));
+    body.extend_from_slice(&u24_bytes(compressed.len()));
+    body.extend_from_slice(compressed);
+    encode_message(25, &body)
+}
+
+fn u24_bytes(len: usize) -> [u8; 3] {
+    let [0, a, b, c] = u32::try_from(len).unwrap().to_be_bytes() else {
+        panic!("{len} does not fit in 24 bits");
+    };
+    [a, b, c]
 }
 
 /// Parses a whole EncryptedExtensions message, header included.
@@ -221,6 +309,12 @@ pub(crate) fn encrypted_extensions(bytes: &[u8]) -> Option<Vec<Extension<'_>>> {
     let block = fields.prefixed_u16()?;
     fields.finish()?;
     extensions(block)
+}
+
+pub(crate) fn encode_encrypted_extensions(extensions: &[Extension<'_>]) -> Vec<u8> {
+    let mut body = Vec::new();
+    push_u16_prefixed(&mut body, &encode_extensions(extensions));
+    encode_message(8, &body)
 }
 
 /// The groups of a `key_share` extension body sent by a client.
@@ -252,7 +346,7 @@ pub(crate) fn u16_list(body: &[u8], prefix: usize) -> Option<Vec<u16>> {
 /// A handshake message with its header.
 pub(crate) fn encode_message(kind: u8, body: &[u8]) -> Vec<u8> {
     let mut message = vec![kind];
-    message.extend_from_slice(&u32::try_from(body.len()).unwrap().to_be_bytes()[1..]);
+    message.extend_from_slice(&u24_bytes(body.len()));
     message.extend_from_slice(body);
     message
 }
@@ -360,12 +454,6 @@ mod tests {
         encode_message(2, &body)
     }
 
-    fn encrypted(extensions: &[Extension<'_>]) -> Vec<u8> {
-        let mut body = Vec::new();
-        push_u16_prefixed(&mut body, &encode_extensions(extensions));
-        encode_message(8, &body)
-    }
-
     /// `message` with `extra` appended inside its body, header length fixed.
     fn with_trailing_body_byte(message: &[u8], extra: u8) -> Vec<u8> {
         let mut body = message[4..].to_vec();
@@ -398,7 +486,7 @@ mod tests {
             let extensions = borrowed(&extensions);
             let server = with_trailing_body_byte(&server_hello(0x1301, &[1, 2], &extensions), extra);
             prop_assert_eq!(ServerHello::parse(&server), None);
-            let encrypted = with_trailing_body_byte(&encrypted(&extensions), extra);
+            let encrypted = with_trailing_body_byte(&encode_encrypted_extensions(&extensions), extra);
             prop_assert_eq!(encrypted_extensions(&encrypted), None);
         }
 
@@ -416,7 +504,7 @@ mod tests {
                 Some(ServerHello { cipher, extensions: extensions.clone() })
             );
             prop_assert_eq!(ServerHello::parse(&server[..cut.index(server.len())]), None);
-            let encrypted = encrypted(&extensions);
+            let encrypted = encode_encrypted_extensions(&extensions);
             prop_assert_eq!(encrypted_extensions(&encrypted), Some(extensions.clone()));
             prop_assert_eq!(encrypted_extensions(&encrypted[..cut.index(encrypted.len())]), None);
             // A message of another type is not mistaken for either.
@@ -476,6 +564,53 @@ mod tests {
         }
 
         #[test]
+        fn rewritten_server_messages_parse_strictly(
+            cipher in any::<u16>(),
+            session_id in prop::collection::vec(any::<u8>(), 0..=32),
+            extensions in extension_lists(),
+            other in extension_lists(),
+            id in any::<u16>(),
+            payload in prop::collection::vec(any::<u8>(), 0..300),
+            len in 0usize..1 << 24,
+            extra in any::<u8>(),
+            cut in any::<prop::sample::Index>(),
+        ) {
+            // Re-encoding keeps every field but the cipher and extensions.
+            let original = server_hello(0x1301, &session_id, &borrowed(&extensions));
+            let other = borrowed(&other);
+            let rewritten = ServerHello { cipher, extensions: other.clone() };
+            let bytes = rewritten.reencode(&original).unwrap();
+            prop_assert_eq!(&bytes, &server_hello(cipher, &session_id, &other));
+            // Unchanged, re-encoding is the identity.
+            let parsed = ServerHello::parse(&original).unwrap();
+            prop_assert_eq!(parsed.reencode(&original), Some(original.clone()));
+            prop_assert_eq!(ServerHello::parse(&bytes).unwrap().reencode(&bytes), Some(bytes.clone()));
+            prop_assert_eq!(rewritten.reencode(&original[..cut.index(original.len())]), None);
+            let trailing = with_trailing_body_byte(&original, extra);
+            prop_assert_eq!(rewritten.reencode(&trailing), None);
+
+            let share = encode_server_key_share(id, &payload);
+            prop_assert_eq!(server_key_share(&share), Some((id, &payload[..])));
+            prop_assert_eq!(server_key_share(&share[..cut.index(share.len())]), None);
+            let mut trailing = share.clone();
+            trailing.push(extra);
+            prop_assert_eq!(server_key_share(&trailing), None);
+
+            let verify = encode_certificate_verify(id, &payload);
+            prop_assert_eq!(certificate_verify(&verify), Some((id, &payload[..])));
+            prop_assert_eq!(certificate_verify(&verify[..cut.index(verify.len())]), None);
+            prop_assert!(certificate_verify(&with_trailing_body_byte(&verify, extra)).is_none());
+
+            let compressed = encode_compressed_certificate(id, len, &payload);
+            prop_assert_eq!(compressed_certificate(&compressed), Some((id, len, &payload[..])));
+            prop_assert_eq!(compressed_certificate(&compressed[..cut.index(compressed.len())]), None);
+            prop_assert!(compressed_certificate(&with_trailing_body_byte(&compressed, extra)).is_none());
+            // A message of another type is neither.
+            prop_assert_eq!(certificate_verify(&compressed), None);
+            prop_assert_eq!(compressed_certificate(&verify), None);
+        }
+
+        #[test]
         fn parsing_never_panics(bytes in prop::collection::vec(any::<u8>(), 0..512)) {
             let _ = ClientHello::parse(&bytes);
             let _ = ServerHello::parse(&bytes);
@@ -484,6 +619,14 @@ mod tests {
             let _ = u16_list(&bytes, 1);
             let _ = u16_list(&bytes, 2);
             let _ = first_record_message(&bytes);
+            let _ = server_key_share(&bytes);
+            let _ = certificate_verify(&bytes);
+            let _ = compressed_certificate(&bytes);
+            if let Some(hello) = ServerHello::parse(&bytes) {
+                // Only an absent extensions block comes back as an empty one.
+                let reencoded = hello.reencode(&bytes).unwrap();
+                prop_assert!(reencoded == bytes || hello.extensions.is_empty());
+            }
         }
 
         #[test]
@@ -554,7 +697,7 @@ mod tests {
 
     #[test]
     fn only_handshake_records_yield_a_message() {
-        let message = encrypted(&[(0, &[1][..])]);
+        let message = encode_encrypted_extensions(&[(0, &[1][..])]);
         let mut record = vec![0x16, 3, 3];
         push_u16_prefixed(&mut record, &message);
         assert_eq!(first_record_message(&record), Some(&message[..]));
