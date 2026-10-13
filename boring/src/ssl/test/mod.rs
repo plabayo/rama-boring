@@ -1871,3 +1871,4 @@ mod connection;
 mod memory;
 mod panic_safety;
 mod session_order;
+pub(crate) mod wire;

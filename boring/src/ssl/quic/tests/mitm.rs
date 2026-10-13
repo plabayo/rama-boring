@@ -10,6 +10,7 @@
 //! deadline.
 
 use super::support::{credential, deliver, quic_context, Authority, Gate, Peer};
+use crate::ssl::test::wire;
 use crate::{
     pkey::{PKey, Private},
     ssl::{
@@ -189,13 +190,9 @@ fn capture_hello(
        + 'static {
     let shared = shared.clone();
     move |hello| {
-        let mut ids = Vec::new();
-        let mut extensions = hello.extensions();
-        while extensions.len() >= 4 {
-            ids.push(u16::from_be_bytes([extensions[0], extensions[1]]));
-            let length = usize::from(u16::from_be_bytes([extensions[2], extensions[3]]));
-            extensions = &extensions[4 + length..];
-        }
+        let ids = wire::ids(
+            &wire::extensions(wire::Reader::new(hello.extensions())).expect("extensions"),
+        );
         let target = if slot == "client" {
             &shared.client_hello
         } else {

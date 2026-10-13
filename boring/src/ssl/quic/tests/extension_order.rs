@@ -2,6 +2,7 @@
 
 use super::support::{settle, Peer};
 use super::{connection, contexts, pump, Record};
+use crate::ssl::test::wire::{is_grease, ClientHello};
 use crate::{
     ffi,
     ssl::{
@@ -28,33 +29,18 @@ fn client_hello_order(record: &Record) -> Vec<u16> {
         .filter(|(level, _)| *level == EncryptionLevel::Initial)
         .flat_map(|(_, bytes)| bytes.iter().copied())
         .collect();
-    assert_eq!(bytes[0], 1, "ClientHello handshake type");
-    // Handshake header, legacy version and random precede the variable fields.
-    let mut fields = &bytes[4 + 2 + 32..];
-    fields = &fields[1 + usize::from(fields[0])..];
-    let cipher_bytes = usize::from(u16::from_be_bytes([fields[0], fields[1]]));
-    fields = &fields[2 + cipher_bytes..];
-    fields = &fields[1 + usize::from(fields[0])..];
-    let extension_bytes = usize::from(u16::from_be_bytes([fields[0], fields[1]]));
-    fields = &fields[2..];
-    assert_eq!(fields.len(), extension_bytes);
-    let mut order = Vec::new();
-    while !fields.is_empty() {
-        let id = u16::from_be_bytes([fields[0], fields[1]]);
-        let length = usize::from(u16::from_be_bytes([fields[2], fields[3]]));
+    // The Initial level carries exactly one message: the ClientHello.
+    ClientHello::parse(&bytes)
+        .expect("a well-formed ClientHello")
+        .ids()
+        .into_iter()
         // GREASE values are fresh per connection; compare their positions.
-        order.push(if is_grease(id) { GREASE } else { id });
-        fields = &fields[4 + length..];
-    }
-    order
+        .map(|id| if is_grease(id) { GREASE } else { id })
+        .collect()
 }
 
 /// Marks a GREASE position in a parsed or expected extension order.
 const GREASE: u16 = 0x0a0a;
-
-fn is_grease(id: u16) -> bool {
-    id & 0x0f0f == 0x0a0a && id >> 8 == id & 0xff
-}
 
 fn use_legacy_codepoint(peer: &mut Peer, legacy: bool) {
     peer.conn.ssl_mut().set_quic_use_legacy_codepoint(legacy);

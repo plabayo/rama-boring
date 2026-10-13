@@ -2,6 +2,7 @@
 //! unknown values and padding, checked on the wire.
 
 use super::memory::{client_context, handshake, server_context, Side};
+use super::wire::{self, is_grease};
 use crate::ssl::{
     ClientHelloShape, ExtensionType, GreaseLists, GreaseValues, Padding, Ssl, SslContext,
     SslContextBuilder, SslVersion, UnknownValues,
@@ -20,10 +21,6 @@ const P256: u16 = 0x0017;
 const P384: u16 = 0x0018;
 const FFDHE2048: u16 = 0x0100;
 
-fn is_grease(value: u16) -> bool {
-    value & 0x0f0f == 0x0a0a && value >> 8 == value & 0xff
-}
-
 /// A ClientHello as sent.
 #[derive(Debug, Clone)]
 struct Hello {
@@ -34,26 +31,23 @@ struct Hello {
 
 impl Hello {
     fn parse(message: &[u8]) -> Self {
-        assert_eq!(message[0], 1, "ClientHello");
-        let mut rest = &message[4 + 2 + 32..];
-        rest = &rest[1 + usize::from(rest[0])..];
-        let cipher_len = usize::from(u16::from_be_bytes([rest[0], rest[1]]));
-        let ciphers = u16s(&rest[2..2 + cipher_len]);
-        rest = &rest[2 + cipher_len..];
-        rest = &rest[1 + usize::from(rest[0])..];
-        let mut fields = &rest[2..];
-        let mut extensions = Vec::new();
-        while !fields.is_empty() {
-            let id = u16::from_be_bytes([fields[0], fields[1]]);
-            let len = usize::from(u16::from_be_bytes([fields[2], fields[3]]));
-            extensions.push((id, fields[4..4 + len].to_vec()));
-            fields = &fields[4 + len..];
-        }
+        let hello = wire::ClientHello::parse(message)
+            .unwrap_or_else(|| panic!("a well-formed ClientHello: {message:02x?}"));
         Self {
             len: message.len(),
-            ciphers,
-            extensions,
+            ciphers: hello.ciphers,
+            extensions: hello
+                .extensions
+                .into_iter()
+                .map(|(id, body)| (id, body.to_vec()))
+                .collect(),
         }
+    }
+
+    /// A two-byte list behind a length prefix of `prefix` bytes.
+    fn list(&self, id: u16, prefix: usize) -> Vec<u16> {
+        let body = self.body(id).unwrap_or_else(|| panic!("extension {id}"));
+        wire::u16_list(body, prefix).unwrap_or_else(|| panic!("malformed extension {id}"))
     }
 
     fn ids(&self) -> Vec<u16> {
@@ -68,26 +62,20 @@ impl Hello {
     }
 
     fn groups(&self) -> Vec<u16> {
-        u16s(&self.body(SUPPORTED_GROUPS).unwrap()[2..])
+        self.list(SUPPORTED_GROUPS, 2)
     }
 
     fn versions(&self) -> Vec<u16> {
-        u16s(&self.body(SUPPORTED_VERSIONS).unwrap()[1..])
+        self.list(SUPPORTED_VERSIONS, 1)
     }
 
     fn sigalgs(&self) -> Vec<u16> {
-        u16s(&self.body(SIGNATURE_ALGORITHMS).unwrap()[2..])
+        self.list(SIGNATURE_ALGORITHMS, 2)
     }
 
     fn key_shares(&self) -> Vec<u16> {
-        let mut entries = &self.body(KEY_SHARE).unwrap()[2..];
-        let mut groups = Vec::new();
-        while !entries.is_empty() {
-            groups.push(u16::from_be_bytes([entries[0], entries[1]]));
-            let len = usize::from(u16::from_be_bytes([entries[2], entries[3]]));
-            entries = &entries[4 + len..];
-        }
-        groups
+        wire::key_share_groups(self.body(KEY_SHARE).expect("key_share"))
+            .expect("a well-formed key_share")
     }
 
     /// Every GREASE value, list by list, in order.
@@ -105,13 +93,6 @@ impl Hello {
         .filter(|value| is_grease(*value))
         .collect()
     }
-}
-
-fn u16s(bytes: &[u8]) -> Vec<u16> {
-    bytes
-        .chunks(2)
-        .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
-        .collect()
 }
 
 /// Positions of GREASE values, with everything else exact.

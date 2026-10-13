@@ -1,6 +1,7 @@
 //! Per-connection wire settings, message observation and negotiated-state getters.
 
 use super::memory::{client_context, connect, handshake, server_context, End};
+use super::wire::{self, Reader};
 use crate::ssl::{
     CertificateCompressionAlgorithm, CertificateCompressor, ExtensionType, SslContentType,
     SslContextBuilder, SslMessage, SslRef, SslRenegotiateMode, SslSignatureAlgorithm, SslStream,
@@ -32,19 +33,12 @@ fn capture(server: &mut SslContextBuilder) -> Arc<Mutex<Vec<Hello>>> {
     let captured = Arc::new(Mutex::new(Vec::new()));
     let sink = captured.clone();
     server.set_select_certificate_callback(move |hello| {
-        let ciphers = hello
-            .ciphers()
-            .chunks(2)
-            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        let ciphers = Reader::new(hello.ciphers()).u16s().expect("cipher list");
+        let extensions = wire::extensions(Reader::new(hello.extensions()))
+            .expect("extensions")
+            .into_iter()
+            .map(|(id, body)| (id, body.to_vec()))
             .collect();
-        let mut extensions = Vec::new();
-        let mut rest = hello.extensions();
-        while rest.len() >= 4 {
-            let id = u16::from_be_bytes([rest[0], rest[1]]);
-            let len = usize::from(u16::from_be_bytes([rest[2], rest[3]]));
-            extensions.push((id, rest[4..4 + len].to_vec()));
-            rest = &rest[4 + len..];
-        }
         sink.lock().unwrap().push(Hello {
             ciphers,
             extensions,
@@ -196,12 +190,9 @@ fn certificate_compression_offer_is_per_connection() {
         .done();
 
     let offered = |hello: &Hello| {
-        hello.extension(COMPRESS_CERTIFICATE).map(|body| {
-            body[1..]
-                .chunks(2)
-                .map(|id| u16::from_be_bytes([id[0], id[1]]))
-                .collect::<Vec<_>>()
-        })
+        hello
+            .extension(COMPRESS_CERTIFICATE)
+            .map(|body| wire::u16_list(body, 1).expect("compression algorithms"))
     };
     let hellos = hellos.lock().unwrap();
     assert_eq!(offered(&hellos[0]), Some(vec![0xff02, 0xff01]));
@@ -322,15 +313,9 @@ fn message_callbacks_see_every_tls13_handshake_message() {
         .find(|(written, _, ty, _)| !written && *ty == Some(2))
         .unwrap()
         .3;
-    let session_id_len = usize::from(server_hello[4 + 2 + 32]);
-    let rest = &server_hello[4 + 2 + 32 + 1 + session_id_len + 2 + 1..];
-    let mut extensions = &rest[2..];
-    let mut ids = Vec::new();
-    while !extensions.is_empty() {
-        ids.push(u16::from_be_bytes([extensions[0], extensions[1]]));
-        let len = usize::from(u16::from_be_bytes([extensions[2], extensions[3]]));
-        extensions = &extensions[4 + len..];
-    }
+    let mut ids = wire::ServerHello::parse(server_hello)
+        .expect("a well-formed ServerHello")
+        .ids();
     ids.sort_unstable();
     assert_eq!(ids, [43, 51], "supported_versions and key_share");
 }
@@ -521,25 +506,14 @@ fn negotiated_state_getters() {
     );
 }
 
-/// Extension IDs of a handshake message as observed.
+/// Extension IDs of a ServerHello or EncryptedExtensions as observed.
 fn message_extension_ids(message: &[u8]) -> Vec<u16> {
-    let mut fields = match message[0] {
-        // ServerHello: version, random, session id, cipher and compression.
-        2 => {
-            let session_id = usize::from(message[4 + 2 + 32]);
-            &message[4 + 2 + 32 + 1 + session_id + 2 + 1 + 2..]
-        }
-        // EncryptedExtensions: just the extensions.
-        8 => &message[4 + 2..],
-        other => panic!("unexpected handshake message {other}"),
-    };
-    let mut ids = Vec::new();
-    while !fields.is_empty() {
-        ids.push(u16::from_be_bytes([fields[0], fields[1]]));
-        let len = usize::from(u16::from_be_bytes([fields[2], fields[3]]));
-        fields = &fields[4 + len..];
+    match message.first() {
+        Some(2) => wire::ServerHello::parse(message).map(|hello| hello.ids()),
+        Some(8) => wire::encrypted_extensions(message).map(|extensions| wire::ids(&extensions)),
+        _ => None,
     }
-    ids
+    .unwrap_or_else(|| panic!("a well-formed ServerHello or EncryptedExtensions: {message:02x?}"))
 }
 
 /// The server's ServerHello and EncryptedExtensions extension orders, with the
@@ -658,30 +632,16 @@ fn client_hello_record_without(extension: u16) -> Vec<u8> {
     let (a, _b) = super::memory::ends();
     let _ = client.connect(a);
     let message = hello.lock().unwrap().clone();
-    // Rebuild the body without the extension.
-    let body = &message[4..];
-    let session_id = usize::from(body[2 + 32]);
-    let mut at = 2 + 32 + 1 + session_id;
-    at += 2 + usize::from(u16::from_be_bytes([body[at], body[at + 1]]));
-    at += 1 + usize::from(body[at]);
-    let (head, mut fields) = (&body[..at], &body[at + 2..]);
-    let mut extensions = Vec::new();
-    while !fields.is_empty() {
-        let id = u16::from_be_bytes([fields[0], fields[1]]);
-        let len = usize::from(u16::from_be_bytes([fields[2], fields[3]]));
-        if id != extension {
-            extensions.extend_from_slice(&fields[..4 + len]);
-        }
-        fields = &fields[4 + len..];
-    }
-    let mut body = head.to_vec();
-    body.extend_from_slice(&u16::try_from(extensions.len()).unwrap().to_be_bytes());
-    body.extend_from_slice(&extensions);
+    let mut hello = wire::ClientHello::parse(&message).expect("a well-formed ClientHello");
+    assert!(
+        hello.extension(extension).is_some(),
+        "the client offers {extension}"
+    );
+    hello.extensions.retain(|(id, _)| *id != extension);
+    let message = hello.encode();
     let mut record = vec![0x16, 0x03, 0x01];
-    record.extend_from_slice(&u16::try_from(4 + body.len()).unwrap().to_be_bytes());
-    record.push(1);
-    record.extend_from_slice(&u32::try_from(body.len()).unwrap().to_be_bytes()[1..]);
-    record.extend_from_slice(&body);
+    record.extend_from_slice(&u16::try_from(message.len()).unwrap().to_be_bytes());
+    record.extend_from_slice(&message);
     record
 }
 
@@ -700,10 +660,9 @@ fn server_extension_order_never_answers_extensions_the_client_omitted() {
         server_end.rx.lock().unwrap().extend(record.iter().copied());
         let _ = ssl.accept(server_end);
         let response: Vec<u8> = client_end.rx.lock().unwrap().iter().copied().collect();
-        assert_eq!(response[0], 0x16, "a handshake record answers: {order:?}");
-        let server_hello = &response[5..];
-        let len = usize::from(server_hello[3]) | usize::from(server_hello[2]) << 8;
-        let ids = message_extension_ids(&server_hello[..4 + len]);
+        let server_hello = wire::first_record_message(&response)
+            .unwrap_or_else(|| panic!("a handshake record answers: {order:?}"));
+        let ids = message_extension_ids(server_hello);
         assert!(!ids.contains(&EC_POINT_FORMATS), "{order:?}: {ids:?}");
     }
 }

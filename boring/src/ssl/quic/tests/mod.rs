@@ -479,18 +479,10 @@ fn quic_handshake_messages_are_observable() {
     assert_eq!(read[..5], [2, 8, 11, 15, 20]);
     // EncryptedExtensions carries the server's QUIC transport parameters.
     let encrypted_extensions = &seen.iter().find(|m| !m.0 && m.2 == Some(8)).unwrap().3;
-    let mut extensions = &encrypted_extensions[4 + 2..];
-    let mut transport_parameters = None;
-    while !extensions.is_empty() {
-        let id = u16::from_be_bytes([extensions[0], extensions[1]]);
-        let len = usize::from(u16::from_be_bytes([extensions[2], extensions[3]]));
-        if id == 57 {
-            transport_parameters = Some(extensions[4..4 + len].to_vec());
-        }
-        extensions = &extensions[4 + len..];
-    }
+    let extensions = crate::ssl::test::wire::encrypted_extensions(encrypted_extensions)
+        .expect("a well-formed EncryptedExtensions");
     assert_eq!(
-        transport_parameters.as_deref(),
+        crate::ssl::test::wire::find(&extensions, 57),
         Some(&b"server parameters"[..])
     );
 }
