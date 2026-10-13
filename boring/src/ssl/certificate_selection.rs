@@ -52,6 +52,22 @@ impl CertificateSelection<'_> {
         }
     }
 
+    /// Signature algorithms a client offered for delegated credentials. Empty if
+    /// it offered none, and on clients.
+    #[corresponds(SSL_get0_peer_delegation_algorithms)]
+    pub fn peer_delegation_algorithms(&self) -> &[SslSignatureAlgorithm] {
+        unsafe {
+            let mut algorithms = ptr::null();
+            let len = ffi::SSL_get0_peer_delegation_algorithms(self.0.as_ptr(), &mut algorithms);
+            if len == 0 {
+                &[]
+            } else {
+                // As for `peer_verify_algorithms`: valid only during selection.
+                slice::from_raw_parts(algorithms.cast(), len)
+            }
+        }
+    }
+
     /// Client certificate types requested by the server. Empty for TLS 1.3
     /// and on servers; use signature algorithms for TLS 1.3.
     #[corresponds(SSL_get0_certificate_types)]

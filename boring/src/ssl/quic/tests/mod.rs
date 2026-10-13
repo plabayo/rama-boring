@@ -403,6 +403,179 @@ fn errors_expose_their_cause_and_connections_their_progress() {
     }
 }
 
+#[test]
+fn early_data_reasons_explain_acceptance_and_rejection() {
+    use crate::ssl::SslEarlyDataReason;
+    let (client_ctx, server_ctx, tickets) = contexts();
+    let handshake = |ticket: Option<&SslSession>, server_context: &[u8]| {
+        let c = Arc::new(Record::default());
+        let s = Arc::new(Record::default());
+        let mut client = connection(&client_ctx, false, c.clone());
+        let mut server = connection(&server_ctx, true, s.clone());
+        if let Some(ticket) = ticket {
+            // Tickets come from this client context and server.
+            unsafe { client.ssl_mut().set_session(ticket).unwrap() };
+        }
+        server.set_early_data_context(server_context).unwrap();
+        pump(&mut client, &mut server, &c, &s).unwrap();
+        (client, server)
+    };
+    let (client, server) = handshake(None, b"transport-context");
+    assert_eq!(
+        client.ssl().early_data_reason(),
+        SslEarlyDataReason::NO_SESSION_OFFERED
+    );
+    assert_eq!(
+        server.ssl().early_data_reason(),
+        SslEarlyDataReason::NO_SESSION_OFFERED
+    );
+    let ticket = tickets.lock().unwrap().take().unwrap();
+    let (client, server) = handshake(Some(&ticket), b"transport-context");
+    assert_eq!(
+        client.ssl().early_data_reason(),
+        SslEarlyDataReason::ACCEPTED
+    );
+    assert_eq!(
+        server.ssl().early_data_reason(),
+        SslEarlyDataReason::ACCEPTED
+    );
+    assert!(client.ssl().ticket_age_skew().abs() <= 1);
+    let ticket = tickets.lock().unwrap().take().unwrap();
+    let (_, server) = handshake(Some(&ticket), b"changed-transport-context");
+    let reason = server.ssl().early_data_reason();
+    assert_eq!(reason, SslEarlyDataReason::QUIC_PARAMETER_MISMATCH);
+    assert_eq!(reason.as_str(), Some("quic_parameter_mismatch"));
+}
+
+#[test]
+fn quic_handshake_messages_are_observable() {
+    let (client_ctx, server_ctx, _) = contexts();
+    let c = Arc::new(Record::default());
+    let s = Arc::new(Record::default());
+    let mut client = connection(&client_ctx, false, c.clone());
+    let mut server = connection(&server_ctx, true, s.clone());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    client.ssl_mut().set_msg_callback(move |_, message| {
+        sink.lock().unwrap().push((
+            message.is_written(),
+            message.content_type(),
+            message.handshake_type(),
+            message.bytes().to_vec(),
+        ));
+    });
+    pump(&mut client, &mut server, &c, &s).unwrap();
+    let seen = seen.lock().unwrap();
+    // QUIC has no TLS records: only messages, decrypted.
+    assert!(seen
+        .iter()
+        .all(|(_, content, ..)| *content == crate::ssl::SslContentType::HANDSHAKE));
+    let read: Vec<_> = seen.iter().filter(|m| !m.0).filter_map(|m| m.2).collect();
+    assert_eq!(read[..5], [2, 8, 11, 15, 20]);
+    // EncryptedExtensions carries the server's QUIC transport parameters.
+    let encrypted_extensions = &seen.iter().find(|m| !m.0 && m.2 == Some(8)).unwrap().3;
+    let mut extensions = &encrypted_extensions[4 + 2..];
+    let mut transport_parameters = None;
+    while !extensions.is_empty() {
+        let id = u16::from_be_bytes([extensions[0], extensions[1]]);
+        let len = usize::from(u16::from_be_bytes([extensions[2], extensions[3]]));
+        if id == 57 {
+            transport_parameters = Some(extensions[4..4 + len].to_vec());
+        }
+        extensions = &extensions[4 + len..];
+    }
+    assert_eq!(
+        transport_parameters.as_deref(),
+        Some(&b"server parameters"[..])
+    );
+}
+
+#[test]
+fn servers_issue_the_configured_number_of_tickets() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    // Larger counts are capped at 16.
+    for (count, issued_count) in [(0usize, 0), (1, 1), (3, 3), (40, 16)] {
+        let issued = Arc::new(AtomicUsize::new(0));
+        let mut client_ctx = SslContext::builder(SslMethod::tls()).unwrap();
+        client_ctx
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        client_ctx.set_alpn_protos(b"\x02h3").unwrap();
+        client_ctx.set_verify(SslVerifyMode::NONE);
+        client_ctx.set_session_cache_mode(SslSessionCacheMode::CLIENT);
+        let counter = issued.clone();
+        client_ctx.set_new_session_callback(move |_, _| {
+            counter.fetch_add(1, SeqCst);
+        });
+        let client_ctx = client_ctx.build();
+        let c = Arc::new(Record::default());
+        let s = Arc::new(Record::default());
+        let mut client = connection(&client_ctx, false, c.clone());
+        let mut server = connection(&tickets_server(count), true, s.clone());
+        pump(&mut client, &mut server, &c, &s).unwrap();
+        assert_eq!(issued.load(SeqCst), issued_count, "num_tickets={count}");
+    }
+}
+
+fn tickets_server(count: usize) -> SslContext {
+    let mut server = SslContext::builder(SslMethod::tls()).unwrap();
+    server
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    server
+        .set_certificate(&X509::from_pem(include_bytes!("../../../../test/cert.pem")).unwrap())
+        .unwrap();
+    server
+        .set_private_key(
+            &PKey::private_key_from_pem(include_bytes!("../../../../test/key.pem")).unwrap(),
+        )
+        .unwrap();
+    server.set_alpn_select_callback(|_, offers| {
+        crate::ssl::select_next_proto(b"\x02h3", offers).ok_or(crate::ssl::AlpnError::ALERT_FATAL)
+    });
+    server.set_num_tickets(count);
+    server.build()
+}
+
+#[test]
+fn reverification_on_resumption_is_opt_in() {
+    for reverify in [false, true] {
+        let (_, server_ctx, _) = contexts();
+        let verified = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let tickets = Arc::new(Mutex::new(None));
+        let mut client_ctx = SslContext::builder(SslMethod::tls()).unwrap();
+        client_ctx
+            .set_min_proto_version(Some(SslVersion::TLS1_3))
+            .unwrap();
+        client_ctx.set_alpn_protos(b"\x02h3").unwrap();
+        client_ctx.set_session_cache_mode(SslSessionCacheMode::CLIENT);
+        let sink = tickets.clone();
+        client_ctx.set_new_session_callback(move |_, ticket| *sink.lock().unwrap() = Some(ticket));
+        let counter = verified.clone();
+        client_ctx.set_custom_verify_callback(SslVerifyMode::PEER, move |_| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        });
+        client_ctx.set_reverify_on_resume(reverify);
+        let client_ctx = client_ctx.build();
+        for resume in [false, true] {
+            let c = Arc::new(Record::default());
+            let s = Arc::new(Record::default());
+            let mut client = connection(&client_ctx, false, c.clone());
+            let mut server = connection(&server_ctx, true, s.clone());
+            if resume {
+                let ticket = tickets.lock().unwrap().take().unwrap();
+                // Same client context and server as the ticket's origin.
+                unsafe { client.ssl_mut().set_session(&ticket).unwrap() };
+            }
+            pump(&mut client, &mut server, &c, &s).unwrap();
+            assert_eq!(client.ssl().session_reused(), resume);
+        }
+        let expected = if reverify { 2 } else { 1 };
+        assert_eq!(verified.load(std::sync::atomic::Ordering::SeqCst), expected);
+    }
+}
+
 mod async_handshake;
 mod extension_order;
 mod mitm;

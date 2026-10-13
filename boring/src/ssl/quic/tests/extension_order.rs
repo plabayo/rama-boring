@@ -9,7 +9,6 @@ use crate::{
         Ssl, SslContext,
     },
 };
-use foreign_types::ForeignTypeRef;
 use proptest::prelude::*;
 use std::sync::{Arc, LazyLock};
 
@@ -50,9 +49,7 @@ fn client_hello_order(record: &Record) -> Vec<u16> {
 }
 
 fn use_legacy_codepoint(peer: &mut Peer, legacy: bool) {
-    unsafe {
-        ffi::SSL_set_quic_use_legacy_codepoint(peer.conn.ssl_mut().as_ptr(), legacy.into());
-    }
+    peer.conn.ssl_mut().set_quic_use_legacy_codepoint(legacy);
 }
 
 /// Emits the first flight of a fresh client and returns its extension order.

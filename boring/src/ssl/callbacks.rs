@@ -936,3 +936,59 @@ fn verify_panicked(x509_ctx: *mut ffi::X509_STORE_CTX, message: String) -> c_int
         .set_error(Err(X509VerifyError::APPLICATION_VERIFICATION));
     0
 }
+
+pub(super) unsafe extern "C" fn raw_ctx_msg<F>(
+    write_p: c_int,
+    version: c_int,
+    content_type: c_int,
+    buf: *const c_void,
+    len: usize,
+    ssl: *mut ffi::SSL,
+    _: *mut c_void,
+) where
+    F: Fn(&SslRef, super::SslMessage<'_>) + 'static + Sync + Send,
+{
+    // Observation cannot fail the connection; a panic is contained.
+    unwind::catch(
+        || {
+            // SAFETY: boring provides valid inputs.
+            let ssl = unsafe { SslRef::from_ptr(ssl) };
+            let message =
+                unsafe { super::SslMessage::from_raw(write_p, version, content_type, buf, len) };
+            let Some(callback) = super::connection::session_context(ssl)
+                .and_then(|ctx| ctx.ex_data(SslContext::cached_ex_index::<F>()))
+            else {
+                return;
+            };
+            callback(ssl, message);
+        },
+        |_| (),
+    )
+}
+
+pub(super) unsafe extern "C" fn raw_ssl_msg<F>(
+    write_p: c_int,
+    version: c_int,
+    content_type: c_int,
+    buf: *const c_void,
+    len: usize,
+    ssl: *mut ffi::SSL,
+    _: *mut c_void,
+) where
+    F: Fn(&SslRef, super::SslMessage<'_>) + 'static + Sync + Send,
+{
+    unwind::catch(
+        || {
+            // SAFETY: boring provides valid inputs.
+            let ssl = unsafe { SslRef::from_ptr(ssl) };
+            let message =
+                unsafe { super::SslMessage::from_raw(write_p, version, content_type, buf, len) };
+            // Clone the Arc: the callback may replace itself.
+            let Some(callback) = ssl.ex_data(Ssl::cached_ex_index::<Arc<F>>()).cloned() else {
+                return;
+            };
+            callback(ssl, message);
+        },
+        |_| (),
+    )
+}

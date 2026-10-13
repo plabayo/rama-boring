@@ -115,6 +115,7 @@ pub use self::async_callbacks::{
     BoxSelectCertFuture, ExDataFuture,
 };
 pub use self::certificate_selection::CertificateSelection;
+pub use self::connection::{SslContentType, SslEarlyDataReason, SslMessage, SslRenegotiateMode};
 pub use self::connector::{
     ConnectConfiguration, SslAcceptor, SslAcceptorBuilder, SslConnector, SslConnectorBuilder,
 };
@@ -127,6 +128,7 @@ mod bio;
 mod buffer;
 mod callbacks;
 mod certificate_selection;
+mod connection;
 mod connector;
 mod credential;
 mod ech;

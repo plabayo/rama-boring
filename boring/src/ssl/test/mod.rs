@@ -1861,5 +1861,7 @@ fn per_session_extension_order_bounds_and_server_role() {
     server.ssl_mut().set_extension_order(&[43]).unwrap_err();
 }
 
+mod connection;
+mod memory;
 mod panic_safety;
 mod session_order;

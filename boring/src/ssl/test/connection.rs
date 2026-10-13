@@ -1,0 +1,436 @@
+//! Per-connection wire settings, message observation and negotiated-state getters.
+
+use super::memory::{client_context, connect, handshake, server_context, End};
+use crate::ssl::{
+    CertificateCompressionAlgorithm, CertificateCompressor, ExtensionType, SslContentType,
+    SslContextBuilder, SslMessage, SslRef, SslRenegotiateMode, SslSignatureAlgorithm, SslStream,
+    SslVersion,
+};
+use crate::ssl::{Ssl, SslVerifyMode};
+use std::{
+    io::{self, Read, Write},
+    sync::{Arc, Mutex},
+};
+
+/// What a server saw of a ClientHello.
+#[derive(Debug, Default, Clone)]
+struct Hello {
+    ciphers: Vec<u16>,
+    extensions: Vec<(u16, Vec<u8>)>,
+}
+
+impl Hello {
+    fn extension(&self, id: u16) -> Option<&[u8]> {
+        self.extensions
+            .iter()
+            .find(|(ext, _)| *ext == id)
+            .map(|(_, body)| body.as_slice())
+    }
+}
+
+fn capture(server: &mut SslContextBuilder) -> Arc<Mutex<Vec<Hello>>> {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let sink = captured.clone();
+    server.set_select_certificate_callback(move |hello| {
+        let ciphers = hello
+            .ciphers()
+            .chunks(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        let mut extensions = Vec::new();
+        let mut rest = hello.extensions();
+        while rest.len() >= 4 {
+            let id = u16::from_be_bytes([rest[0], rest[1]]);
+            let len = usize::from(u16::from_be_bytes([rest[2], rest[3]]));
+            extensions.push((id, rest[4..4 + len].to_vec()));
+            rest = &rest[4 + len..];
+        }
+        sink.lock().unwrap().push(Hello {
+            ciphers,
+            extensions,
+        });
+        Ok(())
+    });
+    captured
+}
+
+fn tls12(mut ctx: SslContextBuilder) -> SslContextBuilder {
+    ctx.set_max_proto_version(Some(SslVersion::TLS1_2)).unwrap();
+    ctx
+}
+
+#[test]
+fn raw_cipher_list_applies_to_one_connection() {
+    let mut server = server_context();
+    let hellos = capture(&mut server);
+    let server = server.build();
+    let mut client = client_context();
+    client.set_raw_cipher_list(&[0xc02f, 0x1301]).unwrap();
+    let client = client.build();
+
+    // Values unknown to BoringSSL are offered as-is; known ones negotiate.
+    let mut custom = Ssl::new(&client).unwrap();
+    custom
+        .set_raw_cipher_list(&[0x1302, 0xcafe, 0x1301, 0xc030])
+        .unwrap();
+    handshake(custom, Ssl::new(&server).unwrap()).0.done();
+    handshake(Ssl::new(&client).unwrap(), Ssl::new(&server).unwrap())
+        .0
+        .done();
+
+    let hellos = hellos.lock().unwrap();
+    assert_eq!(hellos[0].ciphers, [0x1302, 0xcafe, 0x1301, 0xc030]);
+    assert_eq!(hellos[1].ciphers, [0xc02f, 0x1301], "context list changed");
+}
+
+#[test]
+fn tls12_server_cipher_is_pinned_per_connection() {
+    let server = tls12(server_context()).build();
+    let client = tls12(client_context()).build();
+    for (pin, id) in [
+        ("ECDHE-RSA-AES256-GCM-SHA384", 0xc030),
+        ("ECDHE-RSA-AES128-GCM-SHA256", 0xc02f),
+    ] {
+        let mut ssl = Ssl::new(&server).unwrap();
+        ssl.set_strict_cipher_list(pin).unwrap();
+        let (client, _) = handshake(Ssl::new(&client).unwrap(), ssl);
+        let client = client.done();
+        assert_eq!(client.ssl().current_cipher().unwrap().protocol_id(), id);
+    }
+    let mut ssl = Ssl::new(&server).unwrap();
+    assert!(ssl.set_strict_cipher_list("NOT-A-CIPHER").is_err());
+    assert!(ssl.set_cipher_list("bad\0list").is_err());
+}
+
+#[test]
+fn tls13_server_cipher_preference_is_per_connection() {
+    let server = server_context().build();
+    let mut client = client_context();
+    client
+        .set_raw_cipher_list(&[0x1301, 0x1302, 0x1303])
+        .unwrap();
+    let client = client.build();
+    for (preference, expected) in [
+        (&[0x1303][..], 0x1303),
+        (&[0x1302, 0x1303], 0x1302),
+        (&[][..], 0x1301),
+    ] {
+        let mut ssl = Ssl::new(&server).unwrap();
+        ssl.set_tls13_server_ciphers(preference).unwrap();
+        let client = handshake(Ssl::new(&client).unwrap(), ssl).0.done();
+        assert_eq!(
+            client.ssl().current_cipher().unwrap().protocol_id(),
+            expected,
+            "{preference:x?}"
+        );
+    }
+
+    // A preference the client did not offer falls back to the native choice.
+    let mut only_aes128 = Ssl::new(&client_context().build()).unwrap();
+    only_aes128.set_raw_cipher_list(&[0x1301]).unwrap();
+    let mut ssl = Ssl::new(&server).unwrap();
+    ssl.set_tls13_server_ciphers(&[0x1303]).unwrap();
+    let client = handshake(only_aes128, ssl).0.done();
+    assert_eq!(client.ssl().current_cipher().unwrap().protocol_id(), 0x1301);
+
+    let mut ssl = Ssl::new(&server).unwrap();
+    assert!(ssl.set_tls13_server_ciphers(&[0xc02f]).is_err());
+    assert!(ssl.set_tls13_server_ciphers(&[0xcafe]).is_err());
+}
+
+/// "Compresses" by copying, under a configurable algorithm id.
+struct Copy<const ID: u16>;
+
+impl<const ID: u16> CertificateCompressor for Copy<ID> {
+    const ALGORITHM: CertificateCompressionAlgorithm = CertificateCompressionAlgorithm(ID);
+    const CAN_COMPRESS: bool = true;
+    const CAN_DECOMPRESS: bool = true;
+
+    fn compress<W: Write>(&self, input: &[u8], output: &mut W) -> io::Result<()> {
+        output.write_all(input)
+    }
+    fn decompress<W: Write>(&self, input: &[u8], output: &mut W) -> io::Result<()> {
+        output.write_all(input)
+    }
+}
+
+const A: CertificateCompressionAlgorithm = CertificateCompressionAlgorithm(0xff01);
+const B: CertificateCompressionAlgorithm = CertificateCompressionAlgorithm(0xff02);
+const COMPRESS_CERTIFICATE: u16 = 27;
+
+fn with_compressors(mut ctx: SslContextBuilder) -> SslContextBuilder {
+    ctx.add_certificate_compression_algorithm(Copy::<0xff01>)
+        .unwrap();
+    ctx.add_certificate_compression_algorithm(Copy::<0xff02>)
+        .unwrap();
+    ctx
+}
+
+#[test]
+fn certificate_compression_offer_is_per_connection() {
+    let mut server = with_compressors(server_context());
+    let hellos = capture(&mut server);
+    let server = server.build();
+    let client = with_compressors(client_context()).build();
+
+    for algorithms in [&[B, A][..], &[A][..], &[][..]] {
+        let mut ssl = Ssl::new(&client).unwrap();
+        ssl.set_certificate_compression_algorithms(algorithms)
+            .unwrap();
+        handshake(ssl, Ssl::new(&server).unwrap()).0.done();
+    }
+    handshake(Ssl::new(&client).unwrap(), Ssl::new(&server).unwrap())
+        .0
+        .done();
+
+    let offered = |hello: &Hello| {
+        hello.extension(COMPRESS_CERTIFICATE).map(|body| {
+            body[1..]
+                .chunks(2)
+                .map(|id| u16::from_be_bytes([id[0], id[1]]))
+                .collect::<Vec<_>>()
+        })
+    };
+    let hellos = hellos.lock().unwrap();
+    assert_eq!(offered(&hellos[0]), Some(vec![0xff02, 0xff01]));
+    assert_eq!(offered(&hellos[1]), Some(vec![0xff01]));
+    assert_eq!(
+        offered(&hellos[2]),
+        None,
+        "an empty list disables compression"
+    );
+    assert_eq!(offered(&hellos[3]), Some(vec![0xff01, 0xff02]));
+
+    let mut ssl = Ssl::new(&client).unwrap();
+    let unregistered = CertificateCompressionAlgorithm::ZSTD;
+    assert!(ssl
+        .set_certificate_compression_algorithms(&[unregistered])
+        .is_err());
+    assert!(ssl.set_certificate_compression_algorithms(&[A, A]).is_err());
+}
+
+#[test]
+fn certificate_compression_choice_is_per_connection_on_servers() {
+    let server = with_compressors(server_context()).build();
+    let client = with_compressors(client_context()).build();
+    for (preference, expected) in [
+        (Some(&[B][..]), Some(B)),
+        (Some(&[B, A]), Some(B)),
+        (Some(&[]), None),
+        (None, Some(A)),
+    ] {
+        let mut ssl = Ssl::new(&server).unwrap();
+        if let Some(preference) = preference {
+            ssl.set_certificate_compression_algorithms(preference)
+                .unwrap();
+        }
+        let client = handshake(Ssl::new(&client).unwrap(), ssl).0.done();
+        assert_eq!(
+            client.ssl().peer_certificate_compression_algorithm(),
+            expected,
+            "{preference:?}"
+        );
+    }
+}
+
+#[test]
+fn status_requests_are_per_connection() {
+    let mut server = server_context();
+    let hellos = capture(&mut server);
+    let server = server.build();
+    let client = client_context().build();
+    let mut ssl = Ssl::new(&client).unwrap();
+    ssl.enable_ocsp_stapling();
+    ssl.enable_signed_cert_timestamps();
+    handshake(ssl, Ssl::new(&server).unwrap()).0.done();
+    handshake(Ssl::new(&client).unwrap(), Ssl::new(&server).unwrap())
+        .0
+        .done();
+    let hellos = hellos.lock().unwrap();
+    let status = ExtensionType::STATUS_REQUEST.0;
+    let sct = ExtensionType::CERTIFICATE_TIMESTAMP.0;
+    assert!(hellos[0].extension(status).is_some());
+    assert!(hellos[0].extension(sct).is_some());
+    assert!(hellos[1].extension(status).is_none());
+    assert!(hellos[1].extension(sct).is_none());
+}
+
+type Seen = Arc<Mutex<Vec<(bool, i32, Option<u8>, Vec<u8>)>>>;
+
+fn observe(seen: &Seen) -> impl Fn(&SslRef, SslMessage<'_>) + Send + Sync + 'static {
+    let seen = seen.clone();
+    move |_, message| {
+        seen.lock().unwrap().push((
+            message.is_written(),
+            message.content_type().as_raw(),
+            message.handshake_type(),
+            message.bytes().to_vec(),
+        ));
+    }
+}
+
+fn handshake_types(seen: &Seen, written: bool) -> Vec<u8> {
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|(w, ..)| *w == written)
+        .filter_map(|(_, _, handshake_type, _)| *handshake_type)
+        .collect()
+}
+
+#[test]
+fn message_callbacks_see_every_tls13_handshake_message() {
+    let client_seen = Seen::default();
+    let server_seen = Seen::default();
+    let mut client = client_context();
+    client.set_msg_callback(observe(&client_seen));
+    let mut server = server_context();
+    server.set_msg_callback(observe(&server_seen));
+    let (client, server) = connect(client, server);
+    client.done();
+    server.done();
+
+    // ClientHello, then ServerHello, EncryptedExtensions, Certificate,
+    // CertificateVerify and Finished from the server, decrypted.
+    assert_eq!(handshake_types(&client_seen, true), [1, 20]);
+    assert_eq!(
+        handshake_types(&client_seen, false)[..5],
+        [2, 8, 11, 15, 20]
+    );
+    assert_eq!(handshake_types(&server_seen, false)[..2], [1, 20]);
+    assert_eq!(handshake_types(&server_seen, true)[..5], [2, 8, 11, 15, 20]);
+
+    let seen = client_seen.lock().unwrap();
+    assert!(seen
+        .iter()
+        .any(|(_, content, ..)| *content == SslContentType::HEADER.as_raw()));
+    // The ServerHello reveals the server's extension order (JA4S).
+    let server_hello = &seen
+        .iter()
+        .find(|(written, _, ty, _)| !written && *ty == Some(2))
+        .unwrap()
+        .3;
+    let session_id_len = usize::from(server_hello[4 + 2 + 32]);
+    let rest = &server_hello[4 + 2 + 32 + 1 + session_id_len + 2 + 1..];
+    let mut extensions = &rest[2..];
+    let mut ids = Vec::new();
+    while !extensions.is_empty() {
+        ids.push(u16::from_be_bytes([extensions[0], extensions[1]]));
+        let len = usize::from(u16::from_be_bytes([extensions[2], extensions[3]]));
+        extensions = &extensions[4 + len..];
+    }
+    ids.sort_unstable();
+    assert_eq!(ids, [43, 51], "supported_versions and key_share");
+}
+
+#[test]
+fn connection_message_callback_replaces_the_context_one() {
+    let context_seen = Seen::default();
+    let connection_seen = Seen::default();
+    let mut client = client_context();
+    client.set_msg_callback(observe(&context_seen));
+    let mut ssl = Ssl::new(&client.build()).unwrap();
+    ssl.set_msg_callback(observe(&connection_seen));
+    handshake(ssl, Ssl::new(&server_context().build()).unwrap())
+        .0
+        .done();
+    assert!(context_seen.lock().unwrap().is_empty());
+    assert!(!connection_seen.lock().unwrap().is_empty());
+}
+
+#[test]
+fn max_send_fragment_splits_records() {
+    let records = |fragment: Option<usize>| {
+        let seen = Seen::default();
+        let mut ssl = Ssl::new(&client_context().build()).unwrap();
+        ssl.set_msg_callback(observe(&seen));
+        if let Some(fragment) = fragment {
+            ssl.set_max_send_fragment(fragment);
+        }
+        let (client, server) = handshake(ssl, Ssl::new(&server_context().build()).unwrap());
+        let (mut client, mut server) = (client.done(), server.done());
+        seen.lock().unwrap().clear();
+        client.write_all(&[7; 2000]).unwrap();
+        let mut buf = [0; 2000];
+        server.read_exact(&mut buf).unwrap();
+        let seen = seen.lock().unwrap();
+        seen.iter()
+            .filter(|(written, content, ..)| {
+                *written && *content == SslContentType::HEADER.as_raw()
+            })
+            .count()
+    };
+    assert_eq!(records(None), 1);
+    assert_eq!(records(Some(512)), 4);
+    // Smaller values are clamped to 512.
+    assert_eq!(records(Some(100)), 4);
+}
+
+fn exchange(client: &mut SslStream<End>, server: &mut SslStream<End>) {
+    client.write_all(b"ping").unwrap();
+    let mut buf = [0; 4];
+    server.read_exact(&mut buf).unwrap();
+    server.write_all(b"pong").unwrap();
+    client.read_exact(&mut buf).unwrap();
+    assert_eq!(&buf, b"pong");
+}
+
+#[test]
+fn robustness_settings_keep_connections_working() {
+    let mut client = Ssl::new(&client_context().build()).unwrap();
+    client.set_shed_handshake_config(true);
+    client.set_renegotiate_mode(SslRenegotiateMode::ONCE);
+    let mut server = Ssl::new(&server_context().build()).unwrap();
+    server.set_shed_handshake_config(true);
+    server.set_jdk11_workaround(true);
+    let (client, server) = handshake(client, server);
+    let (mut client, mut server) = (client.done(), server.done());
+    exchange(&mut client, &mut server);
+    exchange(&mut client, &mut server);
+}
+
+#[test]
+fn negotiated_state_getters() {
+    let mut server = tls12(server_context());
+    server.set_verify(SslVerifyMode::PEER);
+    server.set_custom_verify_callback(SslVerifyMode::PEER, |_| Ok(()));
+    let mut client = tls12(client_context());
+    client.set_certificate_chain_file("test/cert.pem").unwrap();
+    client
+        .set_private_key_file("test/key.pem", crate::ssl::SslFiletype::PEM)
+        .unwrap();
+    let (client, server) = connect(client, server);
+    let (client, server) = (client.done(), server.done());
+    for ssl in [client.ssl(), server.ssl()] {
+        assert!(ssl.extended_master_secret_support());
+        assert!(ssl.secure_renegotiation_support());
+        let chain = ssl.peer_full_cert_chain().expect("peer chain");
+        assert_eq!(
+            chain.get(0).unwrap().to_der().unwrap(),
+            ssl.peer_certificate().unwrap().to_der().unwrap(),
+            "the full chain starts with the leaf"
+        );
+    }
+
+    let mut client = Ssl::new(&client_context().build()).unwrap();
+    client
+        .set_delegated_credential_schemes(&[SslSignatureAlgorithm::ECDSA_SECP256R1_SHA256])
+        .unwrap();
+    let offered = Arc::new(Mutex::new(Vec::new()));
+    let sink = offered.clone();
+    let mut server = server_context();
+    // Only meaningful while the server selects its certificate.
+    server.set_certificate_callback(move |selection| {
+        sink.lock()
+            .unwrap()
+            .extend_from_slice(selection.peer_delegation_algorithms());
+        Ok(())
+    });
+    handshake(client, Ssl::new(&server.build()).unwrap())
+        .1
+        .done();
+    assert_eq!(
+        *offered.lock().unwrap(),
+        [SslSignatureAlgorithm::ECDSA_SECP256R1_SHA256]
+    );
+}

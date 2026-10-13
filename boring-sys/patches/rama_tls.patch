@@ -1,5 +1,5 @@
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 3b48c2a..88e997a 100644
+index 3b48c2a..2d6c33c 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
 @@ -1739,8 +1739,17 @@ OPENSSL_EXPORT int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx,
@@ -42,7 +42,7 @@ index 3b48c2a..88e997a 100644
  
  // QUIC integration.
  //
-@@ -5565,7 +5580,30 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
+@@ -5565,7 +5580,54 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
  
@@ -52,6 +52,30 @@ index 3b48c2a..88e997a 100644
 +// which is similar to SSL_CTX_set_permute_extensions but in a defined
 +// order instead of a random one.
 +OPENSSL_EXPORT int RAMA_SSL_CTX_set_extension_order(SSL_CTX *ctx, const uint16_t *ids, size_t num);
++
++// RAMA_SSL_set_raw_cipher_list sets the cipher suite values this |ssl| offers,
++// in order, like |RAMA_SSL_CTX_set_raw_cipher_list| but for one connection.
++OPENSSL_EXPORT int RAMA_SSL_set_raw_cipher_list(SSL *ssl,
++                                                const uint16_t *values,
++                                                size_t num);
++
++// RAMA_SSL_set_cert_compression_algs selects, in preference order, which of
++// the context's registered certificate compression algorithms this |ssl|
++// uses: a client offers them in this order and a server prefers them in this
++// order. An empty list disables certificate compression for |ssl|. Every ID
++// must be registered on the context and appear once. It returns one on
++// success and zero on error.
++OPENSSL_EXPORT int RAMA_SSL_set_cert_compression_algs(SSL *ssl,
++                                                      const uint16_t *ids,
++                                                      size_t num);
++
++// RAMA_SSL_set_tls13_server_ciphers sets a server's TLS 1.3 cipher preference
++// for |ssl|: the first listed cipher the client offered is selected, otherwise
++// the native choice applies. Every ID must be a TLS 1.3 cipher suite. An empty
++// list restores the native choice. It returns one on success and zero on error.
++OPENSSL_EXPORT int RAMA_SSL_set_tls13_server_ciphers(SSL *ssl,
++                                                     const uint16_t *ids,
++                                                     size_t num);
 +
 +// RAMA_SSL_MAX_EXTENSION_ORDER is the most IDs |RAMA_SSL_set_extension_order|
 +// accepts.
@@ -97,7 +121,7 @@ index f4b3484..30cf143 100644
  #define TLSEXT_MAXLEN_host_name 255
  
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
-index 90238d9..8cad3e5 100644
+index 90238d9..6e013a1 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
 @@ -3303,6 +3303,32 @@ static bool ext_quic_transport_params_add_serverhello_legacy(SSL_HANDSHAKE *hs,
@@ -164,7 +188,80 @@ index 90238d9..8cad3e5 100644
  // Certificate compression
  
  static bool cert_compression_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
-@@ -4260,6 +4310,13 @@ static const struct tls_extension kExtensions[] = {
+@@ -3336,10 +3386,28 @@ static bool cert_compression_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
+   bool first = true;
+   CBB contents, algs;
+ 
+-  for (const auto &alg : hs->ssl->ctx->cert_compression_algs) {
+-    if (alg.decompress == nullptr) {
++  const SSLContext *ctx = hs->ssl->ctx.get();
++  // A per-connection list names registered algorithms in offer order.
++  const RamaConnectionConfig *rama = hs->config->rama.get();
++  const bool per_connection = rama != nullptr && rama->cert_compression_set;
++  const size_t num_algs = per_connection ? rama->cert_compression_algs.size()
++                                         : ctx->cert_compression_algs.size();
++  for (size_t i = 0; i < num_algs; i++) {
++    const CertCompressionAlg *found = nullptr;
++    if (per_connection) {
++      for (const auto &candidate : ctx->cert_compression_algs) {
++        if (candidate.alg_id == rama->cert_compression_algs[i]) {
++          found = &candidate;
++          break;
++        }
++      }
++    } else {
++      found = &ctx->cert_compression_algs[i];
++    }
++    if (found == nullptr || found->decompress == nullptr) {
+       continue;
+     }
++    const auto &alg = *found;
+ 
+     if (first &&
+         (!CBB_add_u16(out_compressible, TLSEXT_TYPE_cert_compression) ||
+@@ -3393,6 +3461,7 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
+   }
+ 
+   size_t best_index = num_algs;
++  uint16_t best_alg_id = 0;
+   size_t given_alg_idx = 0;
+ 
+   while (CBS_len(&alg_ids) > 0) {
+@@ -3406,8 +3475,22 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
+     for (size_t i = 0; i < num_algs; i++) {
+       const auto &alg = ctx->cert_compression_algs[i];
+       if (alg.alg_id == alg_id && alg.compress != nullptr) {
+-        if (i < best_index) {
+-          best_index = i;
++        // A per-connection list restricts and reorders the server preference.
++        size_t rank = i;
++        const RamaConnectionConfig *rama = hs->config->rama.get();
++        if (rama != nullptr && rama->cert_compression_set) {
++          const auto &prefs = rama->cert_compression_algs;
++          rank = num_algs;
++          for (size_t j = 0; j < prefs.size(); j++) {
++            if (prefs[j] == alg_id) {
++              rank = j;
++              break;
++            }
++          }
++        }
++        if (rank < best_index) {
++          best_index = rank;
++          best_alg_id = alg_id;
+         }
+         break;
+       }
+@@ -3424,7 +3507,7 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
+   if (best_index < num_algs &&
+       ssl_protocol_version(hs->ssl) >= TLS1_3_VERSION) {
+     hs->cert_compression_negotiated = true;
+-    hs->cert_compression_alg_id = ctx->cert_compression_algs[best_index].alg_id;
++    hs->cert_compression_alg_id = best_alg_id;
+   }
+ 
+   return true;
+@@ -4260,6 +4343,13 @@ static const struct tls_extension kExtensions[] = {
          cert_compression_parse_clienthello,
          cert_compression_add_serverhello,
      },
@@ -178,7 +275,7 @@ index 90238d9..8cad3e5 100644
      {
          TLSEXT_TYPE_delegated_credential,
          ext_delegated_credential_add_clienthello,
-@@ -4342,6 +4399,90 @@ static_assert(kNumExtensions <=
+@@ -4342,6 +4432,90 @@ static_assert(kNumExtensions <=
                    sizeof(((SSL_HANDSHAKE *)nullptr)->extensions.received) * 8,
                "too many extensions for received bitset");
  
@@ -325,7 +422,7 @@ index a4a53cd..f016691 100644
        !ssl_add_client_hello(hs)) {
      return ssl_hs_error;
 diff --git a/ssl/internal.h b/ssl/internal.h
-index 96f6d3d..9e915c7 100644
+index 96f6d3d..42e7b61 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
 @@ -297,10 +297,14 @@ struct SSLCipherPreferenceList {
@@ -380,19 +477,53 @@ index 96f6d3d..9e915c7 100644
  // ssl_setup_extension_permutation computes a ClientHello extension permutation
  // for `hs`, if applicable. It returns true on success and false on error.
  bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs);
-@@ -3596,6 +3616,11 @@ struct SSL_CONFIG {
+@@ -3397,6 +3417,28 @@ struct ALPSConfig {
+ //
+ // See SSL_shed_handshake_config() for more about the conditions under which
+ // configuration can be shed.
++// RamaConnectionConfig holds per-connection wire settings that replace the
++// context's for one connection.
++struct RamaConnectionConfig {
++  static constexpr bool kAllowUniquePtr = true;
++
++  // cert_compression_set is whether `cert_compression_algs` replaces the
++  // context's certificate compression preferences.
++  bool cert_compression_set = false;
++
++  // cert_compression_algs lists, in preference order, the context's registered
++  // certificate compression algorithms this connection uses.
++  Array<uint16_t> cert_compression_algs;
++
++  // tls13_server_ciphers is a server's TLS 1.3 cipher preference: the first one
++  // the client offered wins. Empty keeps the native choice.
++  Array<uint16_t> tls13_server_ciphers;
++};
++
++// rama_connection_config returns the per-connection settings of `config`,
++// allocating them on first use, or nullptr on allocation failure.
++RamaConnectionConfig *rama_connection_config(SSL_CONFIG *config);
++
+ struct SSL_CONFIG {
+   static constexpr bool kAllowUniquePtr = true;
+ 
+@@ -3596,6 +3638,16 @@ struct SSL_CONFIG {
    // server_padding_enabled is true iff the server is willing to send additional
    // padding to clients that request it through the server padding extension.
    bool server_padding_enabled : 1;
++
 +  // Value that will be used for record size extension
 +  uint16_t record_size_limit = 0;
 +
 +  // Credentials schemes that client supports for using delegated credentials
 +  Array<uint16_t> supported_delegated_credential_schemes;
++
++  // rama holds per-connection wire settings. It is allocated only when one is
++  // set, so connections without them pay one null pointer.
++  UniquePtr<RamaConnectionConfig> rama;
  };
  
  // From RFC 8446, used in determining PSK modes.
-@@ -4232,6 +4257,10 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+@@ -4232,6 +4284,10 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
    // permute_extensions is whether to permute extensions when sending messages.
    bool permute_extensions : 1;
  
@@ -536,7 +667,7 @@ index 7799d79..4bb8f4d 100644
    switch (EVP_PKEY_id(key)) {
      case EVP_PKEY_RSA:
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index a0c746b..23f4aef 100644
+index a0c746b..f991978 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
 @@ -364,6 +364,12 @@ void SSL_set_aes_hw_override_for_testing(SSL *ssl, bool override_value) {
@@ -564,7 +695,7 @@ index a0c746b..23f4aef 100644
  }
  
  const char *SSL_get_cipher_list(const SSL *ssl, int n) {
-@@ -2216,6 +2221,11 @@ int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str) {
+@@ -2216,6 +2221,90 @@ int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str) {
                                  false /* not strict */);
  }
  
@@ -573,10 +704,89 @@ index a0c746b..23f4aef 100644
 +  return rama_ssl_create_raw_cipher_list(&FromOpaque(ctx)->cipher_list, values, num);
 +}
 +
++int RAMA_SSL_set_raw_cipher_list(SSL *ssl, const uint16_t *values,
++                                 size_t num) {
++  auto *ssl_impl = FromOpaque(ssl);
++  if (!ssl_impl->config) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
++    return 0;
++  }
++  return rama_ssl_create_raw_cipher_list(&ssl_impl->config->cipher_list,
++                                         values, num);
++}
++
++int RAMA_SSL_set_cert_compression_algs(SSL *ssl, const uint16_t *ids,
++                                       size_t num) {
++  auto *ssl_impl = FromOpaque(ssl);
++  if (!ssl_impl->config) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
++    return 0;
++  }
++  if (ids == nullptr && num != 0) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_PASSED_NULL_PARAMETER);
++    return 0;
++  }
++  // Only algorithms registered on the context can be offered or used.
++  for (size_t i = 0; i < num; i++) {
++    bool registered = false;
++    for (const auto &alg : ssl_impl->ctx->cert_compression_algs) {
++      registered |= alg.alg_id == ids[i];
++    }
++    for (size_t j = 0; j < i; j++) {
++      registered &= ids[j] != ids[i];
++    }
++    if (!registered) {
++      OPENSSL_PUT_ERROR(SSL, SSL_R_UNKNOWN_CERT_COMPRESSION_ALG);
++      return 0;
++    }
++  }
++  RamaConnectionConfig *rama = rama_connection_config(ssl_impl->config.get());
++  if (rama == nullptr || !rama->cert_compression_algs.CopyFrom(Span(ids, num))) {
++    return 0;
++  }
++  rama->cert_compression_set = true;
++  return 1;
++}
++
++int RAMA_SSL_set_tls13_server_ciphers(SSL *ssl, const uint16_t *ids,
++                                      size_t num) {
++  auto *ssl_impl = FromOpaque(ssl);
++  if (!ssl_impl->config) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
++    return 0;
++  }
++  if (ids == nullptr && num != 0) {
++    OPENSSL_PUT_ERROR(SSL, ERR_R_PASSED_NULL_PARAMETER);
++    return 0;
++  }
++  for (size_t i = 0; i < num; i++) {
++    const SSL_CIPHER *cipher = SSL_get_cipher_by_value(ids[i]);
++    if (cipher == nullptr ||
++        SSL_CIPHER_get_min_version(cipher) > TLS1_3_VERSION ||
++        SSL_CIPHER_get_max_version(cipher) < TLS1_3_VERSION) {
++      OPENSSL_PUT_ERROR(SSL, SSL_R_UNKNOWN_CIPHER_RETURNED);
++      return 0;
++    }
++  }
++  RamaConnectionConfig *rama = rama_connection_config(ssl_impl->config.get());
++  return rama != nullptr && rama->tls13_server_ciphers.CopyFrom(Span(ids, num));
++}
++
++BSSL_NAMESPACE_BEGIN
++
++RamaConnectionConfig *rama_connection_config(SSL_CONFIG *config) {
++  if (config->rama == nullptr) {
++    config->rama = MakeUnique<RamaConnectionConfig>();
++  }
++  return config->rama.get();
++}
++
++BSSL_NAMESPACE_END
++
  int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx, const char *str) {
    auto *ctx_impl = FromOpaque(ctx);
    const bool has_aes_hw = ctx_impl->aes_hw_override
-@@ -2541,6 +2551,45 @@ void SSL_set_alps_use_new_codepoint(SSL *ssl, int use_new) {
+@@ -2541,6 +2630,45 @@ void SSL_set_alps_use_new_codepoint(SSL *ssl, int use_new) {
    ssl_impl->config->alps_use_new_codepoint = !!use_new;
  }
  
@@ -622,7 +832,7 @@ index a0c746b..23f4aef 100644
  int SSL_CTX_add_cert_compression_alg(SSL_CTX *ctx, uint16_t alg_id,
                                       ssl_cert_compression_func_t compress,
                                       ssl_cert_decompression_func_t decompress) {
-@@ -3284,6 +3333,31 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
+@@ -3284,6 +3412,31 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
    FromOpaque(ctx)->permute_extensions = !!enabled;
  }
  
@@ -682,3 +892,30 @@ index f134ebb..403c696 100644
        SSL_CIPHER_get_min_version(cipher) > ssl_protocol_version(ssl) ||
        SSL_CIPHER_get_max_version(cipher) < ssl_protocol_version(ssl) ||
        !ssl_tls13_cipher_meets_policy(SSL_CIPHER_get_protocol_id(cipher),
+diff --git a/ssl/tls13_server.cc b/ssl/tls13_server.cc
+index 94de72d..1b2433a 100644
+--- a/ssl/tls13_server.cc
++++ b/ssl/tls13_server.cc
+@@ -144,6 +144,22 @@ static const SSL_CIPHER *choose_tls13_cipher(
+ 
+   const uint16_t version = ssl_protocol_version(ssl);
+ 
++  // A per-connection preference wins when the client offered it.
++  const RamaConnectionConfig *rama = ssl->config->rama.get();
++  if (rama != nullptr) {
++    for (uint16_t preferred : rama->tls13_server_ciphers) {
++      CBS offered = cipher_suites;
++      uint16_t cipher_suite;
++      while (CBS_get_u16(&offered, &cipher_suite)) {
++        if (cipher_suite == preferred &&
++            ssl_tls13_cipher_meets_policy(cipher_suite,
++                                          ssl->config->compliance_policy)) {
++          return SSL_get_cipher_by_value(cipher_suite);
++        }
++      }
++    }
++  }
++
+   return ssl_choose_tls13_cipher(cipher_suites,
+                                  ssl->config->aes_hw_override
+                                      ? ssl->config->aes_hw_override_value

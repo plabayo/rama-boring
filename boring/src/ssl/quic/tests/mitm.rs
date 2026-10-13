@@ -11,7 +11,6 @@
 
 use super::support::{credential, deliver, quic_context, Authority, Gate, Peer};
 use crate::{
-    ffi,
     pkey::{PKey, Private},
     ssl::{
         AsyncSelectCertError, BoxCertificateFinish, BoxCustomVerifyFinish, CertificateSelection,
@@ -19,7 +18,6 @@ use crate::{
     },
     x509::X509,
 };
-use foreign_types::ForeignTypeRef;
 use proptest::prelude::*;
 use std::sync::{
     atomic::{AtomicBool, Ordering::SeqCst},
@@ -209,9 +207,7 @@ fn capture_hello(
 }
 
 fn set_legacy(peer: &mut Peer, legacy: bool) {
-    unsafe {
-        ffi::SSL_set_quic_use_legacy_codepoint(peer.conn.ssl_mut().as_ptr(), legacy.into());
-    }
+    peer.conn.ssl_mut().set_quic_use_legacy_codepoint(legacy);
 }
 
 struct Relay {
