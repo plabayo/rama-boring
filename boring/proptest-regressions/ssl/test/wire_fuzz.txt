@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 29dda9e6fd5aadc61d4b0e5f0601741cf7e8f6e3bb136f5b8331d08e7d9db77e # shrinks to case = Case { versions: Tls12, context_grease: false, context_grease_sigalgs: false, ciphers: None, groups: [001d, 001d], key_shares: None, supported_versions: None, sigalgs: None, orders: [], shapes: [], shape_first: false, resume: false }
+cc 3977d82f90ecc23397a9b20fb318fa79ffe1cb499933b9eef2973bc355ffc1fd # shrinks to case = Case { versions: Tls13, context_grease: false, context_grease_sigalgs: false, ciphers: None, groups: None, key_shares: None, supported_versions: [0304, 0304], sigalgs: None, orders: [], shapes: [], shape_first: false, resume: false }

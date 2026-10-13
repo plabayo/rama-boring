@@ -611,7 +611,7 @@ impl SslRef {
     }
 
     /// Sets the groups this client lists in supported_groups, exactly as on the
-    /// wire: GREASE codepoints are GREASE slots, and groups it cannot negotiate
+    /// wire, repeats included: GREASE codepoints are GREASE slots, and groups it cannot negotiate
     /// follow [`UnknownValues`]. The supported ones also become the groups this
     /// connection negotiates. Fails if none is supported.
     #[corresponds(RAMA_SSL_set_raw_supported_groups)]
@@ -629,8 +629,9 @@ impl SslRef {
     /// Sets the groups this client sends key shares for, in order, exactly as
     /// on the wire: GREASE codepoints are GREASE key shares. A group must also
     /// be a supported group; others are never sent (they need a key), whatever
-    /// the [`UnknownValues`] policy. With no key share left, the client sends
-    /// an empty list, asking the server for a HelloRetryRequest.
+    /// the [`UnknownValues`] policy, and later repeats of a group are dropped
+    /// (RFC 8446 forbids them). With no key share left, the client sends an
+    /// empty list, asking the server for a HelloRetryRequest.
     #[corresponds(RAMA_SSL_set_raw_key_shares)]
     pub fn set_raw_key_shares(&mut self, groups: &[u16]) -> Result<(), ErrorStack> {
         unsafe {
@@ -644,7 +645,7 @@ impl SslRef {
     }
 
     /// Sets the versions this client lists in supported_versions, exactly as
-    /// on the wire: GREASE codepoints are GREASE slots, and versions outside the
+    /// on the wire, repeats included: GREASE codepoints are GREASE slots, and versions outside the
     /// configured minimum and maximum follow [`UnknownValues`].
     #[corresponds(RAMA_SSL_set_raw_supported_versions)]
     pub fn set_raw_supported_versions(&mut self, versions: &[u16]) -> Result<(), ErrorStack> {
@@ -658,8 +659,8 @@ impl SslRef {
         }
     }
 
-    /// Sets the signature algorithms this client lists, exactly as on the wire:
-    /// GREASE codepoints are GREASE slots, and algorithms BoringSSL does not
+    /// Sets the signature algorithms this client lists, exactly as on the wire,
+    /// repeats included (Safari repeats one): GREASE codepoints are GREASE slots, and algorithms BoringSSL does not
     /// implement follow [`UnknownValues`]. The server's choice is still checked
     /// against [`Self::set_verify_algorithm_prefs`].
     #[corresponds(RAMA_SSL_set_raw_signature_algorithms)]

@@ -494,8 +494,8 @@ mod model {
         policy: UnknownValues,
         values: GreaseValues,
     ) -> Option<Vec<Option<u16>>> {
+        // Repeats are kept as listed.
         let mut out = Vec::new();
-        let mut seen = Vec::new();
         for &value in raw {
             if is_grease(value) {
                 out.push(
@@ -505,10 +505,6 @@ mod model {
                 );
                 continue;
             }
-            if seen.contains(&value) {
-                continue;
-            }
-            seen.push(value);
             if known.contains(&value) {
                 out.push(Some(value));
             } else {

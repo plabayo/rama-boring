@@ -399,7 +399,8 @@ impl Model {
 
     /// A set list as it must appear on the wire: GREASE slots exactly where
     /// listed (their value too when pinned), later duplicates of other values
-    /// dropped when `dedupe`, and the unknown-value policy applied. `None`
+    /// dropped when `dedupe` (key shares only: RFC 8446 forbids repeats), and
+    /// the unknown-value policy applied. `None`
     /// when the policy forbids it.
     fn expected(
         &self,
@@ -644,7 +645,7 @@ impl Model {
         match &self.groups {
             Some(raw) => prop_assert_eq!(
                 self.wire(&groups),
-                self.expected(raw, true, |g| self.group_class(g)).unwrap(),
+                self.expected(raw, false, |g| self.group_class(g)).unwrap(),
                 "supported_groups"
             ),
             None => native_list("groups", &groups, grease.contains(GreaseLists::GROUPS))?,
@@ -655,7 +656,8 @@ impl Model {
             match &self.versions {
                 Some(raw) => prop_assert_eq!(
                     self.wire(&versions),
-                    self.expected(raw, true, |v| self.version_class(v)).unwrap(),
+                    self.expected(raw, false, |v| self.version_class(v))
+                        .unwrap(),
                     "supported_versions"
                 ),
                 None => native_list(
@@ -672,7 +674,7 @@ impl Model {
         match &self.sigalgs {
             Some(raw) => prop_assert_eq!(
                 self.wire(&sigalgs),
-                self.expected(raw, true, Self::sigalg_class).unwrap(),
+                self.expected(raw, false, Self::sigalg_class).unwrap(),
                 "signature_algorithms"
             ),
             None => native_list(
@@ -1374,8 +1376,10 @@ fn grease_slots_first_middle_and_last() {
     }
 }
 
+/// Lists keep repeats as listed (Safari repeats a signature algorithm); key
+/// shares drop later repeats, and an order lists each extension once.
 #[test]
-fn duplicates_are_dropped_except_in_raw_cipher_lists() {
+fn duplicates_are_kept_except_in_key_shares_and_orders() {
     let mut case = Case::new(Versions::Both).order(&[51, 10, 51, 0x0a0a, 10, 0x0a0a]);
     case.ciphers = Some(vec![0x1301, 0x1301, 0xc02f, 0x1301]);
     case.groups = Some(vec![X25519, P256, X25519, 0x0a0a, 0x0a0a]);
