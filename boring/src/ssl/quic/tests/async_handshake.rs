@@ -876,3 +876,63 @@ isolated_test! {
         }
     }
 }
+
+/// A waker whose next dropped handle panics once armed.
+struct ArmedWaker {
+    armed: std::sync::atomic::AtomicBool,
+    fired: std::sync::atomic::AtomicBool,
+}
+
+static ARMED_WAKER_VTABLE: std::task::RawWakerVTable = std::task::RawWakerVTable::new(
+    |data| std::task::RawWaker::new(data, &ARMED_WAKER_VTABLE),
+    |_| {},
+    |_| {},
+    |data| {
+        let waker = unsafe { &*data.cast::<ArmedWaker>() };
+        if waker.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            waker.fired.store(true, std::sync::atomic::Ordering::SeqCst);
+            panic!("waker");
+        }
+    },
+);
+
+impl ArmedWaker {
+    fn new() -> &'static Self {
+        Box::leak(Box::new(Self {
+            armed: false.into(),
+            fired: false.into(),
+        }))
+    }
+
+    fn waker(&'static self) -> std::task::Waker {
+        // SAFETY: the vtable only reads a leaked, immortal `ArmedWaker`.
+        unsafe {
+            std::task::Waker::from_raw(std::task::RawWaker::new(
+                (self as *const Self).cast(),
+                &ARMED_WAKER_VTABLE,
+            ))
+        }
+    }
+}
+
+#[test]
+fn a_replaced_waker_that_panics_when_dropped_is_contained() {
+    let gate = Gate::new();
+    let (_client, mut server) = certificate_pending_server(&gate);
+    let first = ArmedWaker::new();
+    let first_waker = first.waker();
+    assert!(server
+        .conn
+        .poll_handshake(&mut Context::from_waker(&first_waker))
+        .is_pending());
+    // The next poll replaces the installed handle first: its destructor panics.
+    first.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        server
+            .conn
+            .poll_handshake(&mut Context::from_waker(std::task::Waker::noop()))
+            .is_pending()
+    }));
+    assert!(first.fired.load(std::sync::atomic::Ordering::SeqCst));
+    assert_eq!(polled.ok(), Some(true), "the panic escaped polling");
+}

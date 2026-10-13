@@ -765,3 +765,114 @@ isolated_test! {
         }
     }
 }
+
+/// A future that is pending once, then ready with what `make` builds; it
+/// panics when dropped, and so does what `make` builds.
+struct ReadyBomb<T> {
+    make: Option<fn() -> T>,
+    polled: bool,
+    _drop: PanicOnDrop,
+}
+
+fn ready_bomb<T: 'static>(
+    make: fn() -> T,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>> {
+    Box::pin(ReadyBomb {
+        make: Some(make),
+        polled: false,
+        _drop: PanicOnDrop,
+    })
+}
+
+impl<T> Unpin for ReadyBomb<T> {}
+
+impl<T> std::future::Future for ReadyBomb<T> {
+    type Output = T;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<T> {
+        if !self.polled {
+            self.polled = true;
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
+        }
+        std::task::Poll::Ready((self.make.take().expect("polled after completion"))())
+    }
+}
+
+isolated_test! {
+    fn completed_futures_and_results_with_panicking_destructors_are_contained() {
+        // Certificate selection: the future and the finish closure both panic
+        // when dropped.
+        let mut server = server_context();
+        server.set_async_certificate_callback(|_| {
+            Ok(ready_bomb(|| {
+                let guard = PanicOnDrop;
+                Ok(Box::new(move |_: CertificateSelection<'_>| {
+                    let _owned = &guard;
+                    Ok(())
+                }) as BoxCertificateFinish)
+            }))
+        });
+        let mut server = Ssl::new(&server.build()).unwrap();
+        server.set_task_waker(Some(Waker::noop().clone()));
+        let (_, server) = handshake(Ssl::new(&client_context().build()).unwrap(), server);
+        server.panicked("destructor");
+
+        // Signing: the future and the finish closure both panic when dropped.
+        struct Signer;
+        impl crate::ssl::AsyncPrivateKeyMethod for Signer {
+            fn sign(
+                &self,
+                _: &mut SslRef,
+                _: &[u8],
+                _: SslSignatureAlgorithm,
+                _: &mut [u8],
+            ) -> Result<crate::ssl::BoxPrivateKeyMethodFuture, crate::ssl::AsyncPrivateKeyMethodError>
+            {
+                Ok(ready_bomb(|| {
+                    let guard = PanicOnDrop;
+                    Ok(Box::new(move |_: &mut SslRef, _: &mut [u8]| {
+                        let _owned = &guard;
+                        Err(crate::ssl::AsyncPrivateKeyMethodError)
+                    }) as crate::ssl::BoxPrivateKeyMethodFinish)
+                }))
+            }
+            fn decrypt(
+                &self,
+                _: &mut SslRef,
+                _: &[u8],
+                _: &mut [u8],
+            ) -> Result<crate::ssl::BoxPrivateKeyMethodFuture, crate::ssl::AsyncPrivateKeyMethodError>
+            {
+                Err(crate::ssl::AsyncPrivateKeyMethodError)
+            }
+        }
+        let mut server = server_context();
+        server.set_async_private_key_method(Signer);
+        let mut server = Ssl::new(&server.build()).unwrap();
+        server.set_task_waker(Some(Waker::noop().clone()));
+        let (_, server) = handshake(Ssl::new(&client_context().build()).unwrap(), server);
+        server.failed();
+    }
+}
+
+isolated_test! {
+    fn a_callback_that_replaces_itself_and_panics_is_contained() {
+        // The callback owns a panicking destructor, replaces itself (so the
+        // running call holds the last reference), then panics.
+        let mut server = Ssl::new(&server_context().build()).unwrap();
+        let guard = PanicOnDrop;
+        server.set_certificate_callback(move |mut selection| {
+            let _owned = &guard;
+            selection
+                .ssl_mut()
+                .set_certificate_callback(|_| Ok(()));
+            panic!("replaced")
+        });
+        let (_, server) = handshake(Ssl::new(&client_context().build()).unwrap(), server);
+        server.panicked("replaced");
+    }
+}

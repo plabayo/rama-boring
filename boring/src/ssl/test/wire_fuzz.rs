@@ -607,6 +607,12 @@ impl Model {
                 ids
             );
         }
+        // Padding, if any, is the last extension or comes right before
+        // pre_shared_key: never earlier.
+        if let Some(padding) = ids.iter().position(|id| *id == PADDING) {
+            let expected = ids.len() - 1 - usize::from(ids.last() == Some(&PRE_SHARED_KEY));
+            prop_assert_eq!(padding, expected, "padding misplaced: {:04x?}", ids);
+        }
         let native = ids
             .iter()
             .rposition(|id| *id != PADDING && *id != PRE_SHARED_KEY)
