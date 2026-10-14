@@ -5,7 +5,7 @@ use super::memory::{client_context, handshake, server_context, Side};
 use super::wire::{self, is_grease};
 use crate::ssl::{
     ClientHelloShape, ExtensionType, GreaseLists, GreaseValues, Padding, Ssl, SslContext,
-    SslContextBuilder, SslVersion, UnknownValues,
+    SslContextBuilder, SslCurve, SslVersion, UnknownValues,
 };
 use std::sync::{Arc, Mutex};
 
@@ -1096,4 +1096,180 @@ fn key_shares_never_repeat_a_group_even_pinned() {
             assert_eq!(shares.len(), 3, "fresh slots are distinct values");
         }
     }
+}
+
+const MLKEM: u16 = 0x11ec;
+
+/// The supported groups of a client's first ClientHello, and the group the
+/// handshake negotiated.
+fn groups_and_curve(client: Ssl, server: Ssl) -> (Vec<u16>, Option<SslCurve>) {
+    let (hellos, client) = hellos_of(client, server);
+    let client = client.done();
+    (hellos[0].groups(), client.ssl().curve())
+}
+
+#[test]
+fn context_curves_are_sent_in_order() {
+    let ssl = client(|ctx| {
+        ctx.set_grease_enabled(false);
+        ctx.set_curves(&[
+            SslCurve::X25519_MLKEM768,
+            SslCurve::SECP384R1,
+            SslCurve::X25519,
+        ])
+        .unwrap();
+    });
+    let (groups, curve) = groups_and_curve(ssl, Ssl::new(&server()).unwrap());
+    assert_eq!(groups, [MLKEM, P384, X25519]);
+    assert_eq!(curve, Some(SslCurve::X25519_MLKEM768));
+
+    // An empty list restores the defaults.
+    let defaults = groups_and_curve(client(|_| {}), Ssl::new(&server()).unwrap()).0;
+    let ssl = client(|ctx| {
+        ctx.set_curves(&[SslCurve::SECP384R1]).unwrap();
+        ctx.set_curves(&[]).unwrap();
+    });
+    assert_eq!(
+        groups_and_curve(ssl, Ssl::new(&server()).unwrap()).0,
+        defaults
+    );
+}
+
+#[test]
+fn connection_curves_replace_the_context_curves() {
+    for grease in [false, true] {
+        let ctx = {
+            let mut ctx = client_context();
+            ctx.set_grease_enabled(grease);
+            ctx.set_curves(&[SslCurve::X25519, SslCurve::SECP256R1])
+                .unwrap();
+            ctx.build()
+        };
+        let mut ssl = Ssl::new(&ctx).unwrap();
+        ssl.set_curves(&[
+            SslCurve::SECP384R1,
+            SslCurve::X25519_MLKEM768,
+            SslCurve::X25519,
+        ])
+        .unwrap();
+        let (groups, curve) = groups_and_curve(ssl, Ssl::new(&server()).unwrap());
+        // A native list: GREASE first when enabled, and none otherwise.
+        assert_eq!(is_grease(groups[0]), grease, "{groups:04x?}");
+        let groups: Vec<u16> = groups.into_iter().filter(|g| !is_grease(*g)).collect();
+        assert_eq!(groups, [P384, MLKEM, X25519]);
+        assert_eq!(curve, Some(SslCurve::SECP384R1));
+
+        // Another connection from the same context keeps the context's list.
+        let (groups, curve) =
+            groups_and_curve(Ssl::new(&ctx).unwrap(), Ssl::new(&server()).unwrap());
+        assert_eq!(is_grease(groups[0]), grease, "{groups:04x?}");
+        let groups: Vec<u16> = groups.into_iter().filter(|g| !is_grease(*g)).collect();
+        assert_eq!(groups, [X25519, P256]);
+        assert_eq!(curve, Some(SslCurve::X25519));
+    }
+}
+
+#[test]
+fn connection_curves_follow_the_connection_grease_lists() {
+    let groups = |lists: GreaseLists| {
+        let mut ssl = client(|ctx| ctx.set_grease_enabled(false));
+        ssl.set_client_hello_shape(&ClientHelloShape::new().with_grease_lists(lists))
+            .unwrap();
+        ssl.set_curves(&[SslCurve::X25519, SslCurve::SECP256R1])
+            .unwrap();
+        groups_and_curve(ssl, Ssl::new(&server()).unwrap()).0
+    };
+    assert_eq!(
+        shape(&groups(GreaseLists::GROUPS)),
+        [None, Some(X25519), Some(P256)]
+    );
+    assert_eq!(groups(GreaseLists::empty()), [X25519, P256]);
+}
+
+#[test]
+fn native_and_raw_group_setters_replace_each_other() {
+    let groups = |configure: &dyn Fn(&mut Ssl)| {
+        let mut ssl = client(|ctx| ctx.set_grease_enabled(false));
+        configure(&mut ssl);
+        groups_and_curve(ssl, Ssl::new(&server()).unwrap())
+    };
+    // The list set last is the one sent and negotiated.
+    assert_eq!(
+        groups(&|ssl| {
+            ssl.set_raw_supported_groups(&[X25519, 0x0a0a, P256])
+                .unwrap();
+            ssl.set_curves(&[SslCurve::SECP384R1]).unwrap();
+        }),
+        (vec![P384], Some(SslCurve::SECP384R1))
+    );
+    assert_eq!(
+        groups(&|ssl| {
+            ssl.set_raw_supported_groups(&[X25519, 0x0a0a, P256])
+                .unwrap();
+            ssl.set_curves_list("P-384:P-256").unwrap();
+        }),
+        (vec![P384, P256], Some(SslCurve::SECP384R1))
+    );
+    let (raw, curve) = groups(&|ssl| {
+        ssl.set_curves(&[SslCurve::SECP384R1]).unwrap();
+        ssl.set_raw_supported_groups(&[P256, 0x0a0a, X25519])
+            .unwrap();
+    });
+    assert_eq!(shape(&raw), [Some(P256), None, Some(X25519)]);
+    assert_eq!(curve, Some(SslCurve::SECP256R1));
+}
+
+#[test]
+fn servers_negotiate_from_their_connection_curves() {
+    let offered = [
+        SslCurve::X25519_MLKEM768,
+        SslCurve::X25519,
+        SslCurve::SECP256R1,
+    ];
+    let ctx = server();
+    for curve in offered {
+        let ssl = client(|ctx| ctx.set_curves(&offered).unwrap());
+        let mut server = Ssl::new(&ctx).unwrap();
+        server.set_curves(&[SslCurve::SECP384R1, curve]).unwrap();
+        let (client, server) = handshake(ssl, server);
+        let (client, server) = (client.done(), server.done());
+        assert_eq!(client.ssl().curve(), Some(curve));
+        assert_eq!(server.ssl().curve(), Some(curve));
+        // Only the first key share is P-256's fallback: it needs a retry.
+        assert_eq!(
+            client.ssl().used_hello_retry_request(),
+            curve == SslCurve::SECP256R1
+        );
+    }
+    // Without its own list, a connection from the same context negotiates
+    // the client's preference.
+    let ssl = client(|ctx| ctx.set_curves(&offered).unwrap());
+    let (client, _) = handshake(ssl, Ssl::new(&ctx).unwrap());
+    assert_eq!(client.done().ssl().curve(), Some(SslCurve::X25519_MLKEM768));
+}
+
+#[test]
+fn connection_curves_are_fixed_like_other_wire_settings() {
+    let mut ssl = client(|_| {});
+    assert!(ssl.set_curves(&[SslCurve::X25519]).is_ok());
+    assert!(ssl.set_curves_list("X25519").is_ok());
+    assert!(
+        ssl.set_curves(&[SslCurve::X25519, SslCurve::X25519])
+            .is_err(),
+        "repeated"
+    );
+    let (a, _b) = super::memory::ends();
+    let Err(crate::ssl::HandshakeError::WouldBlock(mut mid)) = ssl.connect(a) else {
+        panic!("the client waits for the server");
+    };
+    assert!(mid.ssl_mut().set_curves(&[SslCurve::SECP256R1]).is_err());
+    assert!(mid.ssl_mut().set_curves_list("P-256").is_err());
+
+    // A server until its handshake completes.
+    let mut server = Ssl::new(&server()).unwrap();
+    assert!(server.set_curves(&[SslCurve::X25519]).is_ok());
+    let (_, server) = handshake(client(|_| {}), server);
+    let mut server = server.done();
+    assert!(server.ssl_mut().set_curves(&[SslCurve::X25519]).is_err());
+    assert!(server.ssl_mut().set_curves_list("X25519").is_err());
 }

@@ -853,33 +853,9 @@ impl SslCurve {
         }
     }
 
-    // We need to allow dead_code here because `SslRef::set_curves` is conditionally compiled
-    // against the absence of the `kx-safe-default` feature and thus this function is never used.
-    //
-    // **NOTE**: This function only exists because the version of boringssl we currently use does
-    // not expose SSL_CTX_set1_group_ids. Because `SslRef::curve()` returns the public SSL_CURVE id
-    // as opposed to the internal NID, but `SslContextBuilder::set_curves()` requires the internal
-    // NID, we need this mapping in place to avoid breaking changes to the public API. Once the
-    // underlying boringssl version is upgraded, this should be removed in favor of the new
-    // SSL_CTX_set1_group_ids API.
-    //
-    // TODO[glendc]: this is available now, but not yet sure how to use it,
-    // as such it is still in here
-    #[allow(dead_code)]
-    fn nid(&self) -> Option<c_int> {
-        match self.0 {
-            ffi::SSL_CURVE_SECP256R1 => Some(ffi::NID_X9_62_prime256v1),
-            ffi::SSL_CURVE_SECP384R1 => Some(ffi::NID_secp384r1),
-            ffi::SSL_CURVE_SECP521R1 => Some(ffi::NID_secp521r1),
-            ffi::SSL_CURVE_X25519 => Some(ffi::NID_X25519),
-            ffi::SSL_GROUP_X25519_MLKEM768 => Some(ffi::NID_X25519MLKEM768),
-            ffi::SSL_GROUP_X25519_KYBER768_DRAFT00 => Some(ffi::NID_X25519Kyber768Draft00),
-            ffi::SSL_GROUP_X25519_KYBER512_DRAFT00 => Some(ffi::NID_X25519Kyber512Draft00),
-            ffi::SSL_GROUP_X25519_KYBER768_DRAFT00_OLD => Some(ffi::NID_X25519Kyber768Draft00Old),
-            ffi::SSL_GROUP_P256_KYBER768_DRAFT00 => Some(ffi::NID_P256Kyber768Draft00),
-            ffi::SSL_GROUP_MLKEM1024 => Some(ffi::NID_ML_KEM_1024),
-            _ => None,
-        }
+    /// The TLS group ID, as listed on the wire.
+    fn group_id(self) -> u16 {
+        self.0 as u16
     }
 }
 
@@ -2231,11 +2207,7 @@ impl SslContextBuilder {
         unsafe { ffi::SSL_CTX_enable_ocsp_stapling(self.as_ptr()) }
     }
 
-    /// Sets the context's supported curves.
-    //
-    // If the "kx-*" flags are used to set key exchange preference, then don't allow the user to
-    // set them here. This ensures we don't override the user's preference without telling them:
-    // when the flags are used, the preferences are set just before connecting or accepting.
+    /// Sets the context's supported curves, by name, such as `"X25519:P-256"`.
     #[corresponds(SSL_CTX_set1_curves_list)]
     pub fn set_curves_list(&mut self, curves: &str) -> Result<(), ErrorStack> {
         let curves = CString::new(curves).unwrap();
@@ -2248,20 +2220,17 @@ impl SslContextBuilder {
         }
     }
 
-    /// Sets the context's supported curves.
-    //
-    // If the "kx-*" flags are used to set key exchange preference, then don't allow the user to
-    // set them here. This ensures we don't override the user's preference without telling them:
-    // when the flags are used, the preferences are set just before connecting or accepting.
-    #[corresponds(SSL_CTX_set1_curves)]
+    /// Sets the context's supported curves, in preference order. This is a
+    /// native list: GREASE follows the context's GREASE settings. An empty list
+    /// restores the default curves.
+    #[corresponds(SSL_CTX_set1_group_ids)]
     pub fn set_curves(&mut self, curves: &[SslCurve]) -> Result<(), ErrorStack> {
-        let curves: Vec<i32> = curves.iter().filter_map(|curve| curve.nid()).collect();
-
+        let group_ids: Vec<u16> = curves.iter().map(|curve| curve.group_id()).collect();
         unsafe {
-            cvt_0i(ffi::SSL_CTX_set1_curves(
+            cvt_0i(ffi::SSL_CTX_set1_group_ids(
                 self.as_ptr(),
-                curves.as_ptr() as *const _,
-                curves.len(),
+                group_ids.as_ptr(),
+                group_ids.len(),
             ))
             .map(|_| ())
         }
@@ -3107,13 +3076,41 @@ impl SslRef {
         SslOptions::from_bits_retain(bits)
     }
 
+    /// Like [`SslContextBuilder::set_curves_list`], for this connection only.
+    /// It replaces a list set with [`Self::set_raw_supported_groups`].
+    ///
+    /// A client must set it before writing its ClientHello, a server before its
+    /// handshake completes.
     #[corresponds(SSL_set1_curves_list)]
     pub fn set_curves_list(&mut self, curves: &str) -> Result<(), ErrorStack> {
         let curves = CString::new(curves).map_err(ErrorStack::internal_error)?;
+        self.check_wire_settings_mutable()?;
         unsafe {
             cvt_0i(ffi::SSL_set1_curves_list(
                 self.as_ptr(),
                 curves.as_ptr() as *const _,
+            ))
+            .map(|_| ())
+        }
+    }
+
+    /// Like [`SslContextBuilder::set_curves`], for this connection only: a
+    /// native list, so GREASE follows the connection's (or context's) GREASE
+    /// settings, see [`GreaseLists::GROUPS`]. It replaces a list set with
+    /// [`Self::set_raw_supported_groups`]. An empty list restores the default
+    /// curves.
+    ///
+    /// A client must set it before writing its ClientHello, a server before its
+    /// handshake completes.
+    #[corresponds(SSL_set1_group_ids)]
+    pub fn set_curves(&mut self, curves: &[SslCurve]) -> Result<(), ErrorStack> {
+        let group_ids: Vec<u16> = curves.iter().map(|curve| curve.group_id()).collect();
+        self.check_wire_settings_mutable()?;
+        unsafe {
+            cvt_0i(ffi::SSL_set1_group_ids(
+                self.as_ptr(),
+                group_ids.as_ptr(),
+                group_ids.len(),
             ))
             .map(|_| ())
         }
@@ -4099,7 +4096,7 @@ impl SslRef {
     /// takes precedence over this selection.
     #[corresponds(SSL_set1_client_key_shares)]
     pub fn set_client_key_shares(&mut self, curves: &[SslCurve]) -> Result<(), ErrorStack> {
-        let group_ids: Vec<u16> = curves.iter().map(|curve| curve.0 as u16).collect();
+        let group_ids: Vec<u16> = curves.iter().map(|curve| curve.group_id()).collect();
         unsafe {
             cvt(ffi::SSL_set1_client_key_shares(
                 self.as_ptr(),

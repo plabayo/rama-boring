@@ -1,5 +1,5 @@
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 3b48c2a..98a83df 100644
+index 3b48c2a..e1bbfab 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
 @@ -1739,8 +1739,17 @@ OPENSSL_EXPORT int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx,
@@ -42,7 +42,7 @@ index 3b48c2a..98a83df 100644
  
  // QUIC integration.
  //
-@@ -5565,7 +5580,192 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
+@@ -5565,7 +5580,193 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
  
@@ -181,7 +181,8 @@ index 3b48c2a..98a83df 100644
 +
 +// RAMA_SSL_set_raw_supported_groups sets the groups this client lists in its
 +// ClientHello, in order, repeats included. GREASE codepoints mark GREASE slots.
-+// Supported groups also become the groups this connection negotiates.
++// Supported groups also become the groups this connection negotiates. A later
++// native group setter, such as |SSL_set1_group_ids|, replaces this list.
 +OPENSSL_EXPORT int RAMA_SSL_set_raw_supported_groups(SSL *ssl,
 +                                                     const uint16_t *ids,
 +                                                     size_t num);
@@ -1558,7 +1559,7 @@ index 7799d79..c32d06b 100644
    switch (EVP_PKEY_id(key)) {
      case EVP_PKEY_RSA:
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index a0c746b..fb87163 100644
+index a0c746b..7c5a6e0 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
 @@ -364,6 +364,12 @@ void SSL_set_aes_hw_override_for_testing(SSL *ssl, bool override_value) {
@@ -1574,7 +1575,51 @@ index a0c746b..fb87163 100644
  BSSL_NAMESPACE_END
  
  using namespace bssl;
-@@ -2184,9 +2190,8 @@ STACK_OF(SSL_CIPHER) *SSL_get_ciphers(const SSL *ssl) {
+@@ -1937,6 +1943,16 @@ static void clear_key_shares_if_invalid(SSL_CONFIG *config) {
+   }
+ }
+ 
++// rama_native_groups_set follows a native per-connection group setter: the new
++// list replaces a raw supported_groups list set earlier, so it is the one sent.
++static void rama_native_groups_set(SSL_CONFIG *config) {
++  clear_key_shares_if_invalid(config);
++  if (config->rama != nullptr) {
++    config->rama->groups_set = false;
++    config->rama->groups.Reset();
++  }
++}
++
+ static bool check_group_flags(Span<const uint32_t> flags) {
+   if (flags.empty()) {
+     return true;
+@@ -1998,7 +2014,7 @@ int SSL_set1_group_ids_with_flags(SSL *ssl, const uint16_t *group_ids,
+   if (set_group_ids_and_flags(group_ids, flags, num_group_ids,
+                               &ssl_impl->config->supported_group_list,
+                               &ssl_impl->config->supported_group_list_flags)) {
+-    clear_key_shares_if_invalid(ssl_impl->config.get());
++    rama_native_groups_set(ssl_impl->config.get());
+     return 1;
+   }
+   return 0;
+@@ -2045,7 +2061,7 @@ int SSL_set1_groups(SSL *ssl, const int *groups, size_t num_groups) {
+                             Span(groups, num_groups)) &&
+       ssl_impl->config->supported_group_list_flags.Init(
+           ssl_impl->config->supported_group_list.size())) {
+-    clear_key_shares_if_invalid(ssl_impl->config.get());
++    rama_native_groups_set(ssl_impl->config.get());
+     return 1;
+   }
+   return 0;
+@@ -2106,7 +2122,7 @@ int SSL_set1_groups_list(SSL *ssl, const char *groups) {
+   if (ssl_str_to_group_ids(&ssl_impl->config->supported_group_list, groups) &&
+       ssl_impl->config->supported_group_list_flags.Init(
+           ssl_impl->config->supported_group_list.size())) {
+-    clear_key_shares_if_invalid(ssl_impl->config.get());
++    rama_native_groups_set(ssl_impl->config.get());
+     return 1;
+   }
+   return 0;
+@@ -2184,9 +2200,8 @@ STACK_OF(SSL_CIPHER) *SSL_get_ciphers(const SSL *ssl) {
      return nullptr;
    }
  
@@ -1586,7 +1631,7 @@ index a0c746b..fb87163 100644
  }
  
  const char *SSL_get_cipher_list(const SSL *ssl, int n) {
-@@ -2216,6 +2221,124 @@ int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str) {
+@@ -2216,6 +2231,124 @@ int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str) {
                                  false /* not strict */);
  }
  
@@ -1711,7 +1756,7 @@ index a0c746b..fb87163 100644
  int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx, const char *str) {
    auto *ctx_impl = FromOpaque(ctx);
    const bool has_aes_hw = ctx_impl->aes_hw_override
-@@ -2541,6 +2664,45 @@ void SSL_set_alps_use_new_codepoint(SSL *ssl, int use_new) {
+@@ -2541,6 +2674,45 @@ void SSL_set_alps_use_new_codepoint(SSL *ssl, int use_new) {
    ssl_impl->config->alps_use_new_codepoint = !!use_new;
  }
  
@@ -1757,7 +1802,7 @@ index a0c746b..fb87163 100644
  int SSL_CTX_add_cert_compression_alg(SSL_CTX *ctx, uint16_t alg_id,
                                       ssl_cert_compression_func_t compress,
                                       ssl_cert_decompression_func_t decompress) {
-@@ -3284,6 +3446,231 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
+@@ -3284,6 +3456,231 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
    FromOpaque(ctx)->permute_extensions = !!enabled;
  }
  

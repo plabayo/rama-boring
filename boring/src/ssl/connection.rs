@@ -486,7 +486,7 @@ impl SslRef {
         }
     }
 
-    fn check_wire_settings_mutable(&mut self) -> Result<(), ErrorStack> {
+    pub(super) fn check_wire_settings_mutable(&mut self) -> Result<(), ErrorStack> {
         unsafe { cvt(ffi::RAMA_SSL_can_set_wire_settings(self.as_ptr())).map(|_| ()) }
     }
 
@@ -629,7 +629,8 @@ impl SslRef {
     /// Sets the groups this client lists in supported_groups, exactly as on the
     /// wire, repeats included: GREASE codepoints are GREASE slots, and groups it cannot negotiate
     /// follow [`UnknownValues`]. The supported ones also become the groups this
-    /// connection negotiates. Fails if none is supported.
+    /// connection negotiates. Fails if none is supported. A later
+    /// [`Self::set_curves`] or [`Self::set_curves_list`] replaces this list.
     #[corresponds(RAMA_SSL_set_raw_supported_groups)]
     pub fn set_raw_supported_groups(&mut self, groups: &[u16]) -> Result<(), ErrorStack> {
         unsafe {
