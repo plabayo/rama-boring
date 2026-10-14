@@ -412,6 +412,14 @@ impl Model {
         let mut seen = Vec::new();
         for &value in raw {
             if is_grease(value) {
+                // Pinned slots keep their codepoint, so a repeated one is a
+                // repeated value; fresh and seeded slots are always distinct.
+                if dedupe && self.pinned() {
+                    if seen.contains(&value) {
+                        continue;
+                    }
+                    seen.push(value);
+                }
                 out.push(self.pinned().then_some(value));
                 continue;
             }

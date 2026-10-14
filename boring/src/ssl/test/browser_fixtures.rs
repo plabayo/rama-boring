@@ -3,7 +3,8 @@
 //! capture field by field.
 //!
 //! Only per-connection values are normalized: the random, session ID bytes,
-//! key share key exchange bytes and the GREASE ECH payload. Everything else
+//! key share key exchange bytes and, for GREASE ECH, the config ID, the `enc`
+//! bytes and the payload (whose length must be one GREASE ECH picks). Everything else
 //! must match, unless listed as a fixture's known difference; a new
 //! difference or a stale exception fails the test.
 
@@ -107,8 +108,9 @@ struct Fixture {
 
 const NOT_IN_QUIC: &str = "BoringSSL builds it only when TLS 1.2 can be negotiated, which \
                            QUIC rules out, and refuses a body for an extension it builds";
-const NO_AES_HARDWARE: &str =
-    "without AES hardware, BoringSSL's GREASE ECH uses ChaCha20-Poly1305 rather than AES-128-GCM";
+/// HPKE AEAD IDs (RFC 9180).
+const AES_128_GCM: u16 = 0x0001;
+const CHACHA20_POLY1305: u16 = 0x0003;
 
 /// A ClientHello reduced to what a mirror must reproduce.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -474,12 +476,22 @@ fn check(fixture: &Fixture) {
     assert_eq!(hello.encode(), captured);
     let emitted = emit(&hello, fixture.transport);
     let sent = ClientHello::parse(&emitted).expect("a well-formed emitted ClientHello");
-    let found = differences(&Normalized::new(&hello), &Normalized::new(&sent));
-    let mut expected: BTreeMap<_, _> = fixture.known_differences.iter().copied().collect();
-    let aes_hardware = unsafe { ffi::EVP_has_aes_hardware() } != 0;
-    if hello.extension(ENCRYPTED_CLIENT_HELLO).is_some() && !aes_hardware {
-        expected.insert(Difference::Body(ENCRYPTED_CLIENT_HELLO), NO_AES_HARDWARE);
+    let mut sent = Normalized::new(&sent);
+    // Without AES hardware, BoringSSL's GREASE ECH picks ChaCha20-Poly1305
+    // over the captured AES-128-GCM: only that AEAD field may differ.
+    if unsafe { ffi::EVP_has_aes_hardware() } == 0 {
+        if let Some((_, body)) = sent
+            .extensions
+            .iter_mut()
+            .find(|(id, _)| *id == ENCRYPTED_CLIENT_HELLO)
+        {
+            if body.get(3..5) == Some(&CHACHA20_POLY1305.to_be_bytes()[..]) {
+                body[3..5].copy_from_slice(&AES_128_GCM.to_be_bytes());
+            }
+        }
     }
+    let found = differences(&Normalized::new(&hello), &sent);
+    let expected: BTreeMap<_, _> = fixture.known_differences.iter().copied().collect();
     let report: String = found
         .iter()
         .map(|(difference, detail)| {

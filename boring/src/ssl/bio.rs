@@ -29,9 +29,18 @@ impl<S> StreamState<S> {
     fn poison(&mut self, payload: Box<dyn std::any::Any + Send>) {
         let message = unwind::contain(payload);
         self.panicked = true;
-        self.error = Some(io::Error::other(format!(
+        self.set_error(io::Error::other(format!(
             "TLS transport stream panicked: {message}"
         )));
+    }
+
+    // The replaced error may own a stream-defined destructor, which runs where
+    // unwinding is not allowed: contain it.
+    #[inline(always)]
+    fn set_error(&mut self, error: io::Error) {
+        if let Some(replaced) = self.error.replace(error) {
+            unwind::drop_contained(replaced);
+        }
     }
 
     #[inline(always)]
@@ -46,7 +55,7 @@ impl<S> StreamState<S> {
     #[inline(never)]
     fn poisoned_again(&mut self) {
         if self.error.is_none() {
-            self.error = Some(io::Error::other("TLS transport stream panicked earlier"));
+            self.set_error(io::Error::other("TLS transport stream panicked earlier"));
         }
     }
 }
@@ -95,7 +104,7 @@ pub unsafe fn get_mut<'a, S: 'a>(bio: *mut BIO) -> &'a mut S {
     &mut state(bio).stream
 }
 
-pub unsafe extern "C" fn take_stream<S>(bio: *mut BIO) -> S {
+pub unsafe fn take_stream<S>(bio: *mut BIO) -> S {
     assert!(!bio.is_null());
 
     let data = BIO_get_data(bio);
@@ -106,7 +115,33 @@ pub unsafe extern "C" fn take_stream<S>(bio: *mut BIO) -> S {
 
     BIO_set_data(bio, ptr::null_mut());
 
-    state.stream
+    // A pending error may own a stream-defined destructor: contain it, as on
+    // every other cleanup path.
+    let StreamState { stream, error, .. } = *state;
+    unwind::drop_contained(error);
+    stream
+}
+
+/// Flushes the stream as the BIO does: never after it panicked, and a panic
+/// poisons it and becomes an I/O error.
+pub unsafe fn flush<S: Write>(bio: *mut BIO) -> io::Result<()> {
+    let state = state::<S>(bio);
+    if state.poisoned() {
+        return Err(state
+            .error
+            .take()
+            .unwrap_or_else(|| io::Error::other("TLS transport stream panicked earlier")));
+    }
+    match catch_unwind(AssertUnwindSafe(|| state.stream.flush())) {
+        Ok(result) => result,
+        Err(payload) => {
+            state.poison(payload);
+            Err(state
+                .error
+                .take()
+                .unwrap_or_else(|| io::Error::other("TLS transport stream panicked")))
+        }
+    }
 }
 
 pub unsafe fn set_dtls_mtu_size<S>(bio: *mut BIO, mtu_size: usize) {
@@ -143,7 +178,7 @@ unsafe extern "C" fn bwrite<S: Write>(bio: *mut BIO, buf: *const c_char, len: c_
             if retriable_error(&err) {
                 BIO_set_retry_write(bio);
             }
-            state.error = Some(err);
+            state.set_error(err);
             -1
         }
         Err(payload) => {
@@ -172,7 +207,7 @@ unsafe extern "C" fn bread<S: Read>(bio: *mut BIO, buf: *mut c_char, len: c_int)
             if retriable_error(&err) {
                 BIO_set_retry_read(bio);
             }
-            state.error = Some(err);
+            state.set_error(err);
             -1
         }
         Err(payload) => {
@@ -213,7 +248,7 @@ unsafe extern "C" fn ctrl<S: Write>(
                 if retriable_error(&err) {
                     BIO_set_retry_write(bio);
                 }
-                state.error = Some(err);
+                state.set_error(err);
                 0
             }
             Err(payload) => {
@@ -286,6 +321,94 @@ impl Drop for BIO_METHOD {
     fn drop(&mut self) {
         unsafe {
             ffi::BIO_meth_free(self.0);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    use std::sync::Arc;
+
+    /// An error source whose destructor panics.
+    #[derive(Debug)]
+    struct Doomed;
+
+    impl std::fmt::Display for Doomed {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("doomed")
+        }
+    }
+
+    impl std::error::Error for Doomed {}
+
+    impl Drop for Doomed {
+        fn drop(&mut self) {
+            panic!("error destructor");
+        }
+    }
+
+    /// A transport whose flush panics, counting every call.
+    struct Transport {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Read for Transport {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            self.calls.fetch_add(1, SeqCst);
+            Ok(0)
+        }
+    }
+
+    impl Write for Transport {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.calls.fetch_add(1, SeqCst);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.calls.fetch_add(1, SeqCst);
+            panic!("flush")
+        }
+    }
+
+    fn bio(calls: &Arc<AtomicUsize>) -> (*mut BIO, BioMethod) {
+        new(Transport {
+            calls: calls.clone(),
+        })
+        .unwrap()
+    }
+
+    isolated_test! {
+        fn pending_errors_are_dropped_contained() {
+            let calls = Arc::default();
+            let (bio, _method) = bio(&calls);
+            unsafe {
+                let state = state::<Transport>(bio);
+                state.error = Some(io::Error::other(Doomed));
+                // Replacing it, as a failing transport call does, is contained.
+                state.set_error(io::Error::other(Doomed));
+                // So is extracting the stream with an error still pending.
+                drop(take_stream::<Transport>(bio));
+                ffi::BIO_free_all(bio);
+            }
+        }
+    }
+
+    isolated_test! {
+        fn flushing_follows_the_transport_poison() {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (bio, _method) = bio(&calls);
+            unsafe {
+                let error = flush::<Transport>(bio).unwrap_err();
+                assert!(error.to_string().contains("panicked: flush"), "{error}");
+                let used = calls.load(SeqCst);
+                for _ in 0..3 {
+                    assert!(flush::<Transport>(bio).is_err());
+                }
+                assert_eq!(calls.load(SeqCst), used, "a poisoned stream was flushed");
+                ffi::BIO_free_all(bio);
+            }
         }
     }
 }

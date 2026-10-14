@@ -441,9 +441,11 @@ fn shed_configuration_is_released_after_the_handshake() {
         let (mut client, mut server) = (client.done(), server.done());
         exchange(&mut client, &mut server);
         // Settings that live in the handshake configuration are gone once shed.
-        assert_eq!(client.ssl_mut().set_cipher_list("ALL").is_err(), shed);
+        assert_eq!(client.ssl_mut().set_alpn_protos(b"\x02h2").is_err(), shed);
         // Wire settings are fixed once the handshake completed, shed or not.
         assert!(client.ssl_mut().set_raw_cipher_list(&[0x1301]).is_err());
+        assert!(client.ssl_mut().set_cipher_list("ALL").is_err());
+        assert!(client.ssl_mut().set_strict_cipher_list("ALL").is_err());
     }
 }
 

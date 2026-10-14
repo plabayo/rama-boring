@@ -71,6 +71,10 @@
 //! A verify callback that panics records a failed verification, which, as for
 //! any verification result, only fails the handshake when the verify mode
 //! requires it. The panic hook still runs for every panic.
+//!
+//! This relies on unwinding: with `panic = "abort"`, or a panic hook that
+//! aborts, every panic aborts as usual. A destructor that panics while its
+//! own panic unwinds aborts too, as in any Rust code.
 use crate::libc_types::{c_char, c_int, c_uchar, c_uint};
 use foreign_types::{ForeignType, ForeignTypeRef, Opaque};
 use openssl_macros::corresponds;
@@ -2139,7 +2143,8 @@ impl SslContextBuilder {
     /// Sets the default ClientHello extension order of this context's
     /// connections, with the semantics of [`SslRef::set_extension_order`]: a
     /// prefix order whose GREASE codepoints are its only GREASE extensions,
-    /// even when empty, and whose unknown IDs are dropped. Extensions it does
+    /// even when empty, and whose unknown IDs follow each connection's
+    /// [`UnknownValues`] policy (dropped by default). Extensions it does
     /// not list follow in a random order; an empty order selects canonical
     /// order.
     ///
@@ -3220,9 +3225,9 @@ impl SslRef {
         F: Fn(bool, &mut X509StoreContextRef) -> bool + 'static + Sync + Send,
     {
         self.ssl_context().check_x509();
+        // this needs to be in an Arc since the callback can register a new callback!
+        let replaced = self.replace_ex_data(Ssl::cached_ex_index(), Arc::new(callback));
         unsafe {
-            // this needs to be in an Arc since the callback can register a new callback!
-            self.replace_ex_data(Ssl::cached_ex_index(), Arc::new(callback));
             ffi::SSL_set_verify(
                 self.as_ptr(),
                 c_int::from(mode.bits()),
@@ -3230,6 +3235,8 @@ impl SslRef {
             );
         }
         async_callbacks::invalidate_custom_verify(self);
+        // Complete the switch before the replaced callback's cleanup runs.
+        crate::unwind::drop_contained(replaced);
     }
 
     /// Sets a custom certificate store for verifying peer certificates.
@@ -3255,9 +3262,9 @@ impl SslRef {
         F: Fn(&mut SslRef) -> Result<(), SslVerifyError> + 'static + Sync + Send,
     {
         self.ssl_context().check_x509();
+        // this needs to be in an Arc since the callback can register a new callback!
+        let replaced = self.replace_ex_data(Ssl::cached_ex_index(), Arc::new(callback));
         unsafe {
-            // this needs to be in an Arc since the callback can register a new callback!
-            self.replace_ex_data(Ssl::cached_ex_index(), Arc::new(callback));
             ffi::SSL_set_custom_verify(
                 self.as_ptr(),
                 c_int::from(mode.bits()),
@@ -3265,6 +3272,8 @@ impl SslRef {
             );
         }
         async_callbacks::invalidate_custom_verify(self);
+        // Complete the switch before the replaced callback's cleanup runs.
+        crate::unwind::drop_contained(replaced);
     }
 
     /// Like [`SslContextBuilder::set_tmp_dh`].
@@ -3739,8 +3748,10 @@ impl SslRef {
             if let Some(owner) = selected_owner {
                 self.set_ex_data(*credential::SELECTED_CREDENTIAL_CONTEXT_INDEX, owner);
             }
-            certificate_selection::clear_connection_callback(self);
+            let replaced = certificate_selection::clear_connection_callback(self);
             async_callbacks::context_changed(self);
+            // Complete the switch before the replaced callback's cleanup runs.
+            crate::unwind::drop_contained(replaced);
         }
         Ok(())
     }
@@ -4740,7 +4751,7 @@ impl<S: Read + Write> Write for SslStream<S> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.get_mut().flush()
+        unsafe { bio::flush::<S>(self.ssl.get_raw_rbio()) }
     }
 }
 

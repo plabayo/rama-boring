@@ -422,8 +422,10 @@ impl SslRef {
         F: Fn(&SslRef, SslMessage<'_>) + 'static + Sync + Send,
     {
         unsafe {
-            self.replace_ex_data(Ssl::cached_ex_index::<Arc<F>>(), Arc::new(callback));
+            let replaced =
+                self.replace_ex_data(Ssl::cached_ex_index::<Arc<F>>(), Arc::new(callback));
             ffi::SSL_set_msg_callback(self.as_ptr(), Some(callbacks::raw_ssl_msg::<F>));
+            crate::unwind::drop_contained(replaced);
         }
     }
 
@@ -447,10 +449,14 @@ impl SslRef {
     }
 
     /// Like [`SslContextBuilder::set_cipher_list`], for this connection only.
+    ///
+    /// A client must set it before writing its ClientHello, a server before its
+    /// handshake completes.
     #[corresponds(SSL_set_cipher_list)]
     pub fn set_cipher_list(&mut self, cipher_list: &str) -> Result<(), ErrorStack> {
         let cipher_list =
             std::ffi::CString::new(cipher_list).map_err(ErrorStack::internal_error)?;
+        self.check_wire_settings_mutable()?;
         unsafe {
             cvt(ffi::SSL_set_cipher_list(
                 self.as_ptr(),
@@ -463,10 +469,14 @@ impl SslRef {
     /// Like [`SslContextBuilder::set_strict_cipher_list`], for this connection
     /// only. A server uses it as its cipher preference, so it can pin the
     /// cipher a relay negotiated on its other leg.
+    ///
+    /// A client must set it before writing its ClientHello, a server before its
+    /// handshake completes.
     #[corresponds(SSL_set_strict_cipher_list)]
     pub fn set_strict_cipher_list(&mut self, cipher_list: &str) -> Result<(), ErrorStack> {
         let cipher_list =
             std::ffi::CString::new(cipher_list).map_err(ErrorStack::internal_error)?;
+        self.check_wire_settings_mutable()?;
         unsafe {
             cvt(ffi::SSL_set_strict_cipher_list(
                 self.as_ptr(),
@@ -474,6 +484,10 @@ impl SslRef {
             ))
             .map(|_| ())
         }
+    }
+
+    fn check_wire_settings_mutable(&mut self) -> Result<(), ErrorStack> {
+        unsafe { cvt(ffi::RAMA_SSL_can_set_wire_settings(self.as_ptr())).map(|_| ()) }
     }
 
     /// Orders this server's response extensions within its ServerHello and

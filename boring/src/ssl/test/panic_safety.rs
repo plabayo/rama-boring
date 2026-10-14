@@ -876,3 +876,49 @@ isolated_test! {
         server.panicked("replaced");
     }
 }
+
+isolated_test! {
+    fn replacing_a_callback_with_a_panicking_destructor_is_contained() {
+        // Certificate selection: the replacement and a context switch both
+        // finish their switch, then contain the old callback's cleanup.
+        let mut server = Ssl::new(&server_context().build()).unwrap();
+        let guard = PanicOnDrop;
+        server.set_certificate_callback(move |_| {
+            let _owned = &guard;
+            Ok(())
+        });
+        server.set_certificate_callback(|_| Ok(()));
+        let guard = PanicOnDrop;
+        server.set_certificate_callback(move |_| {
+            let _owned = &guard;
+            Ok(())
+        });
+        server.set_ssl_context(&server_context().build()).unwrap();
+        handshake(Ssl::new(&client_context().build()).unwrap(), server)
+            .1
+            .done();
+
+        // Verification and message callbacks.
+        let mut client = Ssl::new(&client_context().build()).unwrap();
+        let guard = PanicOnDrop;
+        client.set_custom_verify_callback(SslVerifyMode::PEER, move |_| {
+            let _owned = &guard;
+            Ok(())
+        });
+        client.set_custom_verify_callback(SslVerifyMode::PEER, |_| Ok(()));
+        let guard = PanicOnDrop;
+        client.set_verify_callback(SslVerifyMode::PEER, move |ok, _| {
+            let _owned = &guard;
+            ok
+        });
+        client.set_verify_callback(SslVerifyMode::NONE, |_, _| true);
+        let guard = PanicOnDrop;
+        client.set_msg_callback(move |_, _| {
+            let _owned = &guard;
+        });
+        client.set_msg_callback(|_, _| {});
+        handshake(client, Ssl::new(&server_context().build()).unwrap())
+            .0
+            .done();
+    }
+}

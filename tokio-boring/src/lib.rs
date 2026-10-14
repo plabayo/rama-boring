@@ -166,10 +166,9 @@ impl<S> SslStream<S> {
 
         let result = f(&mut self.0);
 
-        // NOTE(nox): This should also be executed when `f` panics,
-        // but it's not that important as boring segfaults on panics
-        // and we always set the context prior to doing anything with
-        // the inner async stream.
+        // Callback and transport panics inside `f` become errors, so this runs
+        // after every call; the context is also set before any use of the
+        // inner async stream.
         self.0.get_mut().set_waker(None);
 
         result

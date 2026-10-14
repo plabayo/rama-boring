@@ -1071,3 +1071,29 @@ fn every_list_takes_at_most_sixteen_grease_slots() {
     assert!(ctx.set_raw_cipher_list(&with(&sixteen, 0x1301)).is_ok());
     assert!(ctx.set_raw_cipher_list(&with(&seventeen, 0x1301)).is_err());
 }
+
+#[test]
+fn key_shares_never_repeat_a_group_even_pinned() {
+    for values in [GreaseValues::Pinned, GreaseValues::Fresh] {
+        let mut ssl = client(|_| {});
+        ssl.set_client_hello_shape(&ClientHelloShape::new().with_grease_values(values))
+            .unwrap();
+        ssl.set_raw_supported_groups(&[0x2a2a, X25519, 0x2a2a])
+            .unwrap();
+        ssl.set_raw_key_shares(&[0x2a2a, X25519, 0x2a2a]).unwrap();
+        let (hellos, client) = hellos_of(ssl, Ssl::new(&server()).unwrap());
+        client.done();
+        let shares = hellos[0].key_shares();
+        let mut unique = shares.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), shares.len(), "{values:?}: {shares:04x?}");
+        if values == GreaseValues::Pinned {
+            // The repeated pinned GREASE share is sent once; groups keep both.
+            assert_eq!(shares, [0x2a2a, X25519]);
+            assert_eq!(hellos[0].groups(), [0x2a2a, X25519, 0x2a2a]);
+        } else {
+            assert_eq!(shares.len(), 3, "fresh slots are distinct values");
+        }
+    }
+}

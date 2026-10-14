@@ -1,5 +1,5 @@
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 3b48c2a..a84b800 100644
+index 3b48c2a..98a83df 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
 @@ -1739,8 +1739,17 @@ OPENSSL_EXPORT int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx,
@@ -42,7 +42,7 @@ index 3b48c2a..a84b800 100644
  
  // QUIC integration.
  //
-@@ -5565,7 +5580,187 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
+@@ -5565,7 +5580,192 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
  
@@ -53,6 +53,11 @@ index 3b48c2a..a84b800 100644
 +// order. An empty order selects the canonical order, without GREASE
 +// extensions. It returns one on success and zero on error.
 +OPENSSL_EXPORT int RAMA_SSL_CTX_set_extension_order(SSL_CTX *ctx, const uint16_t *ids, size_t num);
++
++// RAMA_SSL_can_set_wire_settings returns one if |ssl|'s wire settings may still
++// change: for a client before it writes its ClientHello, for a server before
++// its handshake completes. Otherwise it returns zero with an error.
++OPENSSL_EXPORT int RAMA_SSL_can_set_wire_settings(SSL *ssl);
 +
 +// RAMA_SSL_set_raw_cipher_list sets the cipher suite values this |ssl| offers,
 +// in order, like |RAMA_SSL_CTX_set_raw_cipher_list| but for one connection.
@@ -254,7 +259,7 @@ index f4b3484..30cf143 100644
  #define TLSEXT_MAXLEN_host_name 255
  
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
-index 90238d9..cc6bef2 100644
+index 90238d9..4b50ce9 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
 @@ -35,6 +35,7 @@
@@ -300,7 +305,7 @@ index 90238d9..cc6bef2 100644
        !CBB_add_u16(&sigalgs_cbb,
                     ssl_get_grease_value(hs, ssl_grease_signature_algorithm))) {
      return false;
-@@ -2428,6 +2454,45 @@ bool ssl_setup_key_shares(SSL_HANDSHAKE *hs, uint16_t override_group_id) {
+@@ -2428,6 +2454,55 @@ bool ssl_setup_key_shares(SSL_HANDSHAKE *hs, uint16_t override_group_id) {
      return false;
    }
  
@@ -313,10 +318,20 @@ index 90238d9..cc6bef2 100644
 +    }
 +    CBB key_exchange;
 +    size_t grease_slot = 0;
++    // A key share never repeats a group (RFC 8446), GREASE included: a pinned
++    // value listed twice is sent once.
++    uint16_t grease_sent[RAMA_SSL_MAX_GREASE_SLOTS];
++    size_t num_grease_sent = 0;
 +    for (uint16_t group_id : rama->key_shares) {
 +      if (rama_is_grease(group_id)) {
-+        if (!CBB_add_u16(cbb.get(), rama_grease_value(hs, ssl_grease_group,
-+                                                      group_id, &grease_slot)) ||
++        const uint16_t value =
++            rama_grease_value(hs, ssl_grease_group, group_id, &grease_slot);
++        if (std::find(grease_sent, grease_sent + num_grease_sent, value) !=
++            grease_sent + num_grease_sent) {
++          continue;
++        }
++        grease_sent[num_grease_sent++] = value;
++        if (!CBB_add_u16(cbb.get(), value) ||
 +            !CBB_add_u16(cbb.get(), 1 /* length */) ||
 +            !CBB_add_u8(cbb.get(), 0 /* one byte key share */)) {
 +          return false;
@@ -346,7 +361,7 @@ index 90238d9..cc6bef2 100644
    std::optional<Span<const uint16_t>> selected_key_shares;
  
    // This is used for HelloRetryRequest, where we have already been given the
-@@ -2487,7 +2552,8 @@ bool ssl_setup_key_shares(SSL_HANDSHAKE *hs, uint16_t override_group_id) {
+@@ -2487,7 +2562,8 @@ bool ssl_setup_key_shares(SSL_HANDSHAKE *hs, uint16_t override_group_id) {
      return false;
    }
  
@@ -356,7 +371,7 @@ index 90238d9..cc6bef2 100644
      // Add a fake group. See RFC 8701.
      if (!CBB_add_u16(cbb.get(), ssl_get_grease_value(hs, ssl_grease_group)) ||
          !CBB_add_u16(cbb.get(), 1 /* length */) ||
-@@ -2521,10 +2587,11 @@ static bool ext_key_share_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
+@@ -2521,10 +2597,11 @@ static bool ext_key_share_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
    }
  
    // The caller may explicitly configure empty key shares to request a
@@ -370,7 +385,7 @@ index 90238d9..cc6bef2 100644
  
    CBB contents, kse_bytes;
    if (!CBB_add_u16(out_compressible, TLSEXT_TYPE_key_share) ||
-@@ -2675,7 +2742,6 @@ bool ssl_ext_key_share_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
+@@ -2675,7 +2752,6 @@ bool ssl_ext_key_share_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
  static bool ext_supported_versions_add_clienthello(
      const SSL_HANDSHAKE *hs, CBB *out, CBB *out_compressible,
      ssl_client_hello_type_t type) {
@@ -378,7 +393,7 @@ index 90238d9..cc6bef2 100644
    if (hs->max_version <= TLS1_2_VERSION) {
      return true;
    }
-@@ -2693,15 +2759,47 @@ static bool ext_supported_versions_add_clienthello(
+@@ -2693,15 +2769,47 @@ static bool ext_supported_versions_add_clienthello(
      return false;
    }
  
@@ -430,7 +445,7 @@ index 90238d9..cc6bef2 100644
    if (!ssl_add_supported_versions(hs, &versions, extra_min_version) ||
        !CBB_flush(out)) {
      return false;
-@@ -2744,7 +2842,6 @@ static bool ext_supported_groups_add_clienthello(const SSL_HANDSHAKE *hs,
+@@ -2744,7 +2852,6 @@ static bool ext_supported_groups_add_clienthello(const SSL_HANDSHAKE *hs,
                                                   CBB *out,
                                                   CBB *out_compressible,
                                                   ssl_client_hello_type_t type) {
@@ -438,7 +453,7 @@ index 90238d9..cc6bef2 100644
    // In PAKE mode, supported_groups and key_share are not used.
    if (hs->pake_prover != nullptr) {
      return true;
-@@ -2757,8 +2854,39 @@ static bool ext_supported_groups_add_clienthello(const SSL_HANDSHAKE *hs,
+@@ -2757,8 +2864,39 @@ static bool ext_supported_groups_add_clienthello(const SSL_HANDSHAKE *hs,
      return false;
    }
  
@@ -479,7 +494,7 @@ index 90238d9..cc6bef2 100644
        !CBB_add_u16(&groups_bytes, ssl_get_grease_value(hs, ssl_grease_group))) {
      return false;
    }
-@@ -3303,6 +3431,32 @@ static bool ext_quic_transport_params_add_serverhello_legacy(SSL_HANDSHAKE *hs,
+@@ -3303,6 +3441,32 @@ static bool ext_quic_transport_params_add_serverhello_legacy(SSL_HANDSHAKE *hs,
  static bool ext_delegated_credential_add_clienthello(
      const SSL_HANDSHAKE *hs, CBB *out, CBB *out_compressible,
      ssl_client_hello_type_t type) {
@@ -512,7 +527,7 @@ index 90238d9..cc6bef2 100644
    return true;
  }
  
-@@ -3328,6 +3482,30 @@ static bool ext_delegated_credential_parse_clienthello(SSL_HANDSHAKE *hs,
+@@ -3328,6 +3492,30 @@ static bool ext_delegated_credential_parse_clienthello(SSL_HANDSHAKE *hs,
    return true;
  }
  
@@ -543,7 +558,7 @@ index 90238d9..cc6bef2 100644
  // Certificate compression
  
  static bool cert_compression_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
-@@ -3336,10 +3514,28 @@ static bool cert_compression_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
+@@ -3336,10 +3524,28 @@ static bool cert_compression_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
    bool first = true;
    CBB contents, algs;
  
@@ -574,7 +589,7 @@ index 90238d9..cc6bef2 100644
  
      if (first &&
          (!CBB_add_u16(out_compressible, TLSEXT_TYPE_cert_compression) ||
-@@ -3392,7 +3588,11 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
+@@ -3392,7 +3598,11 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
      return false;
    }
  
@@ -587,7 +602,7 @@ index 90238d9..cc6bef2 100644
    size_t given_alg_idx = 0;
  
    while (CBS_len(&alg_ids) > 0) {
-@@ -3406,8 +3606,22 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
+@@ -3406,8 +3616,22 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
      for (size_t i = 0; i < num_algs; i++) {
        const auto &alg = ctx->cert_compression_algs[i];
        if (alg.alg_id == alg_id && alg.compress != nullptr) {
@@ -612,7 +627,7 @@ index 90238d9..cc6bef2 100644
          }
          break;
        }
-@@ -3421,10 +3635,10 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
+@@ -3421,10 +3645,10 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
      }
    }
  
@@ -625,7 +640,7 @@ index 90238d9..cc6bef2 100644
    }
  
    return true;
-@@ -4260,6 +4474,13 @@ static const struct tls_extension kExtensions[] = {
+@@ -4260,6 +4484,13 @@ static const struct tls_extension kExtensions[] = {
          cert_compression_parse_clienthello,
          cert_compression_add_serverhello,
      },
@@ -639,7 +654,7 @@ index 90238d9..cc6bef2 100644
      {
          TLSEXT_TYPE_delegated_credential,
          ext_delegated_credential_add_clienthello,
-@@ -4342,6 +4563,203 @@ static_assert(kNumExtensions <=
+@@ -4342,6 +4573,203 @@ static_assert(kNumExtensions <=
                    sizeof(((SSL_HANDSHAKE *)nullptr)->extensions.received) * 8,
                "too many extensions for received bitset");
  
@@ -843,7 +858,7 @@ index 90238d9..cc6bef2 100644
  bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs) {
    if (!hs->config->permute_extensions) {
      return true;
-@@ -4390,6 +4808,133 @@ static bool add_padding_extension(CBB *cbb, uint16_t ext, size_t len) {
+@@ -4390,6 +4818,133 @@ static bool add_padding_extension(CBB *cbb, uint16_t ext, size_t len) {
    return CBB_flush(cbb);
  }
  
@@ -977,7 +992,7 @@ index 90238d9..cc6bef2 100644
  static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
                                               CBB *out_encoded) {
    // When writing ClientHelloInner, we construct the real and encoded
-@@ -4397,7 +4942,6 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+@@ -4397,7 +4952,6 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
    // are written to `extensions` and copied to `extensions_encoded`. Compressed
    // extensions are buffered in `compressed` and written to the end. (ECH can
    // only compress contiguous extensions.)
@@ -985,7 +1000,7 @@ index 90238d9..cc6bef2 100644
    bssl::ScopedCBB compressed, outer_extensions;
    CBB extensions, extensions_encoded;
    if (!CBB_add_u16_length_prefixed(out, &extensions) ||
-@@ -4410,7 +4954,7 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+@@ -4410,7 +4964,7 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
  
    hs->inner_extensions_sent = 0;
  
@@ -994,7 +1009,7 @@ index 90238d9..cc6bef2 100644
      // Add a fake empty extension. See RFC 8701. This always matches
      // `ssl_add_clienthello_tlsext`, so compress it.
      uint16_t grease_ext = ssl_get_grease_value(hs, ssl_grease_extension1);
-@@ -4448,7 +4992,7 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+@@ -4448,7 +5002,7 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
      }
    }
  
@@ -1003,7 +1018,7 @@ index 90238d9..cc6bef2 100644
      // Add a fake non-empty extension. See RFC 8701. This always matches
      // `ssl_add_clienthello_tlsext`, so compress it.
      uint16_t grease_ext = ssl_get_grease_value(hs, ssl_grease_extension2);
-@@ -4525,18 +5069,46 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+@@ -4525,18 +5079,46 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
    // important to reset this value.
    hs->extensions.sent = 0;
  
@@ -1051,7 +1066,7 @@ index 90238d9..cc6bef2 100644
      const size_t len_before = CBB_len(&extensions);
      if (!kExtensions[i].add_clienthello(hs, &extensions, &extensions, type)) {
        OPENSSL_PUT_ERROR(SSL, SSL_R_ERROR_ADDING_EXTENSION);
-@@ -4553,7 +5125,7 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+@@ -4553,7 +5135,7 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
      last_was_empty = (bytes_written == 4);
    }
  
@@ -1060,7 +1075,7 @@ index 90238d9..cc6bef2 100644
      // Add a fake non-empty extension. See RFC 8701.
      if (!add_padding_extension(
              &extensions, ssl_get_grease_value(hs, ssl_grease_extension2), 1)) {
-@@ -4566,8 +5138,19 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+@@ -4566,8 +5148,19 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
    // bugs. We also apply this padding to ClientHelloOuter, to keep the wire
    // images aligned.
    size_t psk_len = ext_pre_shared_key_clienthello_length(hs, type);
@@ -1081,7 +1096,7 @@ index 90238d9..cc6bef2 100644
      msg_len += 2 /* length prefix */ + CBB_len(&extensions) + psk_len;
      // The length of the padding extension, excluding the four-byte extension
      // header.
-@@ -4627,16 +5210,40 @@ bool ssl_add_serverhello_tlsext(SSL_HANDSHAKE *hs, CBB *out) {
+@@ -4627,16 +5220,40 @@ bool ssl_add_serverhello_tlsext(SSL_HANDSHAKE *hs, CBB *out) {
      goto err;
    }
  
@@ -1543,7 +1558,7 @@ index 7799d79..c32d06b 100644
    switch (EVP_PKEY_id(key)) {
      case EVP_PKEY_RSA:
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index a0c746b..950c6e8 100644
+index a0c746b..fb87163 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
 @@ -364,6 +364,12 @@ void SSL_set_aes_hw_override_for_testing(SSL *ssl, bool override_value) {
@@ -1571,7 +1586,7 @@ index a0c746b..950c6e8 100644
  }
  
  const char *SSL_get_cipher_list(const SSL *ssl, int n) {
-@@ -2216,6 +2221,120 @@ int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str) {
+@@ -2216,6 +2221,124 @@ int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str) {
                                  false /* not strict */);
  }
  
@@ -1593,6 +1608,10 @@ index a0c746b..950c6e8 100644
 +    return nullptr;
 +  }
 +  return ssl_impl->config.get();
++}
++
++int RAMA_SSL_can_set_wire_settings(SSL *ssl) {
++  return rama_wire_config(ssl) != nullptr;
 +}
 +
 +int RAMA_SSL_set_raw_cipher_list(SSL *ssl, const uint16_t *values,
@@ -1692,7 +1711,7 @@ index a0c746b..950c6e8 100644
  int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx, const char *str) {
    auto *ctx_impl = FromOpaque(ctx);
    const bool has_aes_hw = ctx_impl->aes_hw_override
-@@ -2541,6 +2660,45 @@ void SSL_set_alps_use_new_codepoint(SSL *ssl, int use_new) {
+@@ -2541,6 +2664,45 @@ void SSL_set_alps_use_new_codepoint(SSL *ssl, int use_new) {
    ssl_impl->config->alps_use_new_codepoint = !!use_new;
  }
  
@@ -1738,7 +1757,7 @@ index a0c746b..950c6e8 100644
  int SSL_CTX_add_cert_compression_alg(SSL_CTX *ctx, uint16_t alg_id,
                                       ssl_cert_compression_func_t compress,
                                       ssl_cert_decompression_func_t decompress) {
-@@ -3284,6 +3442,231 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
+@@ -3284,6 +3446,231 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
    FromOpaque(ctx)->permute_extensions = !!enabled;
  }
  

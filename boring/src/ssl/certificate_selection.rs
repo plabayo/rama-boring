@@ -123,10 +123,11 @@ static CONNECTION_CALLBACK_INDEX: LazyLock<Index<Ssl, ConnectionCallback>> =
 static CONTEXT_CALLBACK_INDEX: LazyLock<Index<SslContext, ContextCallback>> =
     LazyLock::new(|| SslContext::new_ex_index().unwrap());
 
-pub(super) fn clear_connection_callback(ssl: &mut SslRef) {
-    if let Some(callback) = ssl.ex_data_mut(*CONNECTION_CALLBACK_INDEX) {
-        callback.0 = None;
-    }
+/// Removes the connection's callback and returns it, for the caller to drop
+/// once the switch is complete.
+pub(super) fn clear_connection_callback(ssl: &mut SslRef) -> Option<CertificateCallback> {
+    ssl.ex_data_mut(*CONNECTION_CALLBACK_INDEX)
+        .and_then(|callback| callback.0.take())
 }
 
 impl SslContextBuilder {
@@ -167,7 +168,7 @@ impl SslRef {
     where
         F: Fn(CertificateSelection<'_>) -> Result<(), SelectCertError> + Send + Sync + 'static,
     {
-        self.replace_ex_data(
+        let replaced = self.replace_ex_data(
             *CONNECTION_CALLBACK_INDEX,
             ConnectionCallback(Some(Arc::new(callback))),
         );
@@ -175,6 +176,8 @@ impl SslRef {
             ffi::SSL_set_cert_cb(self.as_ptr(), Some(connection_callback), ptr::null_mut());
         }
         super::async_callbacks::invalidate_certificate_selection(self);
+        // Complete the switch before the replaced callback's cleanup runs.
+        unwind::drop_contained(replaced);
     }
 
     /// Removes all credential candidates, including the inherited legacy
