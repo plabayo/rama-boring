@@ -19,7 +19,15 @@ use std::sync::{
 
 type Tickets = Arc<Mutex<Option<SslSession>>>;
 const VALID_TIME: libc::time_t = 1_800_000_000;
-const EXPIRED_TIME: libc::time_t = 2_500_000_000;
+// After the test certificate's 2046 expiry: needs 64 bits, so 32-bit `time_t` targets work too.
+const EXPIRED_TIME: i64 = 2_500_000_000;
+
+fn set_expired_time(ssl: &mut SslRef) {
+    use foreign_types::ForeignTypeRef;
+    unsafe {
+        crate::ffi::X509_VERIFY_PARAM_set_time_posix(ssl.verify_param_mut().as_ptr(), EXPIRED_TIME);
+    }
+}
 
 fn contexts(version: SslVersion, reverify: bool) -> (SslContext, SslContext, Tickets) {
     let mut server = server_context();
@@ -136,7 +144,7 @@ pub(crate) fn check(quic: bool, version: SslVersion) {
                 let calls = Arc::new(AtomicUsize::new(0));
                 match policy {
                     Policy::Valid => {}
-                    Policy::Expired => resumed.verify_param_mut().set_time(EXPIRED_TIME),
+                    Policy::Expired => set_expired_time(&mut resumed),
                     Policy::Reject => {
                         let calls = calls.clone();
                         resumed.set_verify_callback(SslVerifyMode::PEER, move |ok, store| {
@@ -172,7 +180,7 @@ pub(crate) fn check(quic: bool, version: SslVersion) {
                     }
                     Policy::VerifyNone => {
                         resumed.set_verify(SslVerifyMode::NONE);
-                        resumed.verify_param_mut().set_time(EXPIRED_TIME);
+                        set_expired_time(&mut resumed);
                     }
                 }
                 let result = drive(resumed, Ssl::new(&server).unwrap(), quic, early);
