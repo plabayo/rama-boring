@@ -18,14 +18,15 @@ use std::sync::{
 };
 
 type Tickets = Arc<Mutex<Option<SslSession>>>;
-const VALID_TIME: libc::time_t = 1_800_000_000;
-// After the test certificate's 2046 expiry: needs 64 bits, so 32-bit `time_t` targets work too.
+const VALID_TIME: i64 = 1_800_000_000;
+// After the test certificate's 2046 expiry, so it needs 64 bits on every target.
 const EXPIRED_TIME: i64 = 2_500_000_000;
 
-fn set_expired_time(ssl: &mut SslRef) {
+// `time_t` is 32 bits or deprecated on some targets; the POSIX setter takes 64 bits everywhere.
+fn set_verify_time(ssl: &mut SslRef, time: i64) {
     use foreign_types::ForeignTypeRef;
     unsafe {
-        crate::ffi::X509_VERIFY_PARAM_set_time_posix(ssl.verify_param_mut().as_ptr(), EXPIRED_TIME);
+        crate::ffi::X509_VERIFY_PARAM_set_time_posix(ssl.verify_param_mut().as_ptr(), time);
     }
 }
 
@@ -56,7 +57,7 @@ fn contexts(version: SslVersion, reverify: bool) -> (SslContext, SslContext, Tic
 
 fn client(ctx: &SslContext) -> Ssl {
     let mut ssl = Ssl::new(ctx).unwrap();
-    ssl.verify_param_mut().set_time(VALID_TIME);
+    set_verify_time(&mut ssl, VALID_TIME);
     ssl.verify_param_mut().set_host("foobar.com").unwrap();
     ssl
 }
@@ -144,7 +145,7 @@ pub(crate) fn check(quic: bool, version: SslVersion) {
                 let calls = Arc::new(AtomicUsize::new(0));
                 match policy {
                     Policy::Valid => {}
-                    Policy::Expired => set_expired_time(&mut resumed),
+                    Policy::Expired => set_verify_time(&mut resumed, EXPIRED_TIME),
                     Policy::Reject => {
                         let calls = calls.clone();
                         resumed.set_verify_callback(SslVerifyMode::PEER, move |ok, store| {
@@ -180,7 +181,7 @@ pub(crate) fn check(quic: bool, version: SslVersion) {
                     }
                     Policy::VerifyNone => {
                         resumed.set_verify(SslVerifyMode::NONE);
-                        set_expired_time(&mut resumed);
+                        set_verify_time(&mut resumed, EXPIRED_TIME);
                     }
                 }
                 let result = drive(resumed, Ssl::new(&server).unwrap(), quic, early);
