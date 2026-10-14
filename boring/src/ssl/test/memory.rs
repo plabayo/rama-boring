@@ -117,13 +117,29 @@ impl<S: Read + Write> Side<S> {
 
 /// Runs both handshakes over an in-memory transport until neither can progress.
 pub(super) fn handshake(client: Ssl, server: Ssl) -> (Side<End>, Side<End>) {
+    let (client, server) = handshake_results(client, server);
+    (Side::from(client), Side::from(server))
+}
+
+type HandshakeResult = Result<SslStream<End>, HandshakeError<End>>;
+
+/// Keeps failed connections available for inspecting their verification result.
+pub(super) fn handshake_results(client: Ssl, server: Ssl) -> (HandshakeResult, HandshakeResult) {
+    fn step(result: HandshakeResult) -> HandshakeResult {
+        match result {
+            Err(HandshakeError::WouldBlock(mid)) => mid.handshake(),
+            other => other,
+        }
+    }
     let (a, b) = ends();
-    let mut client = Side::from(client.connect(a));
-    let mut server = Side::from(server.accept(b));
+    let mut client = client.connect(a);
+    let mut server = server.accept(b);
     for _ in 0..32 {
-        client = client.step();
-        server = server.step();
-        if !matches!(client, Side::Mid(_)) && !matches!(server, Side::Mid(_)) {
+        client = step(client);
+        server = step(server);
+        if !matches!(client, Err(HandshakeError::WouldBlock(_)))
+            && !matches!(server, Err(HandshakeError::WouldBlock(_)))
+        {
             break;
         }
     }

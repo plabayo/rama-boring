@@ -106,8 +106,6 @@ struct Fixture {
     known_differences: &'static [(Difference, &'static str)],
 }
 
-const NOT_IN_QUIC: &str = "BoringSSL builds it only when TLS 1.2 can be negotiated, which \
-                           QUIC rules out, and refuses a body for an extension it builds";
 /// HPKE AEAD IDs (RFC 9180).
 const AES_128_GCM: u16 = 0x0001;
 const CHACHA20_POLY1305: u16 = 0x0003;
@@ -404,13 +402,11 @@ fn mirror(ssl: &mut SslRef, hello: &ClientHello<'_>, transport: Transport) {
                 assert_eq!(transport, Transport::Quic);
                 ssl.set_quic_use_legacy_codepoint(id == QUIC_TRANSPORT_PARAMETERS_LEGACY);
             }
+            EXTENDED_MASTER_SECRET | RENEGOTIATION_INFO => {
+                shape.set_legacy_extensions(true);
+            }
             // Built natively, with a fixed body the comparison checks.
-            EC_POINT_FORMATS
-            | EXTENDED_MASTER_SECRET
-            | SESSION_TICKET
-            | PSK_KEY_EXCHANGE_MODES
-            | RENEGOTIATION_INFO
-            | PRE_SHARED_KEY => {}
+            EC_POINT_FORMATS | SESSION_TICKET | PSK_KEY_EXCHANGE_MODES | PRE_SHARED_KEY => {}
             _ => {
                 assert!(!NATIVE.contains(&id));
                 shape.set_extension_body(ExtensionType::from(id), body);
@@ -572,10 +568,7 @@ fn firefox_156_quic() {
     check(&Fixture {
         hello: include_str!("fixtures/firefox-156-quic-client-hello.hex"),
         transport: Transport::Quic,
-        known_differences: &[
-            (Difference::Missing(EXTENDED_MASTER_SECRET), NOT_IN_QUIC),
-            (Difference::Missing(RENEGOTIATION_INFO), NOT_IN_QUIC),
-        ],
+        known_differences: &[],
     });
 }
 
@@ -615,5 +608,36 @@ fn quic_fixtures_decrypt_from_the_captured_datagrams() {
         let mut corrupted = datagrams.clone();
         corrupted[0][200] ^= 1;
         assert_eq!(quic_initial::client_hello(&corrupted), None);
+    }
+}
+
+#[test]
+fn disabled_legacy_extensions_preserve_the_default_tls13_hello() {
+    let mut ctx = client_context();
+    ctx.set_min_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+    let ctx = ctx.build();
+    for ordered in [false, true] {
+        let mut hellos = Vec::new();
+        for shape in [
+            None,
+            Some(ClientHelloShape::new()),
+            Some(ClientHelloShape::new().with_legacy_extensions(false)),
+        ] {
+            let mut client = Ssl::new(&ctx).unwrap();
+            if ordered {
+                client.set_extension_order(&[43, 51]).unwrap();
+            }
+            if let Some(shape) = shape {
+                client.set_client_hello_shape(&shape).unwrap();
+            }
+            let written = capture_client_hello(&mut client);
+            handshake(client, Ssl::new(&server_context().build()).unwrap())
+                .0
+                .done();
+            let bytes = written.lock().unwrap().take().unwrap();
+            hellos.push(Normalized::new(&ClientHello::parse(&bytes).unwrap()));
+        }
+        assert_eq!(hellos[0], hellos[1]);
+        assert_eq!(hellos[0], hellos[2]);
     }
 }

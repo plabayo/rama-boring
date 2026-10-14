@@ -101,6 +101,7 @@ pub struct ClientHelloShape {
     grease_values: GreaseValues,
     unknown_values: UnknownValues,
     padding: Padding,
+    legacy_extensions: bool,
     extension_bodies: Vec<(ExtensionType, Vec<u8>)>,
 }
 
@@ -153,6 +154,18 @@ impl ClientHelloShape {
     #[must_use]
     pub fn with_padding(mut self, padding: Padding) -> Self {
         self.set_padding(padding);
+        self
+    }
+
+    /// Sends initial EMS and renegotiation_info with a TLS 1.3 minimum to match browser hellos.
+    pub fn set_legacy_extensions(&mut self, enabled: bool) -> &mut Self {
+        self.legacy_extensions = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn with_legacy_extensions(mut self, enabled: bool) -> Self {
+        self.set_legacy_extensions(enabled);
         self
     }
 
@@ -622,6 +635,7 @@ impl SslRef {
             padding_length,
             extension_bodies: bodies.as_ptr(),
             num_extension_bodies: bodies.len(),
+            legacy_extensions: shape.legacy_extensions.into(),
         };
         unsafe { cvt(ffi::RAMA_SSL_set_client_hello_shape(self.as_ptr(), &native)).map(|_| ()) }
     }

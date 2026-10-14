@@ -1273,3 +1273,151 @@ fn connection_curves_are_fixed_like_other_wire_settings() {
     assert!(server.ssl_mut().set_curves(&[SslCurve::X25519]).is_err());
     assert!(server.ssl_mut().set_curves_list("X25519").is_err());
 }
+
+#[test]
+fn legacy_extensions_are_opt_in_and_ordered_over_tls13_tcp() {
+    for enabled in [false, true] {
+        for order in [[65281, 23], [23, 65281]] {
+            let mut client = client(|ctx| {
+                ctx.set_min_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+            });
+            client.set_extension_order(&order).unwrap();
+            // Applying a default shape must also clear a previous opt-in.
+            client
+                .set_client_hello_shape(&ClientHelloShape::new().with_legacy_extensions(true))
+                .unwrap();
+            let mut shape = ClientHelloShape::new();
+            shape.set_legacy_extensions(enabled);
+            client.set_client_hello_shape(&shape).unwrap();
+            let mut server = Ssl::new(&server()).unwrap();
+            server.set_msg_callback(|_, message| {
+                if message.is_written() {
+                    let extensions = match message.handshake_type() {
+                        Some(2) => {
+                            wire::ServerHello::parse(message.bytes())
+                                .unwrap()
+                                .extensions
+                        }
+                        Some(8) => wire::encrypted_extensions(message.bytes()).unwrap(),
+                        _ => return,
+                    };
+                    assert!(wire::find(&extensions, 23).is_none());
+                    assert!(wire::find(&extensions, 65281).is_none());
+                }
+            });
+            let (hellos, client) = hellos_of(client, server);
+            let client = client.done();
+            let hello = &hellos[0];
+            assert_eq!(hello.body(23), enabled.then_some(&[][..]));
+            assert_eq!(hello.body(65281), enabled.then_some(&[0][..]));
+            if enabled {
+                assert_eq!(&hello.ids()[..2], &order);
+            }
+            // These compatibility getters always report true for TLS 1.3,
+            // even without the opt-in; they do not report negotiation.
+            assert!(client.ssl().extended_master_secret_support());
+            assert!(client.ssl().secure_renegotiation_support());
+        }
+    }
+}
+
+#[test]
+#[ignore = "release-mode timing of constructing and writing a ClientHello"]
+fn measure_legacy_extensions_client_hello() {
+    use std::{io::Cursor, time::Instant};
+    let mut ctx = client_context();
+    ctx.set_min_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+    let ctx = ctx.build();
+    const N: usize = 10000;
+    for enabled in [None, Some(false), Some(true), None, Some(false), Some(true)] {
+        if enabled == Some(true) && std::env::var_os("RAMA_BENCH_OFF_ONLY").is_some() {
+            continue;
+        }
+        let shape = ClientHelloShape::new().with_legacy_extensions(enabled.unwrap_or(false));
+        let start = Instant::now();
+        let mut bytes = 0;
+        for _ in 0..N {
+            let mut ssl = Ssl::new(&ctx).unwrap();
+            if enabled.is_some() {
+                ssl.set_client_hello_shape(&shape).unwrap();
+            }
+            let result = ssl.connect(Cursor::new(Vec::<u8>::new()));
+            let Err(crate::ssl::HandshakeError::Failure(mid)) = result else {
+                panic!("no server response");
+            };
+            bytes += mid.get_ref().get_ref().len();
+        }
+        eprintln!("TLS13 ClientHello construction; baseline=no shape; legacy={enabled:?}; ns/hello={}; bytes/hello={}", start.elapsed().as_nanos() / N as u128, bytes / N);
+    }
+}
+
+#[test]
+#[ignore = "interop with the OpenSSL executable in RAMA_TEST_OPENSSL"]
+fn legacy_extensions_interoperate_with_openssl() {
+    use std::{
+        io::Write,
+        net::{TcpListener, TcpStream},
+        process::{Command, Stdio},
+        time::{Duration, Instant},
+    };
+    let executable = std::env::var_os("RAMA_TEST_OPENSSL").expect("RAMA_TEST_OPENSSL");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    struct Child(std::process::Child);
+    impl Drop for Child {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut server = Child(
+        Command::new(executable)
+            .args([
+                "s_server",
+                "-accept",
+                &addr.to_string(),
+                "-cert",
+                "test/cert.pem",
+                "-key",
+                "test/key.pem",
+                "-tls1_3",
+                "-quiet",
+                "-www",
+                "-naccept",
+                "2",
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap(),
+    );
+    for enabled in [false, true] {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stream = loop {
+            if let Ok(stream) = TcpStream::connect(addr) {
+                break stream;
+            }
+            assert!(Instant::now() < deadline, "OpenSSL did not listen");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut ssl = client(|ctx| {
+            ctx.set_min_proto_version(Some(SslVersion::TLS1_3)).unwrap();
+        });
+        ssl.set_client_hello_shape(&ClientHelloShape::new().with_legacy_extensions(enabled))
+            .unwrap();
+        let mut stream = ssl.connect(stream).unwrap();
+        assert!(stream.ssl().extended_master_secret_support());
+        assert!(stream.ssl().secure_renegotiation_support());
+        stream.write_all(b"GET / HTTP/1.0\r\n\r\n").unwrap();
+        let _ = stream.shutdown();
+    }
+    assert!(server.0.wait().unwrap().success());
+}

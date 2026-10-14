@@ -137,7 +137,14 @@ fn step(conn: &mut QuicConnection) -> Result<(), QuicError> {
     if conn.ssl().is_init_finished() {
         return conn.process_post_handshake();
     }
-    if conn.handshake()? == HandshakeStatus::EarlyDataRejected {
+    let status = match conn.handshake() {
+        // Synchronous test verifiers may ask to be called once more.
+        Err(QuicError::Tls(error)) if error.code() == ErrorCode::WANT_CERTIFICATE_VERIFY => {
+            conn.handshake()?
+        }
+        result => result?,
+    };
+    if status == HandshakeStatus::EarlyDataRejected {
         conn.reset_early_data_rejection()?;
         conn.handshake()?;
     }
@@ -578,3 +585,68 @@ mod async_handshake;
 mod extension_order;
 mod mitm;
 mod support;
+
+#[test]
+fn legacy_extensions_are_opt_in_and_ordered_over_quic() {
+    use crate::ssl::test::wire;
+    use crate::ssl::{ClientHelloShape, SslContentType};
+    for enabled in [false, true] {
+        for order in [[65281, 23], [23, 65281]] {
+            let (client_ctx, server_ctx, _) = contexts();
+            let c = Arc::new(Record::default());
+            let s = Arc::new(Record::default());
+            let mut client = connection(&client_ctx, false, c.clone());
+            let mut server = connection(&server_ctx, true, s.clone());
+            client.ssl_mut().set_extension_order(&order).unwrap();
+            client
+                .ssl_mut()
+                .set_client_hello_shape(&ClientHelloShape::new().with_legacy_extensions(enabled))
+                .unwrap();
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let capture = seen.clone();
+            client.ssl_mut().set_msg_callback(move |_, message| {
+                if message.content_type() == SslContentType::HANDSHAKE {
+                    capture
+                        .lock()
+                        .unwrap()
+                        .push((message.is_written(), message.bytes().to_vec()));
+                }
+            });
+            pump(&mut client, &mut server, &c, &s).unwrap();
+            let seen = seen.lock().unwrap();
+            let hello = wire::ClientHello::parse(
+                &seen
+                    .iter()
+                    .find(|(out, bytes)| *out && bytes[0] == 1)
+                    .unwrap()
+                    .1,
+            )
+            .unwrap();
+            assert_eq!(hello.extension(23), enabled.then_some(&[][..]));
+            assert_eq!(hello.extension(65281), enabled.then_some(&[0][..]));
+            if enabled {
+                assert_eq!(&hello.ids()[..2], &order);
+            }
+            for (out, bytes) in seen.iter() {
+                if !out {
+                    let extensions = match bytes[0] {
+                        2 => wire::ServerHello::parse(bytes).unwrap().extensions,
+                        8 => wire::encrypted_extensions(bytes).unwrap(),
+                        _ => continue,
+                    };
+                    assert!(wire::find(&extensions, 23).is_none());
+                    assert!(wire::find(&extensions, 65281).is_none());
+                }
+            }
+            // These compatibility getters always report true for TLS 1.3,
+            // even without the opt-in; they do not report negotiation.
+            assert!(client.ssl().extended_master_secret_support());
+            assert!(client.ssl().secure_renegotiation_support());
+        }
+    }
+}
+
+#[test]
+fn reverify_x509_over_quic() {
+    crate::ssl::test::reverify::check(true, SslVersion::TLS1_3);
+}

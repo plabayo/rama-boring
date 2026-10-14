@@ -116,3 +116,43 @@ fn ech_with_a_shaped_client_hello_is_accepted() {
     let ssl_stream = client.connect();
     assert!(ssl_stream.ssl().ech_accepted());
 }
+
+#[test]
+fn legacy_extensions_never_enter_client_hello_inner() {
+    use crate::ssl::{ClientHelloShape, SslContentType, SslVersion};
+    use std::sync::{Arc, Mutex};
+    let (_server, mut client) = bootstrap_ech(ECH_CONFIG, ECH_KEY, ECH_CONFIG_LIST);
+    client
+        .ssl()
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .unwrap();
+    client
+        .ssl()
+        .set_client_hello_shape(&ClientHelloShape::new().with_legacy_extensions(true))
+        .unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let capture = seen.clone();
+    client.ssl().set_msg_callback(move |_, message| {
+        if message.is_written() && message.handshake_type() == Some(1) {
+            let hello = super::wire::ClientHello::parse(message.bytes()).unwrap();
+            capture
+                .lock()
+                .unwrap()
+                .push((message.content_type(), hello.ids()));
+        }
+    });
+    assert!(client.connect().ssl().ech_accepted());
+    let seen = seen.lock().unwrap();
+    let inner = seen
+        .iter()
+        .find(|(kind, _)| *kind == SslContentType::CLIENT_HELLO_INNER)
+        .unwrap();
+    let outer = seen
+        .iter()
+        .find(|(kind, _)| *kind == SslContentType::HANDSHAKE)
+        .unwrap();
+    for id in [23, 65281] {
+        assert!(!inner.1.contains(&id));
+        assert!(outer.1.contains(&id));
+    }
+}
