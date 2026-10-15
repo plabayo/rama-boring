@@ -29,6 +29,12 @@ jobs:
         run: rustup default stable && rustup component add rustfmt
       - name: Check formatting
         run: cargo fmt --all -- --check
+      - name: Check diagnostic harness formatting
+        run: cargo fmt --manifest-path tools/windows-bench/Cargo.toml -- --check
+      - name: Test Windows build policy
+        run: |
+          rustc --edition=2021 --test -Dwarnings boring-sys/build/windows.rs -o /tmp/windows-policy-tests
+          /tmp/windows-policy-tests
 
   clippy:
     permissions:
@@ -325,6 +331,71 @@ jobs:
         # Both of these may no longer be the case after updating the BoringSSL
         # submodules to a new revision, so it's important to test this on CI.
         run: cargo publish --dry-run -p rama-boring-sys
+
+  windows-assembly:
+    permissions:
+      contents: read
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, arch: x64, assembler: nasm, runtime: MultiThreadedDLL }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, arch: x64, assembler: nasm, runtime: MultiThreaded }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, arch: x64, assembler: nasm, runtime: MultiThreadedDLL, generator: Ninja }
+          - { os: windows-latest, target: i686-pc-windows-msvc, arch: x86, assembler: nasm, runtime: MultiThreadedDLL }
+          - { os: windows-latest, target: aarch64-pc-windows-msvc, arch: arm64, assembler: none, runtime: MultiThreadedDLL, cross: true }
+          - { os: windows-latest, target: aarch64-pc-windows-msvc, arch: arm64, assembler: clang, runtime: MultiThreadedDLL, generator: Ninja, cross: true }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc, arch: arm64, assembler: none, runtime: MultiThreadedDLL }
+          - { os: windows-11-arm, target: aarch64-pc-windows-msvc, arch: arm64, assembler: clang, runtime: MultiThreadedDLL, generator: Ninja }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: ">=1.22.0"
+          cache: false
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: ${{ matrix.arch }}
+      - name: Configure tools
+        shell: pwsh
+        run: |
+          rustup target add ${{ matrix.target }}
+          if ('${{ matrix.assembler }}' -eq 'nasm') {
+            choco install nasm --no-progress -y
+            "C:\Program Files\NASM" >> $env:GITHUB_PATH
+          }
+          $clang = (Get-Command clang).Source
+          "LIBCLANG_PATH=$(Split-Path $clang)" >> $env:GITHUB_ENV
+          if ('${{ matrix.generator }}' -ne '') {
+            "CMAKE_GENERATOR=${{ matrix.generator }}" >> $env:GITHUB_ENV
+          }
+          if ('${{ matrix.assembler }}' -eq 'clang') {
+            "CMAKE_TOOLCHAIN_FILE=$env:GITHUB_WORKSPACE/boring-sys/cmake/aarch64-windows-clang.cmake" >> $env:GITHUB_ENV
+          }
+          if ('${{ matrix.runtime }}' -eq 'MultiThreaded') {
+            'RUSTFLAGS=-Dwarnings -C target-feature=+crt-static' >> $env:GITHUB_ENV
+          }
+      - name: Build release probe and check effective settings
+        shell: pwsh
+        run: |
+          # Keep paths short enough for MSBuild's custom build tracking files.
+          $build = Join-Path $env:RUNNER_TEMP 'bssl'
+          cargo build --manifest-path tools/windows-bench/Cargo.toml --release --target ${{ matrix.target }} --target-dir $build
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          .github/scripts/check-windows-build.ps1 -TargetDirectory $build -Assembler ${{ matrix.assembler }} -Runtime ${{ matrix.runtime }}
+      - name: Probe the linked library and exercise both TLS legs
+        if: ${{ !matrix.cross }}
+        shell: pwsh
+        run: |
+          $exe = Join-Path $env:RUNNER_TEMP 'bssl/${{ matrix.target }}/release/windows-boring-bench.exe'
+          $expected = if ('${{ matrix.assembler }}' -eq 'none') { 0 } else { 1 }
+          & $exe probe $expected
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          tools/windows-bench/run.ps1 -EndpointExe $exe -RelayExe $exe -OutputDirectory "$env:RUNNER_TEMP/mitm" -PayloadMiB 4 -Repeats 1
 
   test-android-explicit-toolchain:
     permissions:

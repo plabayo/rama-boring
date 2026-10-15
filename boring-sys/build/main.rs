@@ -10,6 +10,7 @@ use std::sync::OnceLock;
 use crate::config::Config;
 
 mod config;
+mod windows;
 
 fn should_use_cmake_cross_compilation(config: &Config) -> bool {
     if config.host == config.target {
@@ -331,11 +332,39 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
         }
 
         "windows" => {
-            // BoringSSL's CMakeLists.txt isn't set up for cross-compiling using Visual Studio.
-            // Disable assembly support so that it at least builds.
-            if config.host.contains("windows") {
-                println!("cargo:warning=Configuring for Windows - Disabling ASM");
+            // Keep cmake-rs from appending its own processor spelling for
+            // cross builds, and CMake from replacing it with the host CPU.
+            boringssl_cmake.define("CMAKE_SYSTEM_NAME", "Windows");
+            if config.host == config.target {
+                boringssl_cmake.define("CMAKE_CROSSCOMPILING", "FALSE");
+            }
+            // BoringSSL's assembler selection is case-sensitive ("x86", not
+            // cmake-rs's cross-compilation spelling "X86"). Use the target,
+            // also when an x64 Rust toolchain runs under Windows ARM emulation.
+            let processor = match config.target_arch.as_str() {
+                "x86" => Some("x86"),
+                "x86_64" => Some("AMD64"),
+                "aarch64" => Some("ARM64"),
+                _ => None,
+            };
+            if let Some(processor) = processor {
+                boringssl_cmake.define("CMAKE_SYSTEM_PROCESSOR", processor);
+            }
+
+            if windows::needs_no_asm(&config.host, &config.target_arch) {
+                println!(
+                    "cargo:warning=BoringSSL assembly disabled for {}: the default Windows \
+                     toolchain cannot assemble this target's GNU-style .S files. \
+                     Crypto throughput will be reduced. For ARM64 acceleration, use \
+                     CMAKE_TOOLCHAIN_FILE with Ninja and Clang's integrated assembler; \
+                     NASM only supports x86/x64.",
+                    config.target
+                );
                 boringssl_cmake.define("OPENSSL_NO_ASM", "TRUE");
+            } else if config.host.contains("windows") {
+                // Also clear TRUE in a CMake cache created by an older build
+                // script. Merely omitting the define leaves assembly disabled.
+                boringssl_cmake.define("OPENSSL_NO_ASM", "FALSE");
             }
 
             if config.target.contains("-pc-windows-gnu") {
@@ -344,14 +373,9 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
                 // Don't pin a Visual Studio generator: let cmake-rs auto detect the installed
                 // version so the build keeps working across ci updates / env updates.
                 // If newer Visual Studio's start to throw errors: updating `cmake` crate should fix it.
-                if config.target_arch == "x86" {
-                    boringssl_cmake.define("CMAKE_GENERATOR_PLATFORM", "Win32");
-                } else if config.target_arch == "aarch64" {
-                    boringssl_cmake.define("CMAKE_GENERATOR_PLATFORM", "ARM64");
-                    boringssl_cmake.define("CMAKE_SYSTEM_PROCESSOR", "ARM64");
-                } else {
-                    boringssl_cmake.define("CMAKE_GENERATOR_PLATFORM", "x64");
-                }
+                // cmake-rs supplies -A for Visual Studio, and omits it for
+                // Ninja/NMake. Defining CMAKE_GENERATOR_PLATFORM here breaks
+                // those generators, including caller-selected Ninja builds.
 
                 // Follow the Rust `crt-static` target feature so BoringSSL and the
                 // final Rust binary agree on the CRT flavor: static (/MT) when built
@@ -370,6 +394,19 @@ fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
                 const CMAKE_MSVC_DEBUG_FLAGS: &str = "/Zi /Ob0 /Od /RTC1";
                 boringssl_cmake.define("CMAKE_C_FLAGS_DEBUG", CMAKE_MSVC_DEBUG_FLAGS);
                 boringssl_cmake.define("CMAKE_CXX_FLAGS_DEBUG", CMAKE_MSVC_DEBUG_FLAGS);
+                // cmake-rs replaces the selected Visual Studio profile's flags
+                // when it auto-selects the generator, stripping /O* and debug
+                // flags. Preserve CMake's optimized defaults explicitly, with
+                // no CRT flags: CMAKE_MSVC_RUNTIME_LIBRARY owns /MD versus /MT.
+                for (profile, flags) in [
+                    ("RELEASE", "/O2 /Ob2 /DNDEBUG"),
+                    ("RELWITHDEBINFO", "/Zi /O2 /Ob1 /DNDEBUG"),
+                    ("MINSIZEREL", "/O1 /Ob1 /DNDEBUG"),
+                ] {
+                    for language in ["C", "CXX"] {
+                        boringssl_cmake.define(format!("CMAKE_{language}_FLAGS_{profile}"), flags);
+                    }
+                }
             }
         }
 

@@ -1,0 +1,15 @@
+[package]
+name = "windows-boring-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+rama-boring = { path = "../../boring" }
+rama-boring-sys = { path = "../../boring-sys" }
+
+[profile.release]
+debug = 2
+strip = false
