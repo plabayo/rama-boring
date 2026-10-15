@@ -344,8 +344,8 @@ jobs:
           - { os: windows-latest, target: x86_64-pc-windows-msvc, arch: x64, assembler: nasm, runtime: MultiThreaded }
           - { os: windows-latest, target: x86_64-pc-windows-msvc, arch: x64, assembler: nasm, runtime: MultiThreadedDLL, generator: Ninja }
           - { os: windows-latest, target: i686-pc-windows-msvc, arch: x86, assembler: nasm, runtime: MultiThreadedDLL }
-          - { os: windows-latest, target: aarch64-pc-windows-msvc, arch: arm64, assembler: none, runtime: MultiThreadedDLL, cross: true }
-          - { os: windows-latest, target: aarch64-pc-windows-msvc, arch: arm64, assembler: clang, runtime: MultiThreadedDLL, generator: Ninja, cross: true }
+          - { os: windows-latest, target: aarch64-pc-windows-msvc, arch: amd64_arm64, assembler: none, runtime: MultiThreadedDLL, cross: true }
+          - { os: windows-latest, target: aarch64-pc-windows-msvc, arch: amd64_arm64, assembler: clang, runtime: MultiThreadedDLL, generator: Ninja, cross: true }
           - { os: windows-11-arm, target: aarch64-pc-windows-msvc, arch: arm64, assembler: none, runtime: MultiThreadedDLL }
           - { os: windows-11-arm, target: aarch64-pc-windows-msvc, arch: arm64, assembler: clang, runtime: MultiThreadedDLL, generator: Ninja }
     steps:
@@ -364,6 +364,9 @@ jobs:
         shell: pwsh
         run: |
           rustup target add ${{ matrix.target }}
+          # Avoid Git's unrelated link.exe, including when cross-compiling.
+          $linker = 'CARGO_TARGET_${{ matrix.target }}_LINKER'.Replace('-', '_').ToUpperInvariant()
+          "$linker=rust-lld" >> $env:GITHUB_ENV
           if ('${{ matrix.assembler }}' -eq 'nasm') {
             choco install nasm --no-progress -y
             "C:\Program Files\NASM" >> $env:GITHUB_PATH
@@ -379,23 +382,33 @@ jobs:
           if ('${{ matrix.runtime }}' -eq 'MultiThreaded') {
             'RUSTFLAGS=-Dwarnings -C target-feature=+crt-static' >> $env:GITHUB_ENV
           }
-      - name: Build release probe and check effective settings
+      - name: Test build-settings regression checks
+        shell: pwsh
+        run: .github/scripts/test-windows-build.ps1
+      - name: Build both release profiles and check settings
         shell: pwsh
         run: |
           # Keep paths short enough for MSBuild's custom build tracking files.
-          $build = Join-Path $env:RUNNER_TEMP 'bssl'
-          cargo build --manifest-path tools/windows-bench/Cargo.toml --release --target ${{ matrix.target }} --target-dir $build
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          .github/scripts/check-windows-build.ps1 -TargetDirectory $build -Assembler ${{ matrix.assembler }} -Runtime ${{ matrix.runtime }}
+          foreach ($buildType in @('Release', 'RelWithDebInfo')) {
+            $env:CARGO_PROFILE_RELEASE_DEBUG = if ($buildType -eq 'Release') { '0' } else { '2' }
+            $suffix = if ($buildType -eq 'Release') { 'r' } else { 'rd' }
+            $build = Join-Path $env:RUNNER_TEMP "bssl-$suffix"
+            cargo build --manifest-path tools/windows-bench/Cargo.toml --release --target ${{ matrix.target }} --target-dir $build
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            .github/scripts/check-windows-build.ps1 -TargetDirectory $build -BuildType $buildType -Assembler ${{ matrix.assembler }} -Runtime ${{ matrix.runtime }}
+          }
       - name: Probe the linked library and exercise both TLS legs
         if: ${{ !matrix.cross }}
         shell: pwsh
         run: |
-          $exe = Join-Path $env:RUNNER_TEMP 'bssl/${{ matrix.target }}/release/windows-boring-bench.exe'
-          $expected = if ('${{ matrix.assembler }}' -eq 'none') { 0 } else { 1 }
-          & $exe probe $expected
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          tools/windows-bench/run.ps1 -EndpointExe $exe -RelayExe $exe -OutputDirectory "$env:RUNNER_TEMP/mitm" -PayloadMiB 4 -Repeats 1
+          foreach ($buildType in @('Release', 'RelWithDebInfo')) {
+            $suffix = if ($buildType -eq 'Release') { 'r' } else { 'rd' }
+            $exe = Join-Path $env:RUNNER_TEMP "bssl-$suffix/${{ matrix.target }}/release/windows-boring-bench.exe"
+            $expected = if ('${{ matrix.assembler }}' -eq 'none') { 0 } else { 1 }
+            & $exe probe $expected
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            tools/windows-bench/run.ps1 -EndpointExe $exe -RelayExe $exe -OutputDirectory "$env:RUNNER_TEMP/mitm-$buildType" -PayloadMiB 4 -Repeats 1
+          }
 
   test-android-explicit-toolchain:
     permissions:
