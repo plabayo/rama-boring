@@ -156,3 +156,67 @@ fn legacy_extensions_never_enter_client_hello_inner() {
         assert!(outer.1.contains(&id));
     }
 }
+
+#[test]
+fn ech_grease_shape_yields_to_real_ech_and_retry_configs() {
+    use crate::ssl::{ClientHelloShape, EchGreaseShape};
+    for real_first in [false, true] {
+        for retry in [false, true] {
+            let (_server, mut client) = bootstrap_ech(ECH_CONFIG, ECH_KEY, ECH_CONFIG_LIST);
+            let ssl = client.ssl();
+            // Exercise either setter order and both initial and HRR hellos.
+            if !real_first {
+                ssl.set_ech_config_list(&[0, 4, 0xba, 0xdc, 0, 0]).unwrap();
+            }
+            ssl.set_enable_ech_grease(true);
+            ssl.set_client_hello_shape(
+                &ClientHelloShape::new()
+                    .with_ech_grease(Some(EchGreaseShape::from_wire(1, 2, 32, 17).unwrap())),
+            )
+            .unwrap();
+            if !real_first {
+                ssl.set_ech_config_list(ECH_CONFIG_LIST).unwrap();
+            }
+            if retry {
+                ssl.set_raw_key_shares(&[]).unwrap();
+            }
+            let seen = super::ech_grease::observe(ssl);
+            let stream = client.connect();
+            assert!(stream.ssl().ech_accepted());
+            assert_eq!(stream.ssl().used_hello_retry_request(), retry);
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.len(), if retry { 2 } else { 1 });
+            for (i, hello) in seen.iter().enumerate() {
+                let outer = hello.as_ref().unwrap();
+                assert_ne!(outer.aead, 2, "real config offers AEAD 1 or 3");
+                assert_ne!(outer.payload.len(), 17);
+                assert_eq!(outer.enc.len(), if i == 0 { 32 } else { 0 });
+            }
+        }
+    }
+
+    let (_server, mut client) = bootstrap_ech(ECH_CONFIG_2, ECH_KEY_2, ECH_CONFIG_LIST);
+    client.ssl().set_enable_ech_grease(true);
+    client
+        .ssl()
+        .set_client_hello_shape(
+            &ClientHelloShape::new()
+                .with_ech_grease(Some(EchGreaseShape::from_wire(1, 2, 32, 17).unwrap())),
+        )
+        .unwrap();
+    let HandshakeError::Failure(failed) = client.connect_err() else {
+        panic!("expected ECH rejection");
+    };
+    let configs = failed.ssl().get_ech_retry_configs().unwrap();
+    // Retry on a NEW connection with the authenticated server config.
+    let (_server, mut client) = bootstrap_ech(ECH_CONFIG_2, ECH_KEY_2, configs);
+    client.ssl().set_enable_ech_grease(true);
+    client
+        .ssl()
+        .set_client_hello_shape(
+            &ClientHelloShape::new()
+                .with_ech_grease(Some(EchGreaseShape::from_wire(1, 2, 32, 17).unwrap())),
+        )
+        .unwrap();
+    assert!(client.connect().ssl().ech_accepted());
+}

@@ -130,7 +130,7 @@ pub use self::connector::{
     ConnectConfiguration, SslAcceptor, SslAcceptorBuilder, SslConnector, SslConnectorBuilder,
 };
 pub use self::credential::{SslCredential, SslCredentialBuilder, SslCredentialRef};
-pub use self::ech::{SslEchKeys, SslEchKeysRef};
+pub use self::ech::{EchGreaseCipherSuite, EchGreaseShape, SslEchKeys, SslEchKeysRef};
 pub use self::error::{Error, ErrorCode, HandshakeError};
 
 mod async_callbacks;
@@ -4284,7 +4284,10 @@ impl SslRef {
         unsafe { ffi::SSL_ech_accepted(self.as_ptr()) != 0 }
     }
 
-    // Whether or not to enable ECH grease on `SSL`.
+    /// Enables ECH GREASE when TLS 1.3 is offered and no usable real ECH
+    /// configuration is selected. Configure before starting the handshake.
+    /// Defaults to disabled. [`ClientHelloShape::set_ech_grease`] optionally
+    /// controls its algorithms and lengths without enabling it.
     #[corresponds(SSL_set_enable_ech_grease)]
     pub fn set_enable_ech_grease(&self, enable: bool) {
         let enable = if enable { 1 } else { 0 };

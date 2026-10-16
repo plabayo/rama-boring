@@ -650,3 +650,45 @@ fn legacy_extensions_are_opt_in_and_ordered_over_quic() {
 fn reverify_x509_over_quic() {
     crate::ssl::test::reverify::check(true, SslVersion::TLS1_3);
 }
+
+#[test]
+fn ech_grease_shape_quic_handshakes_and_retries() {
+    use crate::ssl::test::ech_grease::observe;
+    use crate::ssl::{ClientHelloShape, EchGreaseShape};
+    let (client_ctx, server_ctx, _) = contexts();
+    for retry in [false, true] {
+        for aead in [1, 2, 3] {
+            for length in [144, 208] {
+                let c = Arc::new(Record::default());
+                let s = Arc::new(Record::default());
+                let mut client = connection(&client_ctx, false, c.clone());
+                let mut server = connection(&server_ctx, true, s.clone());
+                client.ssl_mut().set_enable_ech_grease(true);
+                client
+                    .ssl_mut()
+                    .set_client_hello_shape(&ClientHelloShape::new().with_ech_grease(Some(
+                        EchGreaseShape::from_wire(1, aead, 32, length).unwrap(),
+                    )))
+                    .unwrap();
+                if retry {
+                    client.ssl_mut().set_raw_key_shares(&[]).unwrap();
+                }
+                let seen = observe(client.ssl_mut());
+                pump(&mut client, &mut server, &c, &s).unwrap();
+                assert!(client.ssl().is_init_finished());
+                assert!(server.ssl().is_init_finished());
+                assert_eq!(client.ssl().used_hello_retry_request(), retry);
+                let seen = seen.lock().unwrap();
+                assert_eq!(seen.len(), if retry { 2 } else { 1 });
+                for hello in seen.iter() {
+                    let outer = hello.as_ref().unwrap();
+                    assert_eq!(
+                        (outer.kdf, outer.aead, outer.enc.len(), outer.payload.len()),
+                        (1, aead, 32, length)
+                    );
+                    assert_eq!(hello, &seen[0]);
+                }
+            }
+        }
+    }
+}

@@ -2,8 +2,8 @@
 //! negotiated-state getters that complement the context-level configuration.
 
 use super::{
-    callbacks, CertificateCompressionAlgorithm, ExtensionType, Ssl, SslContext, SslContextBuilder,
-    SslRef, SESSION_CTX_INDEX,
+    callbacks, CertificateCompressionAlgorithm, EchGreaseShape, ExtensionType, Ssl, SslContext,
+    SslContextBuilder, SslRef, SESSION_CTX_INDEX,
 };
 use crate::{cvt, error::ErrorStack, ffi, stack::StackRef, x509::X509};
 use foreign_types::ForeignTypeRef;
@@ -102,6 +102,7 @@ pub struct ClientHelloShape {
     unknown_values: UnknownValues,
     padding: Padding,
     legacy_extensions: bool,
+    ech_grease: Option<EchGreaseShape>,
     extension_bodies: Vec<(ExtensionType, Vec<u8>)>,
 }
 
@@ -166,6 +167,21 @@ impl ClientHelloShape {
     #[must_use]
     pub fn with_legacy_extensions(mut self, enabled: bool) -> Self {
         self.set_legacy_extensions(enabled);
+        self
+    }
+
+    /// Overrides ECH GREASE algorithms and payload length. `None` restores
+    /// BoringSSL's randomized, hardware-dependent defaults. This does not
+    /// enable GREASE; see [`EchGreaseShape`] for enablement, real ECH and retry
+    /// behavior. This setting is independent of [`GreaseValues`].
+    pub fn set_ech_grease(&mut self, shape: Option<EchGreaseShape>) -> &mut Self {
+        self.ech_grease = shape;
+        self
+    }
+
+    #[must_use]
+    pub fn with_ech_grease(mut self, shape: Option<EchGreaseShape>) -> Self {
+        self.set_ech_grease(shape);
         self
     }
 
@@ -636,6 +652,9 @@ impl SslRef {
             extension_bodies: bodies.as_ptr(),
             num_extension_bodies: bodies.len(),
             legacy_extensions: shape.legacy_extensions.into(),
+            ech_grease_kdf_id: shape.ech_grease.map_or(0, |s| s.cipher_suite().ids().0),
+            ech_grease_aead_id: shape.ech_grease.map_or(0, |s| s.cipher_suite().ids().1),
+            ech_grease_payload_len: shape.ech_grease.map_or(0, |s| s.payload_len()),
         };
         unsafe { cvt(ffi::RAMA_SSL_set_client_hello_shape(self.as_ptr(), &native)).map(|_| ()) }
     }

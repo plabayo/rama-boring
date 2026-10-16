@@ -1,5 +1,5 @@
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 3b48c2a..cb3c68f 100644
+index 3b48c2a..44afb89 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
 @@ -1739,8 +1739,17 @@ OPENSSL_EXPORT int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx,
@@ -59,7 +59,7 @@ index 3b48c2a..cb3c68f 100644
  OPENSSL_EXPORT void SSL_CTX_set_reverify_on_resume(SSL_CTX *ctx, int enabled);
  
  // SSL_ST_* are possible values for `SSL_state`, the bitmasks that make them up,
-@@ -5565,7 +5580,195 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
+@@ -5565,7 +5580,206 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
  
@@ -187,6 +187,17 @@ index 3b48c2a..cb3c68f 100644
 +  size_t num_extension_bodies;
 +  // Send initial EMS and renegotiation_info even with a TLS 1.3 minimum.
 +  int legacy_extensions;
++  // All zero keeps native ECH GREASE defaults. Otherwise kdf must be 1
++  // (HKDF-SHA256), aead 1, 2 or 3 (AES-128-GCM, AES-256-GCM, ChaCha20-Poly1305),
++  // and payload_len 16..=65489, including the 16-byte AEAD tag. X25519 fixes
++  // enc at 32 bytes. The complete extensions block must also fit in 65535
++  // bytes; an oversized ClientHello fails before it is written.
++  // This does not enable GREASE. A usable real ECH config takes precedence.
++  // HRR reuses the first GREASE extension. New connections use fresh random
++  // config IDs, X25519 keys and payloads, independently of grease_values.
++  uint16_t ech_grease_kdf_id;
++  uint16_t ech_grease_aead_id;
++  size_t ech_grease_payload_len;
 +} RAMA_SSL_CLIENT_HELLO_SHAPE;
 +
 +// RAMA_SSL_set_client_hello_shape replaces this client's shape as a whole
@@ -278,6 +289,42 @@ index f4b3484..30cf143 100644
  
  #define TLSEXT_MAXLEN_host_name 255
  
+diff --git a/ssl/encrypted_client_hello.cc b/ssl/encrypted_client_hello.cc
+index 0cf1fc3..9a85981 100644
+--- a/ssl/encrypted_client_hello.cc
++++ b/ssl/encrypted_client_hello.cc
+@@ -748,11 +748,19 @@ static bool setup_ech_grease(SSL_HANDSHAKE *hs) {
+   const bool has_aes_hw = hs->ssl->config->aes_hw_override
+                               ? hs->ssl->config->aes_hw_override_value
+                               : EVP_has_aes_hardware();
+-  const EVP_HPKE_AEAD *aead =
+-      has_aes_hw ? EVP_hpke_aes_128_gcm() : EVP_hpke_chacha20_poly1305();
++  const RamaConnectionConfig *rama = hs->config->rama.get();
++  const bool shaped = rama != nullptr && rama->ech_grease_kdf_id != 0;
++  const EVP_HPKE_AEAD *aead = shaped
++                                  ? get_ech_aead(rama->ech_grease_aead_id)
++                                  : (has_aes_hw ? EVP_hpke_aes_128_gcm()
++                                                : EVP_hpke_chacha20_poly1305());
+   static_assert(ssl_grease_ech_config_id < sizeof(hs->grease_seed),
+                 "hs->grease_seed is too small");
+   uint8_t config_id = hs->grease_seed[ssl_grease_ech_config_id];
++  // Shaping may seed GREASE codepoints, but ECH config IDs stay fresh.
++  if (shaped && !RAND_bytes(&config_id, sizeof(config_id))) {
++    return false;
++  }
+ 
+   uint8_t enc[X25519_PUBLIC_VALUE_LEN];
+   uint8_t private_key_unused[X25519_PRIVATE_KEY_LEN];
+@@ -774,7 +782,8 @@ static bool setup_ech_grease(SSL_HANDSHAKE *hs) {
+   // estimate maximum_name_length to be between 32 and 100 bytes. Then round up
+   // to a multiple of 32, to match RFC 9849, section 6.1.3.
+   const size_t payload_len =
+-      32 * random_size(128 / 32, 224 / 32) + aead_overhead(aead);
++      shaped ? rama->ech_grease_payload_len
++             : 32 * random_size(128 / 32, 224 / 32) + aead_overhead(aead);
+   bssl::ScopedCBB cbb;
+   CBB enc_cbb, payload_cbb;
+   uint8_t *payload;
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
 index 90238d9..678646e 100644
 --- a/ssl/extensions.cc
@@ -1317,7 +1364,7 @@ index a4a53cd..d50bead 100644
        !ssl_add_client_hello(hs)) {
      return ssl_hs_error;
 diff --git a/ssl/internal.h b/ssl/internal.h
-index 96f6d3d..8b0c1ad 100644
+index 96f6d3d..22ec8d1 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
 @@ -297,10 +297,14 @@ struct SSLCipherPreferenceList {
@@ -1372,7 +1419,7 @@ index 96f6d3d..8b0c1ad 100644
  // ssl_setup_extension_permutation computes a ClientHello extension permutation
  // for `hs`, if applicable. It returns true on success and false on error.
  bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs);
-@@ -3397,6 +3417,120 @@ struct ALPSConfig {
+@@ -3397,6 +3417,125 @@ struct ALPSConfig {
  //
  // See SSL_shed_handshake_config() for more about the conditions under which
  // configuration can be shed.
@@ -1416,6 +1463,11 @@ index 96f6d3d..8b0c1ad 100644
 +
 +  // legacy_extensions matches browsers that send TLS 1.2 extensions in TLS 1.3.
 +  bool legacy_extensions = false;
++
++  // Zero kdf keeps native ECH GREASE defaults. Validated by the shape setter.
++  uint16_t ech_grease_kdf_id = 0;
++  uint16_t ech_grease_aead_id = 0;
++  size_t ech_grease_payload_len = 0;
 +
 +  // padding is a `RAMA_SSL_PADDING_*` mode; `padding_length` is its target.
 +  uint8_t padding = RAMA_SSL_PADDING_NATIVE;
@@ -1493,7 +1545,7 @@ index 96f6d3d..8b0c1ad 100644
  struct SSL_CONFIG {
    static constexpr bool kAllowUniquePtr = true;
  
-@@ -3596,6 +3730,16 @@ struct SSL_CONFIG {
+@@ -3596,6 +3735,16 @@ struct SSL_CONFIG {
    // server_padding_enabled is true iff the server is willing to send additional
    // padding to clients that request it through the server padding extension.
    bool server_padding_enabled : 1;
@@ -1510,7 +1562,7 @@ index 96f6d3d..8b0c1ad 100644
  };
  
  // From RFC 8446, used in determining PSK modes.
-@@ -4232,6 +4376,12 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+@@ -4232,6 +4381,12 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
    // permute_extensions is whether to permute extensions when sending messages.
    bool permute_extensions : 1;
  
@@ -1659,7 +1711,7 @@ index 7799d79..c32d06b 100644
    switch (EVP_PKEY_id(key)) {
      case EVP_PKEY_RSA:
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index a0c746b..7f02b0e 100644
+index a0c746b..d24a95e 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
 @@ -364,6 +364,12 @@ void SSL_set_aes_hw_override_for_testing(SSL *ssl, bool override_value) {
@@ -1902,7 +1954,7 @@ index a0c746b..7f02b0e 100644
  int SSL_CTX_add_cert_compression_alg(SSL_CTX *ctx, uint16_t alg_id,
                                       ssl_cert_compression_func_t compress,
                                       ssl_cert_decompression_func_t decompress) {
-@@ -3284,6 +3456,232 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
+@@ -3284,6 +3456,251 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
    FromOpaque(ctx)->permute_extensions = !!enabled;
  }
  
@@ -2020,6 +2072,22 @@ index a0c746b..7f02b0e 100644
 +    OPENSSL_PUT_ERROR(SSL, ERR_R_OVERFLOW);
 +    return 0;
 +  }
++  if (shape->ech_grease_kdf_id != 0 || shape->ech_grease_aead_id != 0 ||
++      shape->ech_grease_payload_len != 0) {
++    // The limit leaves room for the extension header (4), ECH fields (10),
++    // and X25519 enc (32) within the u16 extensions block. Other extensions
++    // are checked when the complete ClientHello is serialized.
++    if (shape->ech_grease_kdf_id != EVP_HPKE_HKDF_SHA256 ||
++        (shape->ech_grease_aead_id != EVP_HPKE_AES_128_GCM &&
++         shape->ech_grease_aead_id != EVP_HPKE_AES_256_GCM &&
++         shape->ech_grease_aead_id != EVP_HPKE_CHACHA20_POLY1305) ||
++        shape->ech_grease_payload_len < 16 ||
++        shape->ech_grease_payload_len > 65535 - 4 - 10 - 32) {
++      OPENSSL_PUT_ERROR(SSL, ERR_R_OVERFLOW);
++      ERR_add_error_dataf("rama: invalid ECH GREASE shape");
++      return 0;
++    }
++  }
 +  Vector<std::pair<uint16_t, Array<uint8_t>>> bodies;
 +  for (size_t i = 0; i < shape->num_extension_bodies; i++) {
 +    const RAMA_SSL_EXTENSION_BODY &entry = shape->extension_bodies[i];
@@ -2060,6 +2128,9 @@ index a0c746b..7f02b0e 100644
 +  rama->padding_length = static_cast<uint16_t>(shape->padding_length);
 +  rama->extension_bodies = std::move(bodies);
 +  rama->legacy_extensions = !!shape->legacy_extensions;
++  rama->ech_grease_kdf_id = shape->ech_grease_kdf_id;
++  rama->ech_grease_aead_id = shape->ech_grease_aead_id;
++  rama->ech_grease_payload_len = shape->ech_grease_payload_len;
 +  return 1;
 +}
 +
@@ -2135,6 +2206,161 @@ index a0c746b..7f02b0e 100644
  void SSL_set_permute_extensions(SSL *ssl, int enabled) {
    auto *ssl_impl = FromOpaque(ssl);
    if (!ssl_impl->config) {
+diff --git a/ssl/ssl_test.cc b/ssl/ssl_test.cc
+index fc185ec..f514ed3 100644
+--- a/ssl/ssl_test.cc
++++ b/ssl/ssl_test.cc
+@@ -1662,6 +1662,150 @@ static bool GetClientHello(SSL *ssl, std::vector<uint8_t> *out) {
+   return true;
+ }
+ 
++// The public C setter must validate even when callers bypass Rust's types.
++TEST(SSLTest, RamaECHGreaseShapeValidation) {
++  UniquePtr<SSL_CTX> ctx(SSL_CTX_new(TLS_method()));
++  ASSERT_TRUE(ctx);
++  UniquePtr<SSL> ssl(SSL_new(ctx.get()));
++  ASSERT_TRUE(ssl);
++  RAMA_SSL_CLIENT_HELLO_SHAPE shape = {};
++  shape.ech_grease_kdf_id = EVP_HPKE_HKDF_SHA256;
++  shape.ech_grease_aead_id = EVP_HPKE_AES_256_GCM;
++  shape.ech_grease_payload_len = 208;
++  ASSERT_TRUE(RAMA_SSL_set_client_hello_shape(ssl.get(), &shape));
++  for (auto invalid :
++       {std::make_tuple(0, 2, size_t{208}), std::make_tuple(2, 2, size_t{208}),
++        std::make_tuple(1, 0, size_t{208}), std::make_tuple(1, 4, size_t{208}),
++        std::make_tuple(1, 2, size_t{0}), std::make_tuple(1, 2, size_t{15}),
++        std::make_tuple(1, 2, size_t{65490}),
++        std::make_tuple(1, 2, SIZE_MAX)}) {
++    auto bad = shape;
++    std::tie(bad.ech_grease_kdf_id, bad.ech_grease_aead_id,
++             bad.ech_grease_payload_len) = invalid;
++    EXPECT_FALSE(RAMA_SSL_set_client_hello_shape(ssl.get(), &bad));
++    EXPECT_NE(ERR_get_error(), 0u);
++    ERR_clear_error();
++    const auto *rama = FromOpaque(ssl.get())->config->rama.get();
++    ASSERT_TRUE(rama);
++    EXPECT_EQ(rama->ech_grease_kdf_id, 1);
++    EXPECT_EQ(rama->ech_grease_aead_id, 2);
++    EXPECT_EQ(rama->ech_grease_payload_len, 208u);
++  }
++  // A failure later in validation must not partially replace ECH settings.
++  uint8_t data = 0;
++  RAMA_SSL_EXTENSION_BODY body = {TLSEXT_TYPE_encrypted_client_hello, &data, 1};
++  auto bad = shape;
++  bad.ech_grease_payload_len = 144;
++  bad.extension_bodies = &body;
++  bad.num_extension_bodies = 1;
++  EXPECT_FALSE(RAMA_SSL_set_client_hello_shape(ssl.get(), &bad));
++  ERR_clear_error();
++  EXPECT_EQ(FromOpaque(ssl.get())->config->rama->ech_grease_payload_len, 208u);
++  for (size_t length : {size_t{16}, size_t{65489}}) {
++    shape.ech_grease_payload_len = length;
++    ASSERT_TRUE(RAMA_SSL_set_client_hello_shape(ssl.get(), &shape));
++  }
++  shape = {};
++  ASSERT_TRUE(RAMA_SSL_set_client_hello_shape(ssl.get(), &shape));
++  EXPECT_EQ(FromOpaque(ssl.get())->config->rama->ech_grease_kdf_id, 0);
++  EXPECT_EQ(FromOpaque(ssl.get())->config->rama->ech_grease_aead_id, 0);
++  EXPECT_EQ(FromOpaque(ssl.get())->config->rama->ech_grease_payload_len, 0u);
++  SSL_set_accept_state(ssl.get());
++  EXPECT_FALSE(RAMA_SSL_set_client_hello_shape(ssl.get(), &shape));
++  ERR_clear_error();
++}
++
++TEST(SSLTest, RamaECHGreaseShapeHardwareIndependent) {
++  UniquePtr<SSL_CTX> ctx(SSL_CTX_new(TLS_method()));
++  ASSERT_TRUE(ctx);
++  for (bool aes_hw : {false, true}) {
++    for (uint16_t aead : {1, 2, 3}) {
++      for (size_t length : {size_t{16}, size_t{144}, size_t{208}}) {
++        UniquePtr<SSL> ssl(SSL_new(ctx.get()));
++        ASSERT_TRUE(ssl);
++        SSL_set_connect_state(ssl.get());
++        SSL_set_enable_ech_grease(ssl.get(), 1);
++        SSL_set_aes_hw_override_for_testing(ssl.get(), aes_hw);
++        RAMA_SSL_CLIENT_HELLO_SHAPE shape = {};
++        shape.ech_grease_kdf_id = 1;
++        shape.ech_grease_aead_id = aead;
++        shape.ech_grease_payload_len = length;
++        ASSERT_TRUE(RAMA_SSL_set_client_hello_shape(ssl.get(), &shape));
++        std::vector<uint8_t> hello;
++        ASSERT_TRUE(GetClientHello(ssl.get(), &hello));
++        SSL_CLIENT_HELLO parsed;
++        auto body =
++            Span(hello).subspan(SSL3_RT_HEADER_LENGTH + SSL3_HM_HEADER_LENGTH);
++        ASSERT_TRUE(SSL_parse_client_hello(ssl.get(), &parsed, body.data(),
++                                           body.size()));
++        const uint8_t *ext;
++        size_t ext_len;
++        ASSERT_TRUE(SSL_early_callback_ctx_extension_get(
++            &parsed, TLSEXT_TYPE_encrypted_client_hello, &ext, &ext_len));
++        CBS cbs, enc, payload;
++        CBS_init(&cbs, ext, ext_len);
++        uint8_t type, config_id;
++        uint16_t kdf_id, aead_id;
++        ASSERT_TRUE(CBS_get_u8(&cbs, &type));
++        ASSERT_TRUE(CBS_get_u16(&cbs, &kdf_id));
++        ASSERT_TRUE(CBS_get_u16(&cbs, &aead_id));
++        ASSERT_TRUE(CBS_get_u8(&cbs, &config_id));
++        ASSERT_TRUE(CBS_get_u16_length_prefixed(&cbs, &enc));
++        ASSERT_TRUE(CBS_get_u16_length_prefixed(&cbs, &payload));
++        EXPECT_EQ(type, 0);
++        EXPECT_EQ(kdf_id, 1);
++        EXPECT_EQ(aead_id, aead);
++        EXPECT_EQ(CBS_len(&enc), 32u);
++        EXPECT_EQ(CBS_len(&payload), length);
++        EXPECT_EQ(CBS_len(&cbs), 0u);
++        EXPECT_FALSE(RAMA_SSL_set_client_hello_shape(ssl.get(), &shape));
++        ERR_clear_error();
++      }
++    }
++    // With no override, the hardware-dependent default is unchanged.
++    UniquePtr<SSL> ssl(SSL_new(ctx.get()));
++    ASSERT_TRUE(ssl);
++    SSL_set_enable_ech_grease(ssl.get(), 1);
++    SSL_set_aes_hw_override_for_testing(ssl.get(), aes_hw);
++    std::vector<uint8_t> hello;
++    ASSERT_TRUE(GetClientHello(ssl.get(), &hello));
++    const auto &outer = FromOpaque(ssl.get())->s3->hs->ech_client_outer;
++    EXPECT_EQ(outer[3], aes_hw ? 1 : 3);
++  }
++}
++
++TEST(SSLTest, RamaECHGreaseShapeFreshConfigID) {
++  UniquePtr<SSL_CTX> ctx(SSL_CTX_new(TLS_method()));
++  ASSERT_TRUE(ctx);
++  std::vector<uint8_t> first;
++  bool different_id = false;
++  for (unsigned i = 0; i < 16; i++) {
++    UniquePtr<SSL> ssl(SSL_new(ctx.get()));
++    ASSERT_TRUE(ssl);
++    SSL_set_enable_ech_grease(ssl.get(), 1);
++    RAMA_SSL_CLIENT_HELLO_SHAPE shape = {};
++    shape.grease_values = RAMA_SSL_GREASE_VALUES_SEEDED;
++    shape.grease_seed = 7;
++    shape.ech_grease_kdf_id = 1;
++    shape.ech_grease_aead_id = 1;
++    shape.ech_grease_payload_len = 144;
++    ASSERT_TRUE(RAMA_SSL_set_client_hello_shape(ssl.get(), &shape));
++    std::vector<uint8_t> hello;
++    ASSERT_TRUE(GetClientHello(ssl.get(), &hello));
++    const auto &outer = FromOpaque(ssl.get())->s3->hs->ech_client_outer;
++    ASSERT_EQ(outer.size(), 41u + 144u);
++    if (i == 0) {
++      first.assign(outer.begin(), outer.end());
++    } else {
++      different_id |= outer[4] != first[4];
++      EXPECT_NE(Bytes(Span(outer).subspan(7, 32)),
++                Bytes(Span(first).subspan(7, 32)));
++      EXPECT_NE(Bytes(Span(outer).subspan(41)), Bytes(Span(first).subspan(41)));
++    }
++  }
++  EXPECT_TRUE(different_id);
++}
++
+ // GetClientHelloLen creates a client SSL connection with the specified version
+ // and ticket length. It returns the length of the ClientHello, not including
+ // the record header, on success and zero on error.
 diff --git a/ssl/tls13_both.cc b/ssl/tls13_both.cc
 index 68c5ea2..1e2d7e9 100644
 --- a/ssl/tls13_both.cc

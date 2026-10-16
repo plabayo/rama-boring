@@ -35,6 +35,7 @@ mod client_hello;
 mod credentials;
 mod custom_verify;
 mod ech;
+pub(crate) mod ech_grease;
 mod legacy;
 mod private_key_method;
 mod server;
