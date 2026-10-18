@@ -3289,6 +3289,51 @@ impl SslRef {
         unsafe { cvt(ffi::SSL_set_tmp_ecdh(self.as_ptr(), key.as_ptr())) }
     }
 
+    /// Requests `num_bytes` of server handshake padding on this client connection.
+    ///
+    /// This is a temporary BoringSSL TLS 1.3 experiment (extension 0x12e0),
+    /// not a permanent IANA assignment. It also works with QUIC TLS 1.3.
+    /// By default no request is sent. Zero sends an explicit zero-byte request;
+    /// there is no native API to restore absence. Repeated calls replace the request.
+    /// All `u16` values are sent unchanged, even in a TLS 1.2 ClientHello, but
+    /// bundled servers only respond in TLS 1.3, on non-resumed handshakes, and
+    /// only for requests at most 16,384 bytes. Larger requests are ignored.
+    ///
+    /// Configure before starting the handshake. Native setters update retained
+    /// configuration without a handshake-state check: a late call does not rewrite
+    /// an already emitted ClientHello and may change response validation. If native
+    /// configuration has been shed, the call does nothing. Use a fresh SSL to omit
+    /// a previously configured request. ClientHelloShape ordering can position this
+    /// native extension, but cannot supply an opaque body for it.
+    #[corresponds(SSL_set_server_padding_request)]
+    pub fn set_server_padding_request(&mut self, num_bytes: u16) {
+        unsafe { ffi::SSL_set_server_padding_request(self.as_ptr(), num_bytes) }
+    }
+
+    /// Enables this server connection to answer experimental server-padding requests.
+    ///
+    /// Disabled by default. Repeated calls replace the policy. The bundled server
+    /// responds only on full TLS 1.3 handshakes (including QUIC), for requests of
+    /// zero through 16,384 bytes, in EncryptedExtensions. Configure before the
+    /// handshake; late changes cannot rewrite a response already sent and are
+    /// ignored if native configuration has been shed. See
+    /// [`Self::set_server_padding_request`] for the experiment's limitations.
+    #[corresponds(SSL_set_server_padding_enabled)]
+    pub fn set_server_padding_enabled(&mut self, enabled: bool) {
+        unsafe { ffi::SSL_set_server_padding_enabled(self.as_ptr(), enabled as _) }
+    }
+
+    /// Whether this client received the requested experimental server padding.
+    ///
+    /// False initially and when no response is received (including TLS 1.2,
+    /// resumption, disabled servers, and oversized requests). An acknowledged
+    /// zero-byte request counts as true. Inspect after a successful handshake;
+    /// this flag alone does not establish handshake success.
+    #[corresponds(SSL_server_sent_requested_padding)]
+    pub fn server_sent_requested_padding(&self) -> bool {
+        unsafe { ffi::SSL_server_sent_requested_padding(self.as_ptr()) != 0 }
+    }
+
     /// Configures whether ClientHello extensions should be permuted.
     #[corresponds(SSL_set_permute_extensions)]
     pub fn set_permute_extensions(&mut self, enabled: bool) {
