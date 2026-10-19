@@ -102,6 +102,8 @@ pub struct ClientHelloShape {
     unknown_values: UnknownValues,
     padding: Padding,
     legacy_extensions: bool,
+    ec_point_formats: bool,
+    omit_psk_key_exchange_modes: bool,
     ech_grease: Option<EchGreaseShape>,
     extension_bodies: Vec<(ExtensionType, Vec<u8>)>,
 }
@@ -167,6 +169,43 @@ impl ClientHelloShape {
     #[must_use]
     pub fn with_legacy_extensions(mut self, enabled: bool) -> Self {
         self.set_legacy_extensions(enabled);
+        self
+    }
+
+    /// Sends ec_point_formats, listing only uncompressed points (`[0]`), with
+    /// a TLS 1.3 minimum, as clients that also speak TLS 1.2 do. Below a
+    /// TLS 1.3 minimum it is always sent. A TLS 1.3 server never echoes it,
+    /// so negotiation is unchanged. Once sent, the extension order orders it
+    /// like any other extension.
+    pub fn set_ec_point_formats(&mut self, enabled: bool) -> &mut Self {
+        self.ec_point_formats = enabled;
+        self
+    }
+
+    #[must_use]
+    pub fn with_ec_point_formats(mut self, enabled: bool) -> Self {
+        self.set_ec_point_formats(enabled);
+        self
+    }
+
+    /// Omits psk_key_exchange_modes from a ClientHello offering TLS 1.3, as
+    /// clients that never resume do.
+    ///
+    /// A pre_shared_key requires psk_key_exchange_modes (RFC 8446, section
+    /// 4.2.9), so such a connection does not resume: it offers no session,
+    /// TLS 1.2 ones included, and so no early data, whatever session was set
+    /// or cached. A configured PSK credential fails the handshake with
+    /// `NO_SUPPORTED_PSK_MODE`. Tickets a server sends anyway still reach the
+    /// new-session callback; a later connection that sends the extension may
+    /// resume them.
+    pub fn set_omit_psk_key_exchange_modes(&mut self, omit: bool) -> &mut Self {
+        self.omit_psk_key_exchange_modes = omit;
+        self
+    }
+
+    #[must_use]
+    pub fn with_omit_psk_key_exchange_modes(mut self, omit: bool) -> Self {
+        self.set_omit_psk_key_exchange_modes(omit);
         self
     }
 
@@ -655,6 +694,8 @@ impl SslRef {
             ech_grease_kdf_id: shape.ech_grease.map_or(0, |s| s.cipher_suite().ids().0),
             ech_grease_aead_id: shape.ech_grease.map_or(0, |s| s.cipher_suite().ids().1),
             ech_grease_payload_len: shape.ech_grease.map_or(0, |s| s.payload_len()),
+            ec_point_formats: shape.ec_point_formats.into(),
+            omit_psk_key_exchange_modes: shape.omit_psk_key_exchange_modes.into(),
         };
         unsafe { cvt(ffi::RAMA_SSL_set_client_hello_shape(self.as_ptr(), &native)).map(|_| ()) }
     }

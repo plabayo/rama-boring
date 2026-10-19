@@ -1896,6 +1896,7 @@ fn per_session_extension_order_bounds_and_server_role() {
 mod browser_fixtures;
 mod client_hello_shape;
 mod connection;
+mod extension_presence;
 mod lifecycle;
 mod memory;
 mod panic_safety;

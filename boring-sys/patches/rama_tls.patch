@@ -1,5 +1,5 @@
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 3b48c2a..44afb89 100644
+index 3b48c2a..d2ea69a 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
 @@ -1739,8 +1739,17 @@ OPENSSL_EXPORT int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx,
@@ -59,7 +59,7 @@ index 3b48c2a..44afb89 100644
  OPENSSL_EXPORT void SSL_CTX_set_reverify_on_resume(SSL_CTX *ctx, int enabled);
  
  // SSL_ST_* are possible values for `SSL_state`, the bitmasks that make them up,
-@@ -5565,7 +5580,206 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
+@@ -5565,7 +5580,217 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
  
@@ -198,6 +198,17 @@ index 3b48c2a..44afb89 100644
 +  uint16_t ech_grease_kdf_id;
 +  uint16_t ech_grease_aead_id;
 +  size_t ech_grease_payload_len;
++  // Send ec_point_formats, listing only uncompressed points, even with a
++  // TLS 1.3 minimum. A TLS 1.3 server never echoes it, so this changes no
++  // negotiation.
++  int ec_point_formats;
++  // Omit psk_key_exchange_modes from a ClientHello that offers TLS 1.3. A
++  // pre_shared_key requires it (RFC 8446, section 4.2.9), so such a
++  // connection offers no session, TLS 1.2 ones included, and so no early
++  // data; a configured PSK credential fails the handshake with
++  // SSL_R_NO_SUPPORTED_PSK_MODE. Tickets a server sends anyway still reach
++  // the new-session callback.
++  int omit_psk_key_exchange_modes;
 +} RAMA_SSL_CLIENT_HELLO_SHAPE;
 +
 +// RAMA_SSL_set_client_hello_shape replaces this client's shape as a whole
@@ -326,7 +337,7 @@ index 0cf1fc3..9a85981 100644
    CBB enc_cbb, payload_cbb;
    uint8_t *payload;
 diff --git a/ssl/extensions.cc b/ssl/extensions.cc
-index 90238d9..678646e 100644
+index 90238d9..b559a1a 100644
 --- a/ssl/extensions.cc
 +++ b/ssl/extensions.cc
 @@ -35,6 +35,7 @@
@@ -393,7 +404,47 @@ index 90238d9..678646e 100644
        !CBB_add_u16(&sigalgs_cbb,
                     ssl_get_grease_value(hs, ssl_grease_signature_algorithm))) {
      return false;
-@@ -2428,6 +2457,55 @@ bool ssl_setup_key_shares(SSL_HANDSHAKE *hs, uint16_t override_group_id) {
+@@ -1866,7 +1895,9 @@ static bool ext_ec_point_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
+                                          CBB *out_compressible,
+                                          ssl_client_hello_type_t type) {
+   // The point format extension is unnecessary in TLS 1.3.
+-  if (hs->min_version >= TLS1_3_VERSION || type == ssl_client_hello_inner) {
++  if ((hs->min_version >= TLS1_3_VERSION &&
++       (hs->config->rama == nullptr || !hs->config->rama->ec_point_formats)) ||
++      type == ssl_client_hello_inner) {
+     return true;
+   }
+ 
+@@ -1945,6 +1976,19 @@ bool ssl_setup_pre_shared_keys(SSL_HANDSHAKE *hs) {
+     return false;
+   }
+ 
++  // Without psk_key_exchange_modes no PSK may be offered. The session was
++  // already dropped; a configured PSK credential cannot be honoured.
++  if (rama_omits_psk_key_exchange_modes(hs) &&
++      std::any_of(hs->config->cert->credentials.begin(),
++                  hs->config->cert->credentials.end(), [](const auto &cred) {
++                    return cred->type == SSLCredentialType::kPreSharedKey;
++                  })) {
++    OPENSSL_PUT_ERROR(SSL, SSL_R_NO_SUPPORTED_PSK_MODE);
++    ERR_add_error_data(
++        1, "rama: PSK credential without psk_key_exchange_modes");
++    return false;
++  }
++
+   const uint16_t epsk_protocol =
+       SSL_is_dtls(ssl) ? DTLS1_3_VERSION : TLS1_3_VERSION;
+ #if defined(TLS1_4_VERSION)
+@@ -2266,7 +2310,7 @@ static bool ext_psk_key_exchange_modes_add_clienthello(
+   }
+   // We do not support resumption with PAKEs, so do not offer any PSK key
+   // exchange modes, to signal the server not to send a ticket.
+-  if (hs->pake_prover != nullptr) {
++  if (hs->pake_prover != nullptr || rama_omits_psk_key_exchange_modes(hs)) {
+     return true;
+   }
+ 
+@@ -2428,6 +2472,55 @@ bool ssl_setup_key_shares(SSL_HANDSHAKE *hs, uint16_t override_group_id) {
      return false;
    }
  
@@ -449,7 +500,7 @@ index 90238d9..678646e 100644
    std::optional<Span<const uint16_t>> selected_key_shares;
  
    // This is used for HelloRetryRequest, where we have already been given the
-@@ -2487,7 +2565,8 @@ bool ssl_setup_key_shares(SSL_HANDSHAKE *hs, uint16_t override_group_id) {
+@@ -2487,7 +2580,8 @@ bool ssl_setup_key_shares(SSL_HANDSHAKE *hs, uint16_t override_group_id) {
      return false;
    }
  
@@ -459,7 +510,7 @@ index 90238d9..678646e 100644
      // Add a fake group. See RFC 8701.
      if (!CBB_add_u16(cbb.get(), ssl_get_grease_value(hs, ssl_grease_group)) ||
          !CBB_add_u16(cbb.get(), 1 /* length */) ||
-@@ -2521,10 +2600,11 @@ static bool ext_key_share_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
+@@ -2521,10 +2615,11 @@ static bool ext_key_share_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
    }
  
    // The caller may explicitly configure empty key shares to request a
@@ -473,7 +524,7 @@ index 90238d9..678646e 100644
  
    CBB contents, kse_bytes;
    if (!CBB_add_u16(out_compressible, TLSEXT_TYPE_key_share) ||
-@@ -2675,7 +2755,6 @@ bool ssl_ext_key_share_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
+@@ -2675,7 +2770,6 @@ bool ssl_ext_key_share_add_serverhello(SSL_HANDSHAKE *hs, CBB *out) {
  static bool ext_supported_versions_add_clienthello(
      const SSL_HANDSHAKE *hs, CBB *out, CBB *out_compressible,
      ssl_client_hello_type_t type) {
@@ -481,7 +532,7 @@ index 90238d9..678646e 100644
    if (hs->max_version <= TLS1_2_VERSION) {
      return true;
    }
-@@ -2693,15 +2772,47 @@ static bool ext_supported_versions_add_clienthello(
+@@ -2693,15 +2787,47 @@ static bool ext_supported_versions_add_clienthello(
      return false;
    }
  
@@ -533,7 +584,7 @@ index 90238d9..678646e 100644
    if (!ssl_add_supported_versions(hs, &versions, extra_min_version) ||
        !CBB_flush(out)) {
      return false;
-@@ -2744,7 +2855,6 @@ static bool ext_supported_groups_add_clienthello(const SSL_HANDSHAKE *hs,
+@@ -2744,7 +2870,6 @@ static bool ext_supported_groups_add_clienthello(const SSL_HANDSHAKE *hs,
                                                   CBB *out,
                                                   CBB *out_compressible,
                                                   ssl_client_hello_type_t type) {
@@ -541,7 +592,7 @@ index 90238d9..678646e 100644
    // In PAKE mode, supported_groups and key_share are not used.
    if (hs->pake_prover != nullptr) {
      return true;
-@@ -2757,8 +2867,39 @@ static bool ext_supported_groups_add_clienthello(const SSL_HANDSHAKE *hs,
+@@ -2757,8 +2882,39 @@ static bool ext_supported_groups_add_clienthello(const SSL_HANDSHAKE *hs,
      return false;
    }
  
@@ -582,7 +633,7 @@ index 90238d9..678646e 100644
        !CBB_add_u16(&groups_bytes, ssl_get_grease_value(hs, ssl_grease_group))) {
      return false;
    }
-@@ -3303,6 +3444,32 @@ static bool ext_quic_transport_params_add_serverhello_legacy(SSL_HANDSHAKE *hs,
+@@ -3303,6 +3459,32 @@ static bool ext_quic_transport_params_add_serverhello_legacy(SSL_HANDSHAKE *hs,
  static bool ext_delegated_credential_add_clienthello(
      const SSL_HANDSHAKE *hs, CBB *out, CBB *out_compressible,
      ssl_client_hello_type_t type) {
@@ -615,7 +666,7 @@ index 90238d9..678646e 100644
    return true;
  }
  
-@@ -3328,6 +3495,30 @@ static bool ext_delegated_credential_parse_clienthello(SSL_HANDSHAKE *hs,
+@@ -3328,6 +3510,30 @@ static bool ext_delegated_credential_parse_clienthello(SSL_HANDSHAKE *hs,
    return true;
  }
  
@@ -646,7 +697,7 @@ index 90238d9..678646e 100644
  // Certificate compression
  
  static bool cert_compression_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
-@@ -3336,10 +3527,28 @@ static bool cert_compression_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
+@@ -3336,10 +3542,28 @@ static bool cert_compression_add_clienthello(const SSL_HANDSHAKE *hs, CBB *out,
    bool first = true;
    CBB contents, algs;
  
@@ -677,7 +728,7 @@ index 90238d9..678646e 100644
  
      if (first &&
          (!CBB_add_u16(out_compressible, TLSEXT_TYPE_cert_compression) ||
-@@ -3392,7 +3601,11 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
+@@ -3392,7 +3616,11 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
      return false;
    }
  
@@ -690,7 +741,7 @@ index 90238d9..678646e 100644
    size_t given_alg_idx = 0;
  
    while (CBS_len(&alg_ids) > 0) {
-@@ -3406,8 +3619,22 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
+@@ -3406,8 +3634,22 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
      for (size_t i = 0; i < num_algs; i++) {
        const auto &alg = ctx->cert_compression_algs[i];
        if (alg.alg_id == alg_id && alg.compress != nullptr) {
@@ -715,7 +766,7 @@ index 90238d9..678646e 100644
          }
          break;
        }
-@@ -3421,10 +3648,10 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
+@@ -3421,10 +3663,10 @@ static bool cert_compression_parse_clienthello(SSL_HANDSHAKE *hs,
      }
    }
  
@@ -728,7 +779,7 @@ index 90238d9..678646e 100644
    }
  
    return true;
-@@ -4260,6 +4487,13 @@ static const struct tls_extension kExtensions[] = {
+@@ -4260,6 +4502,13 @@ static const struct tls_extension kExtensions[] = {
          cert_compression_parse_clienthello,
          cert_compression_add_serverhello,
      },
@@ -742,7 +793,7 @@ index 90238d9..678646e 100644
      {
          TLSEXT_TYPE_delegated_credential,
          ext_delegated_credential_add_clienthello,
-@@ -4342,6 +4576,203 @@ static_assert(kNumExtensions <=
+@@ -4342,6 +4591,209 @@ static_assert(kNumExtensions <=
                    sizeof(((SSL_HANDSHAKE *)nullptr)->extensions.received) * 8,
                "too many extensions for received bitset");
  
@@ -898,6 +949,12 @@ index 90238d9..678646e 100644
 +  return SIZE_MAX;
 +}
 +
++bool rama_omits_psk_key_exchange_modes(const SSL_HANDSHAKE *hs) {
++  return !hs->ssl->server && hs->max_version >= TLS1_3_VERSION &&
++         hs->config->rama != nullptr &&
++         hs->config->rama->omit_psk_key_exchange_modes;
++}
++
 +bool rama_extension_is_native(uint16_t id) {
 +  uint32_t index;
 +  return tls_extension_find(&index, id) != nullptr ||
@@ -946,7 +1003,7 @@ index 90238d9..678646e 100644
  bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs) {
    if (!hs->config->permute_extensions) {
      return true;
-@@ -4390,6 +4821,133 @@ static bool add_padding_extension(CBB *cbb, uint16_t ext, size_t len) {
+@@ -4390,6 +4842,133 @@ static bool add_padding_extension(CBB *cbb, uint16_t ext, size_t len) {
    return CBB_flush(cbb);
  }
  
@@ -1080,7 +1137,7 @@ index 90238d9..678646e 100644
  static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
                                               CBB *out_encoded) {
    // When writing ClientHelloInner, we construct the real and encoded
-@@ -4397,7 +4955,6 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+@@ -4397,7 +4976,6 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
    // are written to `extensions` and copied to `extensions_encoded`. Compressed
    // extensions are buffered in `compressed` and written to the end. (ECH can
    // only compress contiguous extensions.)
@@ -1088,7 +1145,7 @@ index 90238d9..678646e 100644
    bssl::ScopedCBB compressed, outer_extensions;
    CBB extensions, extensions_encoded;
    if (!CBB_add_u16_length_prefixed(out, &extensions) ||
-@@ -4410,7 +4967,7 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+@@ -4410,7 +4988,7 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
  
    hs->inner_extensions_sent = 0;
  
@@ -1097,7 +1154,7 @@ index 90238d9..678646e 100644
      // Add a fake empty extension. See RFC 8701. This always matches
      // `ssl_add_clienthello_tlsext`, so compress it.
      uint16_t grease_ext = ssl_get_grease_value(hs, ssl_grease_extension1);
-@@ -4448,7 +5005,7 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
+@@ -4448,7 +5026,7 @@ static bool ssl_add_clienthello_tlsext_inner(SSL_HANDSHAKE *hs, CBB *out,
      }
    }
  
@@ -1106,7 +1163,7 @@ index 90238d9..678646e 100644
      // Add a fake non-empty extension. See RFC 8701. This always matches
      // `ssl_add_clienthello_tlsext`, so compress it.
      uint16_t grease_ext = ssl_get_grease_value(hs, ssl_grease_extension2);
-@@ -4525,18 +5082,46 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+@@ -4525,18 +5103,46 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
    // important to reset this value.
    hs->extensions.sent = 0;
  
@@ -1154,7 +1211,7 @@ index 90238d9..678646e 100644
      const size_t len_before = CBB_len(&extensions);
      if (!kExtensions[i].add_clienthello(hs, &extensions, &extensions, type)) {
        OPENSSL_PUT_ERROR(SSL, SSL_R_ERROR_ADDING_EXTENSION);
-@@ -4553,7 +5138,7 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+@@ -4553,7 +5159,7 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
      last_was_empty = (bytes_written == 4);
    }
  
@@ -1163,7 +1220,7 @@ index 90238d9..678646e 100644
      // Add a fake non-empty extension. See RFC 8701.
      if (!add_padding_extension(
              &extensions, ssl_get_grease_value(hs, ssl_grease_extension2), 1)) {
-@@ -4566,8 +5151,19 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
+@@ -4566,8 +5172,19 @@ bool ssl_add_clienthello_tlsext(SSL_HANDSHAKE *hs, CBB *out, CBB *out_encoded,
    // bugs. We also apply this padding to ClientHelloOuter, to keep the wire
    // images aligned.
    size_t psk_len = ext_pre_shared_key_clienthello_length(hs, type);
@@ -1184,7 +1241,7 @@ index 90238d9..678646e 100644
      msg_len += 2 /* length prefix */ + CBB_len(&extensions) + psk_len;
      // The length of the padding extension, excluding the four-byte extension
      // header.
-@@ -4627,16 +5223,40 @@ bool ssl_add_serverhello_tlsext(SSL_HANDSHAKE *hs, CBB *out) {
+@@ -4627,16 +5244,40 @@ bool ssl_add_serverhello_tlsext(SSL_HANDSHAKE *hs, CBB *out) {
      goto err;
    }
  
@@ -1306,7 +1363,7 @@ index 5103fe9..56ae1c5 100644
  
    if (ret == ssl_verify_invalid) {
 diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
-index a4a53cd..d50bead 100644
+index a4a53cd..238f790 100644
 --- a/ssl/handshake_client.cc
 +++ b/ssl/handshake_client.cc
 @@ -102,12 +102,38 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
@@ -1350,7 +1407,16 @@ index a4a53cd..d50bead 100644
    // Add TLS 1.3 ciphers. Order ChaCha20-Poly1305 relative to AES-GCM based on
    // hardware support.
    if (hs->max_version >= TLS1_3_VERSION) {
-@@ -442,9 +468,11 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
+@@ -403,6 +429,8 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
+         // support resumption with PAKEs. (Offering both together would need
+         // more logic to conditionally send the key_share extension.)
+         hs->pake_prover != nullptr ||
++        // A ClientHello without psk_key_exchange_modes offers no session.
++        rama_omits_psk_key_exchange_modes(hs) ||
+         !ssl_session_is_time_valid(ssl, ssl->session.get()) ||
+         SSL_is_quic(ssl) != int{ssl->session->is_quic} ||
+         ssl->s3->initial_handshake_complete) {
+@@ -442,9 +470,11 @@ static enum ssl_hs_wait_t do_start_connect(SSL_HANDSHAKE *hs) {
    }
  
    ssl_setup_client_certificate_type(hs);
@@ -1364,7 +1430,7 @@ index a4a53cd..d50bead 100644
        !ssl_add_client_hello(hs)) {
      return ssl_hs_error;
 diff --git a/ssl/internal.h b/ssl/internal.h
-index 96f6d3d..22ec8d1 100644
+index 96f6d3d..a8b28b2 100644
 --- a/ssl/internal.h
 +++ b/ssl/internal.h
 @@ -297,10 +297,14 @@ struct SSLCipherPreferenceList {
@@ -1419,7 +1485,7 @@ index 96f6d3d..22ec8d1 100644
  // ssl_setup_extension_permutation computes a ClientHello extension permutation
  // for `hs`, if applicable. It returns true on success and false on error.
  bool ssl_setup_extension_permutation(SSL_HANDSHAKE *hs);
-@@ -3397,6 +3417,125 @@ struct ALPSConfig {
+@@ -3397,6 +3417,135 @@ struct ALPSConfig {
  //
  // See SSL_shed_handshake_config() for more about the conditions under which
  // configuration can be shed.
@@ -1468,6 +1534,12 @@ index 96f6d3d..22ec8d1 100644
 +  uint16_t ech_grease_kdf_id = 0;
 +  uint16_t ech_grease_aead_id = 0;
 +  size_t ech_grease_payload_len = 0;
++
++  // ec_point_formats sends uncompressed-only point formats with a TLS 1.3
++  // minimum; omit_psk_key_exchange_modes drops psk_key_exchange_modes and with
++  // it every PSK offer.
++  bool ec_point_formats = false;
++  bool omit_psk_key_exchange_modes = false;
 +
 +  // padding is a `RAMA_SSL_PADDING_*` mode; `padding_length` is its target.
 +  uint8_t padding = RAMA_SSL_PADDING_NATIVE;
@@ -1538,6 +1610,10 @@ index 96f6d3d..22ec8d1 100644
 +// itself, so a caller cannot supply its body.
 +bool rama_extension_is_native(uint16_t id);
 +
++// rama_omits_psk_key_exchange_modes returns whether this client's ClientHello
++// offers TLS 1.3 without psk_key_exchange_modes, so it must offer no PSK.
++bool rama_omits_psk_key_exchange_modes(const SSL_HANDSHAKE *hs);
++
 +// rama_connection_config returns the per-connection settings of `config`,
 +// allocating them on first use, or nullptr on allocation failure.
 +RamaConnectionConfig *rama_connection_config(SSL_CONFIG *config);
@@ -1545,7 +1621,7 @@ index 96f6d3d..22ec8d1 100644
  struct SSL_CONFIG {
    static constexpr bool kAllowUniquePtr = true;
  
-@@ -3596,6 +3735,16 @@ struct SSL_CONFIG {
+@@ -3596,6 +3745,16 @@ struct SSL_CONFIG {
    // server_padding_enabled is true iff the server is willing to send additional
    // padding to clients that request it through the server padding extension.
    bool server_padding_enabled : 1;
@@ -1562,7 +1638,7 @@ index 96f6d3d..22ec8d1 100644
  };
  
  // From RFC 8446, used in determining PSK modes.
-@@ -4232,6 +4381,12 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
+@@ -4232,6 +4391,12 @@ class SSLContext : public ssl_ctx_st, public RefCounted<SSLContext> {
    // permute_extensions is whether to permute extensions when sending messages.
    bool permute_extensions : 1;
  
@@ -1711,7 +1787,7 @@ index 7799d79..c32d06b 100644
    switch (EVP_PKEY_id(key)) {
      case EVP_PKEY_RSA:
 diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
-index a0c746b..d24a95e 100644
+index a0c746b..779dcc0 100644
 --- a/ssl/ssl_lib.cc
 +++ b/ssl/ssl_lib.cc
 @@ -364,6 +364,12 @@ void SSL_set_aes_hw_override_for_testing(SSL *ssl, bool override_value) {
@@ -1954,7 +2030,7 @@ index a0c746b..d24a95e 100644
  int SSL_CTX_add_cert_compression_alg(SSL_CTX *ctx, uint16_t alg_id,
                                       ssl_cert_compression_func_t compress,
                                       ssl_cert_decompression_func_t decompress) {
-@@ -3284,6 +3456,251 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
+@@ -3284,6 +3456,253 @@ void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled) {
    FromOpaque(ctx)->permute_extensions = !!enabled;
  }
  
@@ -2131,6 +2207,8 @@ index a0c746b..d24a95e 100644
 +  rama->ech_grease_kdf_id = shape->ech_grease_kdf_id;
 +  rama->ech_grease_aead_id = shape->ech_grease_aead_id;
 +  rama->ech_grease_payload_len = shape->ech_grease_payload_len;
++  rama->ec_point_formats = !!shape->ec_point_formats;
++  rama->omit_psk_key_exchange_modes = !!shape->omit_psk_key_exchange_modes;
 +  return 1;
 +}
 +

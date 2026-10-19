@@ -339,7 +339,12 @@ fn compression_algorithm(id: u16) -> CertificateCompressionAlgorithm {
 /// Configures a client to send `hello` through the public per-connection API
 /// only, as a mirroring proxy would. QUIC transport parameters are set on the
 /// QUIC connection by the caller.
-fn mirror(ssl: &mut SslRef, hello: &ClientHello<'_>, transport: Transport) {
+fn mirror(
+    ssl: &mut SslRef,
+    hello: &ClientHello<'_>,
+    transport: Transport,
+    adjust: impl FnOnce(&mut ClientHelloShape),
+) {
     let mut shape = ClientHelloShape::new()
         .with_grease_values(GreaseValues::Pinned)
         .with_unknown_values(UnknownValues::Preserve)
@@ -405,18 +410,27 @@ fn mirror(ssl: &mut SslRef, hello: &ClientHello<'_>, transport: Transport) {
             EXTENDED_MASTER_SECRET | RENEGOTIATION_INFO => {
                 shape.set_legacy_extensions(true);
             }
+            EC_POINT_FORMATS => {
+                shape.set_ec_point_formats(true);
+            }
             // Built natively, with a fixed body the comparison checks.
-            EC_POINT_FORMATS | SESSION_TICKET | PSK_KEY_EXCHANGE_MODES | PRE_SHARED_KEY => {}
+            SESSION_TICKET | PSK_KEY_EXCHANGE_MODES | PRE_SHARED_KEY => {}
             _ => {
                 assert!(!NATIVE.contains(&id));
                 shape.set_extension_body(ExtensionType::from(id), body);
             }
         }
     }
+    shape.set_omit_psk_key_exchange_modes(hello.extension(PSK_KEY_EXCHANGE_MODES).is_none());
+    // The mirror context registers every algorithm; offer none unless captured.
+    if hello.extension(COMPRESS_CERTIFICATE).is_none() {
+        ssl.set_certificate_compression_algorithms(&[]).unwrap();
+    }
     if transport == Transport::Tcp && hello.extension(SESSION_TICKET).is_none() {
         ssl.set_options(SslOptions::NO_TICKET);
     }
     ssl.set_extension_order(&hello.ids()).unwrap();
+    adjust(&mut shape);
     ssl.set_client_hello_shape(&shape).unwrap();
 }
 
@@ -435,11 +449,16 @@ fn capture_client_hello(ssl: &mut SslRef) -> Arc<Mutex<Option<Vec<u8>>>> {
 }
 
 /// Mirrors `hello`, runs a real handshake against a BoringSSL server, and
-/// returns the ClientHello the client sent.
-fn emit(hello: &ClientHello<'_>, transport: Transport) -> Vec<u8> {
+/// returns the ClientHello the client sent. `adjust` changes the mirrored
+/// shape before it is applied.
+fn emit(
+    hello: &ClientHello<'_>,
+    transport: Transport,
+    adjust: impl FnOnce(&mut ClientHelloShape),
+) -> Vec<u8> {
     let ctx = mirror_context(transport).build();
     let mut client = Ssl::new(&ctx).unwrap();
-    mirror(&mut client, hello, transport);
+    mirror(&mut client, hello, transport, adjust);
     let written = capture_client_hello(&mut client);
     match transport {
         Transport::Tcp => {
@@ -470,7 +489,16 @@ fn check(fixture: &Fixture) {
     let captured = quic_initial::unhex(fixture.hello);
     let hello = ClientHello::parse(&captured).expect("a well-formed captured ClientHello");
     assert_eq!(hello.encode(), captured);
-    let emitted = emit(&hello, fixture.transport);
+    check_hello(&hello, fixture, |_| {});
+}
+
+/// Compares the ClientHello emitted for `hello` with it, as [`check`] does.
+fn check_hello(
+    hello: &ClientHello<'_>,
+    fixture: &Fixture,
+    adjust: impl FnOnce(&mut ClientHelloShape),
+) {
+    let emitted = emit(hello, fixture.transport, adjust);
     let sent = ClientHello::parse(&emitted).expect("a well-formed emitted ClientHello");
     let mut sent = Normalized::new(&sent);
     // Without AES hardware, BoringSSL's GREASE ECH picks ChaCha20-Poly1305
@@ -486,7 +514,7 @@ fn check(fixture: &Fixture) {
             }
         }
     }
-    let found = differences(&Normalized::new(&hello), &sent);
+    let found = differences(&Normalized::new(hello), &sent);
     let expected: BTreeMap<_, _> = fixture.known_differences.iter().copied().collect();
     let report: String = found
         .iter()
@@ -572,6 +600,73 @@ fn firefox_156_quic() {
     });
 }
 
+const QUIC_GO_0_63: &str = include_str!("fixtures/quic-go-0.63-quic-client-hello.hex");
+
+/// quic-go without a session cache: a TLS 1.3-only hello that still sends
+/// ec_point_formats and omits psk_key_exchange_modes.
+#[test]
+fn quic_go_0_63_quic() {
+    check(&Fixture {
+        hello: QUIC_GO_0_63,
+        transport: Transport::Quic,
+        known_differences: &[],
+    });
+}
+
+/// Each presence control alone accounts for exactly its own extension.
+#[test]
+fn quic_go_0_63_needs_both_presence_controls() {
+    let captured = quic_initial::unhex(QUIC_GO_0_63);
+    let hello = ClientHello::parse(&captured).unwrap();
+    for (ec_point_formats, omit_psk_modes) in [(false, false), (true, false), (false, true)] {
+        let mut known = Vec::new();
+        if !ec_point_formats {
+            known.push((
+                Difference::Missing(EC_POINT_FORMATS),
+                "not sent natively with a TLS 1.3 minimum",
+            ));
+        }
+        if !omit_psk_modes {
+            known.push((
+                Difference::Extra(PSK_KEY_EXCHANGE_MODES),
+                "sent natively whenever TLS 1.3 is offered",
+            ));
+        }
+        let fixture = Fixture {
+            hello: QUIC_GO_0_63,
+            transport: Transport::Quic,
+            known_differences: known.leak(),
+        };
+        check_hello(&hello, &fixture, |shape| {
+            shape
+                .set_ec_point_formats(ec_point_formats)
+                .set_omit_psk_key_exchange_modes(omit_psk_modes);
+        });
+    }
+}
+
+/// The same hello, without its QUIC transport parameters, over TCP.
+#[test]
+fn quic_go_0_63_shape_over_tcp() {
+    let captured = quic_initial::unhex(QUIC_GO_0_63);
+    let mut hello = ClientHello::parse(&captured).unwrap();
+    hello
+        .extensions
+        .retain(|(id, _)| *id != QUIC_TRANSPORT_PARAMETERS);
+    check_hello(
+        &hello,
+        &Fixture {
+            hello: QUIC_GO_0_63,
+            transport: Transport::Tcp,
+            known_differences: &[(
+                Difference::SessionIdLength,
+                "TCP TLS 1.3 sends a compatibility-mode session ID",
+            )],
+        },
+        |_| {},
+    );
+}
+
 /// The QUIC fixtures are exactly the CRYPTO stream of the captured Initial
 /// datagrams.
 #[test]
@@ -590,6 +685,13 @@ fn quic_fixtures_decrypt_from_the_captured_datagrams() {
                 include_str!("fixtures/quic/firefox-156-initial-2.hex"),
             ],
             include_str!("fixtures/firefox-156-quic-client-hello.hex"),
+        ),
+        (
+            [
+                include_str!("fixtures/quic/quic-go-0.63-initial-1.hex"),
+                include_str!("fixtures/quic/quic-go-0.63-initial-2.hex"),
+            ],
+            QUIC_GO_0_63,
         ),
     ];
     for (datagrams, hello) in flights {
@@ -622,6 +724,11 @@ fn disabled_legacy_extensions_preserve_the_default_tls13_hello() {
             None,
             Some(ClientHelloShape::new()),
             Some(ClientHelloShape::new().with_legacy_extensions(false)),
+            Some(
+                ClientHelloShape::new()
+                    .with_ec_point_formats(false)
+                    .with_omit_psk_key_exchange_modes(false),
+            ),
         ] {
             let mut client = Ssl::new(&ctx).unwrap();
             if ordered {
@@ -639,5 +746,6 @@ fn disabled_legacy_extensions_preserve_the_default_tls13_hello() {
         }
         assert_eq!(hellos[0], hellos[1]);
         assert_eq!(hellos[0], hellos[2]);
+        assert_eq!(hellos[0], hellos[3]);
     }
 }
