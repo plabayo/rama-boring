@@ -229,6 +229,14 @@ fn build_prefix(config: &Config) -> Option<String> {
 fn get_boringssl_cmake_config(config: &Config) -> cmake::Config {
     let src_path = get_boringssl_source_path(config);
     let mut boringssl_cmake = cmake::Config::new(src_path);
+    boringssl_cmake.define(
+        "BORINGSSL_WARNINGS_AS_ERRORS",
+        if config.env.warnings_as_errors {
+            "ON"
+        } else {
+            "OFF"
+        },
+    );
 
     if let Some(prefix) = build_prefix(config) {
         boringssl_cmake.define("BORINGSSL_PREFIX", &prefix);

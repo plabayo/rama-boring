@@ -19,6 +19,7 @@ pub(crate) struct Env {
     pub(crate) include_path: Option<PathBuf>,
     pub(crate) source_path: Option<PathBuf>,
     pub(crate) assume_patched: bool,
+    pub(crate) warnings_as_errors: bool,
     pub(crate) sysroot: Option<PathBuf>,
     pub(crate) compiler_external_toolchain: Option<PathBuf>,
     pub(crate) debug: Option<OsString>,
@@ -118,6 +119,12 @@ impl Env {
             source_path: boringssl_var("BORING_BSSL_SOURCE_PATH").map(PathBuf::from),
             assume_patched: boringssl_var("BORING_BSSL_ASSUME_PATCHED")
                 .is_some_and(|v| !v.is_empty()),
+            warnings_as_errors: match boringssl_var("BORING_BSSL_WARNINGS_AS_ERRORS") {
+                None => false,
+                Some(value) if value == "0" => false,
+                Some(value) if value == "1" => true,
+                Some(_) => panic!("BORING_BSSL_WARNINGS_AS_ERRORS must be 0 or 1"),
+            },
             sysroot: boringssl_var("BORING_BSSL_SYSROOT").map(PathBuf::from),
             compiler_external_toolchain: boringssl_var("BORING_BSSL_COMPILER_EXTERNAL_TOOLCHAIN")
                 .map(PathBuf::from),

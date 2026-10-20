@@ -39,6 +39,15 @@
 //! _Warning_: When providing a different version of BoringSSL make sure to use a compatible one, the
 //! crate relies on the presence of certain functions.
 //!
+//! ## Native compiler warnings
+//!
+//! Bundled BoringSSL builds enable compiler warnings without treating them as errors.
+//! Set `BORING_BSSL_WARNINGS_AS_ERRORS=1` to make native warnings fatal (as in this
+//! repository's CI); unset it or set it to `0` for the default behavior. This does
+//! not override warning flags supplied by the caller or affect prebuilt libraries.
+//! Custom sources used with `BORING_BSSL_ASSUME_PATCHED` must include the warning
+//! policy CMake patch for this setting to take effect.
+//!
 //! ## Building with a FIPS-validated module
 //!
 //! Only BoringCrypto module version `853ca1ea1168dff08011e5d42d94609cc0ca2e27`, as certified with

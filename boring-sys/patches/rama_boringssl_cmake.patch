@@ -111,7 +111,36 @@ diff --git a/CMakeLists.txt b/CMakeLists.txt
  
  # Enable a suite of warnings. We do this here to avoid applying to external
  # dependencies, built above. Note this uses the list-based add_compile_options,
-@@ -699,80 +616,12 @@
+@@ -430,9 +347,13 @@
+ # to earlier-defined targets.
+ #
+ # TODO(crbug.com/389897612): Should these be set on a per-target basis?
++option(BORINGSSL_WARNINGS_AS_ERRORS "Treat native compiler warnings as errors" OFF)
+ if(CMAKE_COMPILER_IS_GNUCXX OR CLANG)
+-  set(C_CXX_WARNINGS -Werror -Wformat=2 -Wmissing-field-initializers -Wshadow
++  set(C_CXX_WARNINGS -Wformat=2 -Wmissing-field-initializers -Wshadow
+       -Wsign-compare -Wtype-limits -Wvla -Wwrite-strings -Wimplicit-fallthrough)
++  if(BORINGSSL_WARNINGS_AS_ERRORS)
++    list(APPEND C_CXX_WARNINGS -Werror)
++  endif()
+   set(C_WARNINGS -Wold-style-definition -Wstrict-prototypes)
+   set(CXX_WARNING -Wnon-virtual-dtor)
+ 
+@@ -520,8 +441,12 @@
+                 # https://crbug.com/385161043
+       "-wd4706" # assignment within conditional expression
+       )
++  set(MSVC_WARNINGS -W4 ${MSVC_DISABLED_WARNINGS_LIST})
++  if(BORINGSSL_WARNINGS_AS_ERRORS)
++    list(APPEND MSVC_WARNINGS -WX)
++  endif()
+   add_compile_options(
+-    "$<$<COMPILE_LANGUAGE:C,CXX>:-W4;-WX;${MSVC_DISABLED_WARNINGS_LIST}>")
++    "$<$<COMPILE_LANGUAGE:C,CXX>:${MSVC_WARNINGS}>")
+ endif()
+ 
+ if(OPENSSL_ASM)
+@@ -699,80 +624,12 @@
      "$<$<COMPILE_LANGUAGE:C,CXX>:${PKI_MSVC_DISABLED_WARNINGS_LIST}>")
  endif()
  
@@ -194,7 +223,7 @@ diff --git a/CMakeLists.txt b/CMakeLists.txt
  
  if(RUST_BINDINGS)
    find_program(BINDGEN_EXECUTABLE bindgen REQUIRED)
-@@ -783,80 +632,6 @@
+@@ -783,80 +640,6 @@
    set(HANDSHAKER_ARGS "-handshaker-path" $<TARGET_FILE:handshaker>)
  endif()
  

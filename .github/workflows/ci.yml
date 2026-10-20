@@ -13,6 +13,7 @@ permissions: {}
 
 env:
   RUSTFLAGS: -Dwarnings
+  BORING_BSSL_WARNINGS_AS_ERRORS: "1"
   RUST_BACKTRACE: 1
 
 jobs:
