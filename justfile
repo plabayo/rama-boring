@@ -13,9 +13,8 @@ clippy:
 	cargo clippy --workspace --all-targets
 
 # Compare the public API with the latest crates.io release (needs cargo-semver-checks).
-# rama-boring-sys is skipped: its symbol prefix puts the version in a type name.
 semver:
-	cargo semver-checks -p rama-boring -p rama-boring-tokio
+	cargo semver-checks --workspace
 
 doc:
 	RUSTDOCFLAGS="-D rustdoc::broken-intra-doc-links" cargo doc  --no-deps

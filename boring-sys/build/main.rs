@@ -840,7 +840,11 @@ fn generate_bindings(config: &Config) {
 
     let prefix = build_prefix(config);
     if let Some(prefix) = &prefix {
-        builder = builder.clang_arg(format!("-DBORINGSSL_PREFIX={prefix}"));
+        builder = builder
+            .clang_arg(format!("-DBORINGSSL_PREFIX={prefix}"))
+            .parse_callbacks(Box::new(UnprefixedTypeNames {
+                prefix: format!("{prefix}_"),
+            }));
     }
 
     let headers = [
@@ -890,6 +894,31 @@ fn generate_bindings(config: &Config) {
         make_link_names_target_portable(&mut source_code);
     }
     fs::write(config.out_dir.join("bindings.rs"), source_code).expect("Couldn't write bindings!");
+}
+
+/// Keeps the symbol prefix out of Rust type names.
+///
+/// `rama_symbols.patch` prefixes the `ssl_session_st` struct tag in C (its C++
+/// destructors live outside the `bssl` namespace and must not collide with
+/// another BoringSSL in the process). Bindgen would turn that into a public
+/// Rust type named after the crate version, which changes on every release.
+/// Types are only referenced by pointer from Rust, so their Rust names do not
+/// affect linking; functions and statics keep their prefixed `link_name`.
+#[derive(Debug)]
+struct UnprefixedTypeNames {
+    prefix: String,
+}
+
+impl bindgen::callbacks::ParseCallbacks for UnprefixedTypeNames {
+    fn item_name(&self, item_info: bindgen::callbacks::ItemInfo<'_>) -> Option<String> {
+        match item_info.kind {
+            bindgen::callbacks::ItemKind::Type => item_info
+                .name
+                .strip_prefix(self.prefix.as_str())
+                .map(str::to_owned),
+            _ => None,
+        }
+    }
 }
 
 /// Rewrite `#[link_name = "\u{1}<mangled>"]` attributes so the link name is
