@@ -173,6 +173,11 @@ pub(super) fn context_changed(ssl: &mut SslRef) {
     invalidate_custom_verify(ssl);
 }
 
+/// Installed in place of a custom-verify callback whose context was switched.
+///
+/// # Safety
+///
+/// BoringSSL (the only caller) must pass `alert` valid for a one-byte write.
 unsafe extern "C" fn invalidated_verify_callback(
     _: *mut ffi::SSL,
     alert: *mut u8,
@@ -183,6 +188,11 @@ unsafe extern "C" fn invalidated_verify_callback(
     ffi::ssl_verify_result_t::ssl_verify_invalid
 }
 
+/// Installed in place of a certificate callback whose context was switched.
+///
+/// # Safety
+///
+/// None beyond being called by BoringSSL: the arguments are not used.
 unsafe extern "C" fn invalidated_certificate_callback(
     _: *mut ffi::SSL,
     _: *mut std::ffi::c_void,

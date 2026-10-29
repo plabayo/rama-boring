@@ -416,6 +416,13 @@ impl<'a> SslMessage<'a> {
         }
     }
 
+    /// Wraps the arguments of a BoringSSL message callback.
+    ///
+    /// # Safety
+    ///
+    /// If `len > 0` and `buf` is non-null, the caller must ensure that `buf`
+    /// is readable for `len` bytes in one allocation that stays live and
+    /// unmodified for `'a`.
     pub(super) unsafe fn from_raw(
         write_p: i32,
         version: i32,
@@ -426,6 +433,8 @@ impl<'a> SslMessage<'a> {
         let bytes = if len == 0 || buf.is_null() {
             &[]
         } else {
+            // SAFETY: `buf` is non-null and readable for `len` bytes for `'a`
+            // (`# Safety`); a message length always fits in `isize`.
             unsafe { slice::from_raw_parts(buf.cast::<u8>(), len) }
         };
         Self {

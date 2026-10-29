@@ -190,6 +190,13 @@ impl SslRef {
     }
 }
 
+/// Certificate-selection trampoline installed on contexts.
+///
+/// # Safety
+///
+/// The [trampoline contract](super::callbacks) for the context-level
+/// certificate selection setter: `ssl` is live, and the connection's current
+/// context holds the callback at `CONTEXT_CALLBACK_INDEX`.
 unsafe extern "C" fn context_callback(ssl: *mut ffi::SSL, _: *mut c_void) -> c_int {
     unwind::catch(
         || {
@@ -214,6 +221,13 @@ unsafe extern "C" fn context_callback(ssl: *mut ffi::SSL, _: *mut c_void) -> c_i
     )
 }
 
+/// Certificate-selection trampoline installed on connections.
+///
+/// # Safety
+///
+/// The [trampoline contract](super::callbacks) for the connection-level
+/// certificate selection setter: `ssl` is live and holds the callback at
+/// `CONNECTION_CALLBACK_INDEX`.
 unsafe extern "C" fn connection_callback(ssl: *mut ffi::SSL, _: *mut c_void) -> c_int {
     unwind::catch(
         || {

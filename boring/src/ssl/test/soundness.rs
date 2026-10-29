@@ -319,8 +319,9 @@ fn psk_client_identity_is_always_nul_terminated() {
         16
     });
     assert!(client_ok && server_ok);
+    // The final byte of the slice is replaced by the NUL terminator.
     let identity = identity.unwrap();
-    assert!(!identity.is_empty());
+    assert_eq!(identity.len(), 128);
     assert!(identity.iter().all(|b| *b == b'x'));
 }
 
@@ -346,6 +347,7 @@ fn psk_buffers_start_zeroed() {
 struct Lying {
     inner: Pipe,
     overstate: bool,
+    overstate_write: bool,
     saw_nonzero: Arc<AtomicBool>,
 }
 
@@ -361,7 +363,12 @@ impl Read for Lying {
 
 impl Write for Lying {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        self.inner.write(buf)
+        let n = self.inner.write(buf)?;
+        Ok(if self.overstate_write {
+            buf.len() + 1
+        } else {
+            n
+        })
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -370,6 +377,13 @@ impl Write for Lying {
 }
 
 fn tls_pair(overstate: bool) -> (Handshake<Pipe>, Handshake<Lying>, Arc<AtomicBool>) {
+    tls_pair_with(overstate, false)
+}
+
+fn tls_pair_with(
+    overstate: bool,
+    overstate_write: bool,
+) -> (Handshake<Pipe>, Handshake<Lying>, Arc<AtomicBool>) {
     let mut client = SslContext::builder(SslMethod::tls()).unwrap();
     client.set_verify(SslVerifyMode::NONE);
     let (a, b) = pipe_pair();
@@ -377,6 +391,7 @@ fn tls_pair(overstate: bool) -> (Handshake<Pipe>, Handshake<Lying>, Arc<AtomicBo
     let lying = Lying {
         inner: b,
         overstate,
+        overstate_write,
         saw_nonzero: saw_nonzero.clone(),
     };
     let client = Ssl::new(&client.build()).unwrap().connect(a);
@@ -415,4 +430,84 @@ fn verify_trust_store_root_still_verifies() {
     assert!(ctx
         .init(&store, &leaf, &chain, |ctx| ctx.verify_cert())
         .unwrap());
+}
+
+#[test]
+fn transport_writing_more_than_the_buffer_is_an_error() {
+    let (client, server, _) = tls_pair_with(false, true);
+    let (_, server) = run_handshake(client, server);
+    let Err(HandshakeError::Failure(mid)) = server else {
+        panic!("expected a handshake failure");
+    };
+    let io = mid.error().io_error().expect("expected an I/O error");
+    assert_eq!(io.kind(), io::ErrorKind::InvalidData);
+}
+
+#[test]
+fn shared_stream_borrows_can_overlap() {
+    let (client, server, _) = tls_pair(false);
+    let (client, _server) = run_handshake(client, server);
+    let client = client.unwrap();
+    // Two live shared borrows of the transport at once.
+    let a = client.get_ref();
+    let b = client.get_ref();
+    assert!(std::ptr::eq(a, b));
+    assert!(a.rx.lock().is_ok() && b.tx.lock().is_ok());
+}
+
+#[test]
+fn psk_server_callback_cannot_overstate_the_key_length() {
+    let mut client = psk_context();
+    client.set_psk_client_callback(|_, _, identity, psk| {
+        identity[0] = b'x';
+        psk[..16].fill(7);
+        Ok(16)
+    });
+    let mut server = psk_context();
+    server.set_psk_server_callback(|_, _, psk| {
+        psk.fill(7);
+        Ok(psk.len() + 1)
+    });
+    let (a, b) = pipe_pair();
+    let client = Ssl::new(&client.build()).unwrap().connect(a);
+    let server = Ssl::new(&server.build()).unwrap().accept(b);
+    let (_, server) = run_handshake(client, server);
+    assert!(server.is_err());
+}
+
+#[test]
+fn private_key_method_cannot_overstate_the_output_length() {
+    let mut builder = Server::builder();
+    builder
+        .ctx()
+        .set_private_key_method(Method::new().sign(|_, _, _, output| Ok(output.len() + 1)));
+    builder.should_error();
+    builder.err_cb(|_| {});
+    let server = builder.build();
+    server.client_with_root_ca().connect_err();
+}
+
+static LONG_PROTOCOL: [u8; 256] = [b'a'; 256];
+
+fn alpn_selection(len: usize) -> bool {
+    let mut server = Server::builder();
+    server
+        .ctx()
+        .set_alpn_select_callback(move |_, _| Ok(&LONG_PROTOCOL[..len]));
+    server.should_error();
+    server.err_cb(|_| {});
+    let server = server.build();
+    let mut client = server.client();
+    client.ctx().set_alpn_protos(b"\x02h2").unwrap();
+    client.ctx().set_verify(SslVerifyMode::NONE);
+    let ok = client.build().builder().connect_err();
+    matches!(ok, HandshakeError::Failure(_))
+}
+
+#[test]
+fn alpn_selection_must_fit_the_one_byte_length() {
+    // An empty or over-long selection would be truncated by the one-byte
+    // length BoringSSL reads back; both now fail the handshake.
+    assert!(alpn_selection(0));
+    assert!(alpn_selection(256));
 }

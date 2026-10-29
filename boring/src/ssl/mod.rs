@@ -352,7 +352,11 @@ impl SslMethod {
     ///
     /// # Safety
     ///
-    /// The caller must ensure the pointer is valid.
+    /// The caller must ensure that `ptr` is non-null, aligned and points to a
+    /// fully initialized BoringSSL `SSL_METHOD` that remains live and immutable
+    /// for `'static`, and whose operations permit concurrent use by independent
+    /// contexts and connections. The method is borrowed; this wrapper never
+    /// frees it.
     #[corresponds(TLS_server_method)]
     #[must_use]
     pub unsafe fn from_ptr(ptr: *const ffi::SSL_METHOD) -> SslMethod {
@@ -1262,13 +1266,17 @@ impl SslContextBuilder {
     ///
     /// # Safety
     ///
-    /// The caller must ensure that whenever the callback returns a success result
-    /// (anything other than failure or "no key"), it has fully written `key_name` and `iv` and
-    /// initialized both the cipher context (`EVP_EncryptInit_ex`/`EVP_DecryptInit_ex` with a
-    /// cipher and key) and the HMAC context (`HMAC_Init_ex` with a digest and key). BoringSSL
-    /// uses both contexts unconditionally after a success result; an unkeyed context has no
-    /// cipher or digest and is dereferenced as NULL. See the [`SSL_CTX_set_tlsext_ticket_key_cb`]
-    /// docs for additional info.
+    /// The caller must ensure that whenever the callback returns a success result (anything other
+    /// than failure or "no key"), the cipher context has been initialized for the requested
+    /// direction with a cipher, key and IV (`EVP_EncryptInit_ex` / `EVP_DecryptInit_ex`), and the
+    /// HMAC context with a digest and key (`HMAC_Init_ex`). BoringSSL uses both contexts
+    /// unconditionally after a success result; an unkeyed context has no cipher or digest and is
+    /// dereferenced as NULL.
+    ///
+    /// The key name and IV are not memory-safety obligations: when encrypting, the wrapper hands
+    /// the callback zeroed arrays to fill in (use a fresh IV); when decrypting, they are inputs
+    /// read from the ticket. See the [`SSL_CTX_set_tlsext_ticket_key_cb`] docs for the protocol
+    /// and return-code requirements.
     ///
     /// [`SSL_CTX_set_tlsext_ticket_key_cb`]: https://commondatastorage.googleapis.com/chromium-boringssl-docs/ssl.h.html#SSL_CTX_set_tlsext_ticket_key_cb
     #[corresponds(SSL_CTX_set_tlsext_ticket_key_cb)]
@@ -1925,7 +1933,8 @@ impl SslContextBuilder {
     /// The callback will be called with the SSL context, an identity hint if one was provided
     /// by the server, a mutable slice for each of the identity and pre-shared key bytes. The
     /// identity must be written as a null-terminated C string. Both slices start zeroed, and the
-    /// identity slice excludes the final terminator byte, so the identity is always terminated.
+    /// last byte of the identity slice is set to NUL after the callback returns, so the identity is
+    /// always terminated (an identity filling the whole slice loses its last byte).
     ///
     /// The callback returns the length of the pre-shared key it wrote. A length larger than the
     /// key slice fails the handshake.
@@ -2599,6 +2608,13 @@ fn empty_cipher_stack() -> &'static StackRef<SslCipher> {
     &EMPTY.0
 }
 
+/// The ClientHello being processed, handed to certificate selection callbacks.
+///
+/// # Invariants
+///
+/// The wrapped `SSL_CLIENT_HELLO` (and every buffer it points to) is the one
+/// BoringSSL passes to the select-certificate callback; it and its `SSL` stay
+/// alive for `'ssl`, which never outlives that callback.
 #[repr(transparent)]
 pub struct ClientHello<'ssl>(&'ssl ffi::SSL_CLIENT_HELLO);
 
@@ -3573,10 +3589,22 @@ impl SslRef {
     }
 
     /// Like [`SslContext::certificate`].
+    ///
+    /// Takes `&mut self` because BoringSSL parses and caches the leaf
+    /// certificate on first use without locking, so two shared callers could
+    /// race. Returns `None` once the handshake configuration has been shed.
     #[corresponds(SSL_get_certificate)]
     #[must_use]
-    pub fn certificate(&self) -> Option<&X509Ref> {
+    pub fn certificate(&mut self) -> Option<&X509Ref> {
         self.ssl_context().check_x509();
+        if self.handshake_config_shed() {
+            return None;
+        }
+        // SAFETY: `self` is exclusively borrowed, so the unlocked cache write
+        // inside `SSL_get_certificate` cannot race. The configuration is
+        // present (`handshake_config_shed` returned `false`). A non-null
+        // result is owned by that configuration, which cannot be replaced or
+        // shed while the returned borrow of `self` is alive.
         unsafe {
             let ptr = ffi::SSL_get_certificate(self.as_ptr());
             if ptr.is_null() {
@@ -4620,6 +4648,10 @@ impl<S: Read + Write> SslStream<S> {
     /// Constructs an `SslStream` from a pointer to the underlying OpenSSL `SSL` struct.
     ///
     /// This is useful if the handshake has already been completed elsewhere.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the stream's BIO cannot be allocated.
     ///
     /// # Safety
     ///

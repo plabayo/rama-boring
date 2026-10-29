@@ -259,7 +259,11 @@ impl Cipher {
     ///
     /// # Safety
     ///
-    /// The caller must ensure the pointer is valid for the `'static` lifetime.
+    /// The caller must ensure that `ptr` is non-null, aligned and points to a
+    /// fully initialized BoringSSL cipher descriptor (`EVP_CIPHER`) that
+    /// remains live and immutable for `'static`, and whose operations support
+    /// concurrent use by independent cipher contexts. The descriptor is
+    /// borrowed; this wrapper never frees it.
     #[must_use]
     pub unsafe fn from_ptr(ptr: *const ffi::EVP_CIPHER) -> Cipher {
         Cipher(ptr)
@@ -379,10 +383,6 @@ unsafe impl Send for Cipher {}
 pub struct Crypter {
     ctx: *mut ffi::EVP_CIPHER_CTX,
     block_size: usize,
-    // Safety invariant: `true` only if the cipher has
-    // `EVP_CIPH_FLAG_CUSTOM_CIPHER`, i.e. `EVP_CipherUpdate` treats a null
-    // output pointer as "feed AAD" instead of writing ciphertext to it.
-    supports_aad: bool,
 }
 
 // SAFETY: `Crypter` exclusively owns its `EVP_CIPHER_CTX`. Every method that
@@ -412,9 +412,6 @@ impl Crypter {
             let crypter = Crypter {
                 ctx,
                 block_size: t.block_size(),
-                supports_aad: ffi::EVP_CIPHER_flags(t.as_ptr())
-                    & ffi::EVP_CIPH_FLAG_CUSTOM_CIPHER as u32
-                    != 0,
             };
 
             let mode = match mode {
@@ -525,24 +522,17 @@ impl Crypter {
     /// `update`.
     ///
     /// Returns an error if the cipher is not an AEAD cipher.
+    #[corresponds(EVP_CipherUpdateAAD)]
     pub fn aad_update(&mut self, input: &[u8]) -> Result<(), ErrorStack> {
-        if !self.supports_aad {
-            return Err(ErrorStack::internal_error_str(
-                "Crypter::aad_update requires an AEAD cipher such as AES GCM",
-            ));
-        }
-        assert!(input.len() <= c_int::MAX as usize);
-        let mut len = 0;
-        // SAFETY: by the `supports_aad` invariant the cipher is a custom
-        // (AEAD) cipher, for which `EVP_CipherUpdate` with a null output only
-        // reads `input.len()` bytes of AAD from `input` and writes nothing.
+        // SAFETY: `self.ctx` is a live context exclusively borrowed through
+        // `&mut self`, and `input` is readable for `input.len()` bytes.
+        // `EVP_CipherUpdateAAD` only reads `input`, writes no output, and
+        // fails (instead of misbehaving) for ciphers without AAD support.
         unsafe {
-            cvt(ffi::EVP_CipherUpdate(
+            cvt(ffi::EVP_CipherUpdateAAD(
                 self.ctx,
-                ptr::null_mut(),
-                &mut len,
                 input.as_ptr(),
-                try_int(input.len())?,
+                input.len(),
             ))
         }
     }

@@ -993,29 +993,29 @@ fn test_mutable_store() {
 
     let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
     ctx.cert_store_mut().add_cert(cert.clone()).unwrap();
-    assert_eq!(1, ctx.cert_store().objects_len());
+    assert_eq!(1, unsafe { ctx.cert_store().objects_len() });
 
     ctx.set_cert_store_builder(X509StoreBuilder::new().unwrap());
-    assert_eq!(0, ctx.cert_store().objects_len());
+    assert_eq!(0, unsafe { ctx.cert_store().objects_len() });
 
     ctx.cert_store_mut().add_cert(cert.clone()).unwrap();
-    assert_eq!(1, ctx.cert_store().objects_len());
+    assert_eq!(1, unsafe { ctx.cert_store().objects_len() });
 
     let mut new_store = X509StoreBuilder::new().unwrap();
     new_store.add_cert(&cert).unwrap();
     new_store.add_cert(&cert2).unwrap();
     let new_store = new_store.build();
-    assert_eq!(2, new_store.objects_len());
+    assert_eq!(2, unsafe { new_store.objects_len() });
 
     ctx.set_cert_store_ref(&new_store);
-    assert_eq!(2, ctx.cert_store().objects_len());
+    assert_eq!(2, unsafe { ctx.cert_store().objects_len() });
     assert!(std::ptr::eq(new_store.as_ptr(), ctx.cert_store().as_ptr()));
 
     let ctx = ctx.build();
     assert!(std::ptr::eq(new_store.as_ptr(), ctx.cert_store().as_ptr()));
 
     drop(new_store);
-    assert_eq!(2, ctx.cert_store().objects_len());
+    assert_eq!(2, unsafe { ctx.cert_store().objects_len() });
 }
 
 #[test]

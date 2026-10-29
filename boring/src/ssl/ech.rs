@@ -26,8 +26,12 @@ impl SslEchKeysBuilder {
     ///
     /// The caller must ensure that `keys` is a non-null pointer to a live
     /// `SSL_ECH_KEYS` whose ownership (one reference) moves to the builder, and
-    /// that it has not been installed on any `SSL_CTX` yet, since the builder
-    /// mutates it.
+    /// that it has not been installed on any `SSL_CTX` yet. For the builder's
+    /// whole lifetime nothing else may access the key collection: no other
+    /// owner, reference, raw pointer or native callback, including other
+    /// builders made from additional references to the same collection. The
+    /// builder mutates the collection and hands its reference to `build`'s
+    /// result, or releases it on drop.
     pub unsafe fn from_ptr(keys: *mut ffi::SSL_ECH_KEYS) -> Self {
         Self {
             keys: SslEchKeys::from_ptr(keys),

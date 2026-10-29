@@ -120,8 +120,15 @@ impl X509StoreBuilderRef {
         unsafe { cvt(ffi::X509_STORE_set1_param(self.as_ptr(), param.as_ptr())) }
     }
 
+    /// For testing only.
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`X509StoreRef::objects`], for the duration of the call.
     #[cfg(test)]
-    pub fn objects_len(&self) -> usize {
+    pub unsafe fn objects_len(&self) -> usize {
+        // SAFETY: forwarded from this function's `# Safety` contract; the
+        // stack reference does not outlive this call.
         unsafe {
             StackRef::<X509Object>::from_ptr(ffi::X509_STORE_get0_objects(self.as_ptr())).len()
         }
@@ -180,12 +187,16 @@ impl X509StoreRef {
     }
 
     /// For testing only, where it doesn't have to expose an unsafe pointer
+    ///
+    /// # Safety
+    ///
+    /// Same contract as [`Self::objects`], for the duration of the call.
     #[cfg(test)]
     #[allow(deprecated)]
     #[must_use]
-    pub fn objects_len(&self) -> usize {
-        // SAFETY: tests only call this while no other thread uses the store,
-        // and the reference does not outlive this call.
+    pub unsafe fn objects_len(&self) -> usize {
+        // SAFETY: forwarded from this function's `# Safety` contract; the
+        // reference does not outlive this call.
         unsafe { self.objects().len() }
     }
 }

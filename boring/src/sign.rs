@@ -50,6 +50,40 @@ use crate::{cvt, cvt_p};
 
 use crate::ffi::{EVP_MD_CTX_free, EVP_MD_CTX_new};
 
+/// Runs `f` on a private copy of `md_ctx`, including its `EVP_PKEY_CTX`.
+///
+/// `Signer` and `Verifier` are `Sync`, and their `&self` finalizers would
+/// otherwise hand the shared `EVP_PKEY_CTX` to the key's native sign/verify
+/// method, which takes it mutably. Working on an independent copy keeps every
+/// `&self` call from touching shared native state, whatever the key method
+/// does with its context.
+///
+/// # Safety
+///
+/// The caller must ensure that `md_ctx` points to a live, initialized
+/// `EVP_MD_CTX` that nothing mutates during the call.
+unsafe fn with_ctx_copy<R>(
+    md_ctx: *const ffi::EVP_MD_CTX,
+    f: impl FnOnce(*mut ffi::EVP_MD_CTX) -> Result<R, ErrorStack>,
+) -> Result<R, ErrorStack> {
+    struct Owned(*mut ffi::EVP_MD_CTX);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            // SAFETY: `self.0` was allocated by `EVP_MD_CTX_new` and is freed
+            // exactly once, here.
+            unsafe { EVP_MD_CTX_free(self.0) }
+        }
+    }
+
+    // SAFETY: allocating a fresh context has no preconditions.
+    let copy = Owned(cvt_p(unsafe { EVP_MD_CTX_new() })?);
+    // SAFETY: `copy.0` is a freshly initialized context and `md_ctx` is a live
+    // context that is only read (`# Safety`); `EVP_MD_CTX_copy_ex` takes it as
+    // `const` and duplicates its `EVP_PKEY_CTX`.
+    cvt(unsafe { ffi::EVP_MD_CTX_copy_ex(copy.0, md_ctx) })?;
+    f(copy.0)
+}
+
 /// Salt lengths that must be used with `set_rsa_pss_saltlen`.
 pub struct RsaPssSaltlen(c_int);
 
@@ -80,9 +114,10 @@ pub struct Signer<'a> {
     _p: PhantomData<&'a ()>,
 }
 
-// SAFETY: `Signer` exclusively owns its `EVP_MD_CTX`. Every method that changes
-// it takes `&mut self`; the `&self` methods only read it
-// (`EVP_DigestSignFinal` finalizes a copy of the context).
+// SAFETY: `Signer` exclusively owns its `EVP_MD_CTX` (and the `EVP_PKEY_CTX`
+// inside it). Every method that changes them takes `&mut self`. Through `&self`
+// the contexts are only read: `len` and `sign` run on a private copy made with
+// `EVP_MD_CTX_copy_ex` (const source), and `rsa_padding` is a read-only query.
 unsafe impl Sync for Signer<'_> {}
 unsafe impl Send for Signer<'_> {}
 
@@ -231,16 +266,20 @@ impl<'a> Signer<'a> {
     }
 
     fn len_intern(&self) -> Result<usize, ErrorStack> {
+        // SAFETY: `self.md_ctx` is live and only mutated through `&mut self`.
+        // The length query runs on a private copy (see `with_ctx_copy`).
         unsafe {
-            let mut len = 0;
-            cvt(ffi::EVP_DigestSign(
-                self.md_ctx,
-                ptr::null_mut(),
-                &mut len,
-                ptr::null(),
-                0,
-            ))?;
-            Ok(len)
+            with_ctx_copy(self.md_ctx, |ctx| {
+                let mut len = 0;
+                cvt(ffi::EVP_DigestSign(
+                    ctx,
+                    ptr::null_mut(),
+                    &mut len,
+                    ptr::null(),
+                    0,
+                ))?;
+                Ok(len)
+            })
         }
     }
 
@@ -250,14 +289,20 @@ impl<'a> Signer<'a> {
     /// method to get an upper bound on the required size.
     #[corresponds(EVP_DigestSignFinal)]
     pub fn sign(&self, buf: &mut [u8]) -> Result<usize, ErrorStack> {
+        // SAFETY: `self.md_ctx` is live and only mutated through `&mut self`;
+        // finalization runs on a private copy (see `with_ctx_copy`). `buf` is
+        // valid for writes of `len` bytes, and `EVP_DigestSignFinal` fails
+        // rather than writing more than `len`.
         unsafe {
-            let mut len = buf.len();
-            cvt(ffi::EVP_DigestSignFinal(
-                self.md_ctx,
-                buf.as_mut_ptr().cast(),
-                &mut len,
-            ))?;
-            Ok(len)
+            with_ctx_copy(self.md_ctx, |ctx| {
+                let mut len = buf.len();
+                cvt(ffi::EVP_DigestSignFinal(
+                    ctx,
+                    buf.as_mut_ptr().cast(),
+                    &mut len,
+                ))?;
+                Ok(len)
+            })
         }
     }
 
@@ -327,7 +372,7 @@ pub struct Verifier<'a> {
     pkey_pd: PhantomData<&'a ()>,
 }
 
-// SAFETY: as for `Signer`; `EVP_DigestVerifyFinal` also works on a copy.
+// SAFETY: as for `Signer`; `verify` runs on a private copy of the context.
 unsafe impl Sync for Verifier<'_> {}
 unsafe impl Send for Verifier<'_> {}
 
@@ -468,17 +513,21 @@ impl<'a> Verifier<'a> {
     /// Determines if the data fed into the `Verifier` matches the provided signature.
     #[corresponds(EVP_DigestVerifyFinal)]
     pub fn verify(&self, signature: &[u8]) -> Result<bool, ErrorStack> {
+        // SAFETY: `self.md_ctx` is live and only mutated through `&mut self`;
+        // finalization runs on a private copy (see `with_ctx_copy`).
+        // `signature` is valid for reads of its length and is not written.
         unsafe {
-            let r =
-                EVP_DigestVerifyFinal(self.md_ctx, signature.as_ptr().cast_mut(), signature.len());
-            match r {
-                1 => Ok(true),
-                0 => {
-                    ErrorStack::clear(); // discard error stack
-                    Ok(false)
+            with_ctx_copy(self.md_ctx, |ctx| {
+                let r = EVP_DigestVerifyFinal(ctx, signature.as_ptr().cast_mut(), signature.len());
+                match r {
+                    1 => Ok(true),
+                    0 => {
+                        ErrorStack::clear(); // discard error stack
+                        Ok(false)
+                    }
+                    _ => Err(ErrorStack::get()),
                 }
-                _ => Err(ErrorStack::get()),
-            }
+            })
         }
     }
 

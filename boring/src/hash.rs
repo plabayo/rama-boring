@@ -20,7 +20,11 @@ impl MessageDigest {
     ///
     /// # Safety
     ///
-    /// The caller must ensure the pointer is valid.
+    /// The caller must ensure that `x` is non-null, aligned and points to a
+    /// fully initialized BoringSSL digest descriptor (`EVP_MD`) that remains
+    /// live and immutable for `'static`, and whose operations support
+    /// concurrent use by independent digest contexts. The descriptor is
+    /// borrowed; this wrapper never frees it.
     #[must_use]
     pub unsafe fn from_ptr(x: *const ffi::EVP_MD) -> Self {
         MessageDigest(x)

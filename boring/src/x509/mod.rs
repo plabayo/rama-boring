@@ -228,9 +228,11 @@ impl X509StoreContextRef {
         if Some(index.as_raw()) == X509StoreContext::ssl_idx().ok().map(|idx| idx.as_raw()) {
             return None;
         }
-        // SAFETY: indices are typed: a safe `Index<X509StoreContext, T>` only
-        // comes from `new_ex_index::<T>`, whose slot only ever holds a boxed
-        // `T` set by `set_ex_data`. `self` is exclusively borrowed.
+        // SAFETY: indices are typed. A safe `Index<X509StoreContext, T>` comes
+        // either from `new_ex_index::<T>`, whose slot only ever holds a boxed
+        // `T` set by `set_ex_data`, or is the built-in SSL slot refused above;
+        // any other index came from the unsafe `Index::from_raw`, whose caller
+        // vouches for its type. `self` is exclusively borrowed.
         unsafe {
             ffi::X509_STORE_CTX_get_ex_data(self.as_ptr(), index.as_raw())
                 .cast::<T>()
@@ -276,8 +278,8 @@ impl X509StoreContextRef {
     #[corresponds(X509_STORE_CTX_get0_param)]
     pub fn verify_param(&mut self) -> &X509VerifyParamRef {
         let param = self.param_ptr();
-        // SAFETY: `param` is non-null and owned by this context, which outlives
-        // the returned borrow of `self`.
+        // SAFETY: by `param_ptr`'s safety-usable invariant `param` is non-null
+        // and owned by this context, which outlives the returned borrow.
         unsafe { X509VerifyParamRef::from_ptr(param) }
     }
 
@@ -290,12 +292,19 @@ impl X509StoreContextRef {
     #[corresponds(X509_STORE_CTX_get0_param)]
     pub fn verify_param_mut(&mut self) -> &mut X509VerifyParamRef {
         let param = self.param_ptr();
-        // SAFETY: `param` is non-null and owned by this context; the exclusive
-        // borrow of `self` rules out any other Rust access to it.
+        // SAFETY: by `param_ptr`'s safety-usable invariant `param` is non-null
+        // and owned by this context; the exclusive borrow of `self` rules out
+        // any other Rust access to it while the result is alive.
         unsafe { X509VerifyParamRef::from_ptr_mut(param) }
     }
 
-    /// Returns the context's non-null `X509_VERIFY_PARAM`, or panics.
+    /// Returns the context's `X509_VERIFY_PARAM`, or panics.
+    ///
+    /// # Safety-usable invariant
+    ///
+    /// The returned pointer is non-null and points to the param owned by this
+    /// context, which stays alive until the context is cleaned up or its
+    /// param replaced (both need `&mut self`).
     fn param_ptr(&self) -> *mut ffi::X509_VERIFY_PARAM {
         // `X509_STORE_CTX_new` leaves `param` null until `X509_STORE_CTX_init`,
         // and `X509_STORE_CTX_cleanup` resets it to null.
@@ -859,14 +868,17 @@ impl X509Ref {
             }
             ffi::sk_free(raw);
 
-            let mut out = Stack::new();
-            for ptr in strings {
-                let string = OpensslString::from_c_ptr(ptr);
-                if let (Ok(out), Ok(string)) = (&mut out, string) {
-                    out.push(string)?;
-                }
+            // Take ownership of every string before anything can fail, so an
+            // error below frees the rest instead of leaking them.
+            let strings: Vec<OpensslString> = strings
+                .into_iter()
+                .filter_map(|ptr| OpensslString::from_c_ptr(ptr).ok())
+                .collect();
+            let mut out = Stack::new()?;
+            for string in strings {
+                out.push(string)?;
             }
-            out
+            Ok(out)
         }
     }
 

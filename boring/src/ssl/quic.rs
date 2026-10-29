@@ -394,6 +394,14 @@ fn callback_pending(code: ErrorCode) -> bool {
 }
 
 // Each trampoline catches both user panics and conversion failures before returning to C.
+//
+/// Runs a QUIC method callback for `ssl`.
+///
+/// # Safety
+///
+/// `ssl` must be a live `SSL` (the QUIC method trampolines below are only
+/// called by BoringSSL, which passes the connection being driven). The
+/// connection's ex_data holds the `Arc<Callbacks>` installed with the method.
 unsafe fn invoke(
     ssl: *mut ffi::SSL,
     call: impl FnOnce(&dyn QuicMethod) -> Result<(), ErrorStack>,
@@ -416,6 +424,11 @@ unsafe fn invoke(
     0
 }
 
+/// # Safety
+///
+/// Called only by BoringSSL through the `SSL_QUIC_METHOD` table: `ssl` is
+/// live, `cipher` points to a static `SSL_CIPHER`, and `secret` is readable for
+/// `len` bytes for the call.
 unsafe extern "C" fn read_secret(
     ssl: *mut ffi::SSL,
     level: ffi::ssl_encryption_level_t,
@@ -428,11 +441,16 @@ unsafe extern "C" fn read_secret(
             method.set_read_secret(
                 EncryptionLevel::from_raw(level),
                 SslCipherRef::from_ptr(cipher.cast_mut()),
-                slice::from_raw_parts(secret, len),
+                crate::util::slice_or_empty(secret, len),
             )
         })
     }
 }
+/// # Safety
+///
+/// Called only by BoringSSL through the `SSL_QUIC_METHOD` table: `ssl` is
+/// live, `cipher` points to a static `SSL_CIPHER`, and `secret` is readable for
+/// `len` bytes for the call.
 unsafe extern "C" fn write_secret(
     ssl: *mut ffi::SSL,
     level: ffi::ssl_encryption_level_t,
@@ -445,11 +463,15 @@ unsafe extern "C" fn write_secret(
             method.set_write_secret(
                 EncryptionLevel::from_raw(level),
                 SslCipherRef::from_ptr(cipher.cast_mut()),
-                slice::from_raw_parts(secret, len),
+                crate::util::slice_or_empty(secret, len),
             )
         })
     }
 }
+/// # Safety
+///
+/// Called only by BoringSSL through the `SSL_QUIC_METHOD` table: `ssl` is
+/// live and `data` is readable for `len` bytes for the call.
 unsafe extern "C" fn handshake_data(
     ssl: *mut ffi::SSL,
     level: ffi::ssl_encryption_level_t,
@@ -469,9 +491,17 @@ unsafe extern "C" fn handshake_data(
         })
     }
 }
+/// # Safety
+///
+/// Called only by BoringSSL through the `SSL_QUIC_METHOD` table with a live
+/// `ssl`.
 unsafe extern "C" fn flush(ssl: *mut ffi::SSL) -> i32 {
     unsafe { invoke(ssl, |method| method.flush_flight()) }
 }
+/// # Safety
+///
+/// Called only by BoringSSL through the `SSL_QUIC_METHOD` table with a live
+/// `ssl`.
 unsafe extern "C" fn alert(
     ssl: *mut ffi::SSL,
     level: ffi::ssl_encryption_level_t,

@@ -90,14 +90,22 @@ macro_rules! to_pem {
 macro_rules! to_der {
     ($(#[$m:meta])* $n:ident, $f:path) => {
         $(#[$m])*
+        ///
+        /// # Panics
+        ///
+        /// Panics if the native encoder reports a different length for the
+        /// encoding than for its size query.
         pub fn $n(&self) -> Result<Vec<u8>, crate::error::ErrorStack> {
             unsafe {
                 let len = crate::cvt_nz($f(::foreign_types::ForeignTypeRef::as_ptr(self),
                                         ptr::null_mut()))?;
                 let mut buf = vec![0; len.get()];
                 // `i2d_*` writes the same number of bytes it reported above:
-                // the object is not mutated in between (the encoders reachable
-                // here only read, and `self` is borrowed).
+                // the encoded content cannot change in between, because `self`
+                // is borrowed and the encoders reachable here only fill
+                // internally synchronized caches (e.g. `X509_NAME`'s cached
+                // encoding) that hold the same bytes. The assert below is a
+                // consistency check, not the bound that protects `buf`.
                 let written = crate::cvt_nz($f(::foreign_types::ForeignTypeRef::as_ptr(self),
                               &mut buf.as_mut_ptr()))?;
                 assert_eq!(written.get(), buf.len(), "i2d length changed between calls");

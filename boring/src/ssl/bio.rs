@@ -95,19 +95,59 @@ pub fn new<S: Read + Write>(stream: S) -> Result<(*mut BIO, BioMethod), ErrorSta
     }
 }
 
+/// Takes the last I/O error recorded by the BIO.
+///
+/// # Safety
+///
+/// The caller must ensure that `bio` is a live BIO created by [`new::<S>`]
+/// for this same `S`, whose stream has not been taken, and that nothing else
+/// accesses its stream state during the call.
 pub unsafe fn take_error<S>(bio: *mut BIO) -> Option<io::Error> {
-    let state = state::<S>(bio);
+    // SAFETY: forwarded from this function's `# Safety` contract.
+    let state = unsafe { state::<S>(bio) };
     state.error.take()
 }
 
+/// Returns a shared reference to the BIO's stream.
+///
+/// # Safety
+///
+/// The caller must ensure that `bio` is a live BIO created by [`new::<S>`]
+/// for this same `S`, whose stream is not taken and whose state is not freed
+/// for `'a`, and that no exclusive access to the stream or its state happens
+/// during `'a` (shared access, including other `get_ref` borrows, is fine).
 pub unsafe fn get_ref<'a, S: 'a>(bio: *mut BIO) -> &'a S {
-    &state(bio).stream
+    // SAFETY: `bio` is a live BIO (`# Safety`).
+    let data = unsafe { BIO_get_data(bio) }.cast::<StreamState<S>>();
+    assert!(!data.is_null());
+    // SAFETY: `data` points to the live, initialized `StreamState<S>` boxed
+    // by `new::<S>` and kept alive for `'a` (`# Safety`). Only a shared
+    // reference to the `stream` field is created: going through `state`
+    // would create a `&mut StreamState` that overlaps other live `get_ref`
+    // borrows.
+    unsafe { &(*data).stream }
 }
 
+/// Returns an exclusive reference to the BIO's stream.
+///
+/// # Safety
+///
+/// The caller must ensure that `bio` is a live BIO created by [`new::<S>`]
+/// for this same `S`, whose stream is not taken and whose state is not freed
+/// for `'a`, and that nothing else accesses the stream state during `'a`.
 pub unsafe fn get_mut<'a, S: 'a>(bio: *mut BIO) -> &'a mut S {
-    &mut state(bio).stream
+    // SAFETY: forwarded from this function's `# Safety` contract.
+    unsafe { &mut state(bio).stream }
 }
 
+/// Moves the stream out of the BIO and frees its state.
+///
+/// # Safety
+///
+/// The caller must ensure that `bio` is a live BIO created by [`new::<S>`]
+/// for this same `S`, whose stream has not been taken yet, and that no
+/// reference into its stream state is alive. Afterwards the BIO has no
+/// stream; it must not be used for I/O or passed to the other functions here.
 pub unsafe fn take_stream<S>(bio: *mut BIO) -> S {
     assert!(!bio.is_null());
 
@@ -128,8 +168,13 @@ pub unsafe fn take_stream<S>(bio: *mut BIO) -> S {
 
 /// Flushes the stream as the BIO does: never after it panicked, and a panic
 /// poisons it and becomes an I/O error.
+///
+/// # Safety
+///
+/// Same contract as [`take_error`].
 pub unsafe fn flush<S: Write>(bio: *mut BIO) -> io::Result<()> {
-    let state = state::<S>(bio);
+    // SAFETY: forwarded from this function's `# Safety` contract.
+    let state = unsafe { state::<S>(bio) };
     if state.poisoned() {
         return Err(state
             .error
@@ -148,6 +193,15 @@ pub unsafe fn flush<S: Write>(bio: *mut BIO) -> io::Result<()> {
     }
 }
 
+/// Records the DTLS MTU the BIO reports to BoringSSL.
+///
+/// # Panics
+///
+/// Panics if `mtu_size` does not fit in a positive `c_long`.
+///
+/// # Safety
+///
+/// Same contract as [`take_error`].
 pub unsafe fn set_dtls_mtu_size<S>(bio: *mut BIO, mtu_size: usize) {
     if mtu_size as u64 > c_long::MAX as u64 {
         panic!("Given MTU size {mtu_size} can't be represented in a positive `c_long` range")
@@ -155,6 +209,13 @@ pub unsafe fn set_dtls_mtu_size<S>(bio: *mut BIO, mtu_size: usize) {
     state::<S>(bio).dtls_mtu_size = mtu_size as c_long;
 }
 
+/// Returns the BIO's stream state.
+///
+/// # Safety
+///
+/// The caller must ensure that `bio` is a live BIO created by [`new::<S>`]
+/// for this same `S` (so its data is a `Box<StreamState<S>>`), whose state is
+/// not freed for `'a`, and that nothing else accesses that state during `'a`.
 unsafe fn state<'a, S: 'a>(bio: *mut BIO) -> &'a mut StreamState<S> {
     let data = BIO_get_data(bio).cast::<StreamState<S>>();
 

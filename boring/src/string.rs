@@ -31,26 +31,30 @@ impl OpensslString {
     ///
     /// # Safety
     ///
-    /// If `ptr` is non-null, the caller must ensure that it points to a
-    /// NUL-terminated string allocated with `OPENSSL_malloc` that nothing else
-    /// owns. Ownership moves to the returned value (or the string is freed).
+    /// If `ptr` is non-null, the caller must ensure that it is the start of a
+    /// live allocation made with `OPENSSL_malloc` that holds a NUL-terminated
+    /// string, that nothing else owns or mutates it, and that ownership moves
+    /// to this call (the string ends up in the result or is freed).
     pub(crate) unsafe fn from_c_ptr(
         ptr: *mut c_char,
     ) -> Result<OpensslString, crate::error::ErrorStack> {
         if ptr.is_null() {
             return Err(crate::error::ErrorStack::get());
         }
-        // SAFETY: `ptr` is a non-null, owned, `OPENSSL_malloc`ed string
-        // (`# Safety`); wrapping it first means it is freed on every path.
-        let string = unsafe { <OpensslString as foreign_types::ForeignType>::from_ptr(ptr) };
-        // SAFETY: `ptr` is NUL-terminated and stays alive while `string` does.
+        // SAFETY: `ptr` is a live, NUL-terminated string that nothing else
+        // mutates (`# Safety`); `bytes` is not used after it is freed below.
         let bytes = unsafe { CStr::from_ptr(ptr) }.to_bytes();
         if str::from_utf8(bytes).is_err() {
+            // SAFETY: we own the `OPENSSL_malloc` allocation (`# Safety`) and
+            // no wrapper owns it yet, so it is freed exactly once, here.
+            unsafe { free(ptr) };
             return Err(crate::error::ErrorStack::internal_error_str(
                 "string returned by BoringSSL is not valid UTF-8",
             ));
         }
-        Ok(string)
+        // SAFETY: the owned string is valid UTF-8, so the `OpensslString`
+        // invariant holds from the moment the wrapper is constructed.
+        Ok(unsafe { <OpensslString as foreign_types::ForeignType>::from_ptr(ptr) })
     }
 }
 

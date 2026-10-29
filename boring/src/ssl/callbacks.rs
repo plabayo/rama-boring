@@ -1,3 +1,28 @@
+//! `extern "C"` trampolines that BoringSSL calls into Rust callbacks.
+//!
+//! # Trampoline contract
+//!
+//! Each trampoline is installed by exactly one setter (named in its
+//! `# Safety` section) and is only ever called by BoringSSL. For every call,
+//! the caller (BoringSSL) must ensure that:
+//!
+//! - the `SSL`, `SSL_CTX`, `X509_STORE_CTX` or `SSL_CLIENT_HELLO` argument is
+//!   non-null and live for the whole call. Rust code reaches the connection
+//!   only through the reference the trampoline creates: a `&mut SslRef` held
+//!   by the frame driving the handshake is not used while the callback runs
+//!   (`SslRef` wraps a zero-sized `Opaque` with interior mutability, so the
+//!   two references do not overlap any Rust-visible bytes);
+//! - the context named in the function's `# Safety` section holds the
+//!   callback (or method / compressor) of the function's concrete type
+//!   parameter at its `cached_ex_index`. The setters store it there before
+//!   registering the trampoline, and a built context's ex_data is never
+//!   replaced;
+//! - every input `(pointer, length)` pair is readable for `length` bytes in
+//!   one live allocation for the whole call (a zero length may come with any
+//!   pointer, which is why `slice_or_empty` is used), and every output
+//!   pointer is valid for writes of the size its BoringSSL header documents.
+//!
+//! The trampolines never let a panic unwind into C (`unwind::catch`).
 #![forbid(unsafe_op_in_unsafe_fn)]
 
 use super::async_callbacks::{cancel_pending, cancel_session_lookup};
@@ -33,9 +58,11 @@ use std::sync::Arc;
 ///
 /// # Safety
 ///
-/// If `len > 0`, the caller must ensure that `buf` is non-null and valid for
-/// reads and writes of `len` bytes, and that nothing else accesses those bytes
-/// for the returned lifetime `'a`.
+/// If `len > 0`, the caller must ensure that `buf` is non-null and spans `len`
+/// readable and writable bytes in one allocation that stays live for all of
+/// `'a`, that `len` does not exceed `isize::MAX`, and that during `'a` those
+/// bytes are only accessed through the returned slice. The bytes may start
+/// uninitialized.
 ///
 /// If these hold, the result is `&mut []` when `len == 0` or `buf` is null, and
 /// otherwise the `len` zeroed bytes at `buf`.
@@ -64,7 +91,7 @@ where
 {
     unwind::catch(
         || {
-            // SAFETY: boring provides valid inputs.
+            // SAFETY: guaranteed by the caller under the module's trampoline contract.
             let ctx = unsafe { X509StoreContextRef::from_ptr_mut(x509_ctx) };
 
             let ssl_idx =
@@ -94,6 +121,11 @@ where
     )
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslContextBuilder::set_custom_verify_callback`. `out_alert` is valid for
+/// a one-byte write. The session context (`SESSION_CTX_INDEX`) holds `F`.
 pub(super) unsafe extern "C" fn raw_custom_verify<F>(
     ssl: *mut ffi::SSL,
     out_alert: *mut u8,
@@ -117,6 +149,12 @@ where
     unsafe { raw_custom_verify_callback(ssl, out_alert, callback) }
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslContextBuilder::set_cert_verify_callback`. `x509_ctx` is the store
+/// context being verified, with the `SSL` at `X509StoreContext::ssl_idx`, and
+/// the connection's current context (`SSL_get_SSL_CTX`) holds `F`.
 pub(super) unsafe extern "C" fn raw_cert_verify<F>(
     x509_ctx: *mut ffi::X509_STORE_CTX,
     _arg: *mut c_void,
@@ -126,7 +164,7 @@ where
 {
     unwind::catch(
         || {
-            // SAFETY: boring provides valid inputs.
+            // SAFETY: guaranteed by the caller under the module's trampoline contract.
             let ctx = unsafe { X509StoreContextRef::from_ptr_mut(x509_ctx) };
 
             let ssl_idx =
@@ -158,6 +196,11 @@ where
     )
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslRef::set_custom_verify_callback`. `out_alert` is valid for a one-byte
+/// write. The connection's own ex_data holds `Arc<F>`.
 pub(super) unsafe extern "C" fn ssl_raw_custom_verify<F>(
     ssl: *mut ffi::SSL,
     out_alert: *mut u8,
@@ -178,6 +221,10 @@ where
     unsafe { raw_custom_verify_callback(ssl, out_alert, callback) }
 }
 
+/// # Safety
+///
+/// Shared body of the custom-verify trampolines: `ssl` and `out_alert` must
+/// satisfy the contract of the calling trampoline.
 unsafe fn raw_custom_verify_callback(
     ssl: *mut ffi::SSL,
     out_alert: *mut u8,
@@ -185,7 +232,7 @@ unsafe fn raw_custom_verify_callback(
 ) -> ffi::ssl_verify_result_t {
     unwind::catch(
         || {
-            // SAFETY: boring provides valid inputs.
+            // SAFETY: guaranteed by the caller under the module's trampoline contract.
             let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
             let out_alert = unsafe { &mut *out_alert };
 
@@ -209,6 +256,14 @@ unsafe fn raw_custom_verify_callback(
     )
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslContextBuilder::set_psk_client_callback`. `hint` is null or a
+/// NUL-terminated string; `identity` is writable for `max_identity_len` bytes
+/// and `psk` for `max_psk_len` bytes, in disjoint buffers that may start
+/// uninitialized. The session context holds `F`. Returns `0` or a PSK length
+/// of at most `max_psk_len`, with `identity` NUL-terminated.
 pub(super) unsafe extern "C" fn raw_client_psk<F>(
     ssl_ptr: *mut ffi::SSL,
     hint: *const c_char,
@@ -224,7 +279,7 @@ where
         + Send,
 {
     unwind::catch_reported(0, || {
-        // SAFETY: boring provides valid inputs.
+        // SAFETY: guaranteed by the caller under the module's trampoline contract.
 
         let ssl = unsafe { SslRef::from_ptr_mut(ssl_ptr) };
 
@@ -241,13 +296,11 @@ where
         // the handshake that outlive this call; `zeroed_out_buf` initializes
         // them before safe code can read them.
         //
-        // The identity is read back as a NUL-terminated C string (`strdup`),
-        // so the last byte is kept out of the slice and stays NUL: a callback
-        // filling the whole slice still leaves a terminated string.
-        let identity_cap = (max_identity_len as usize).saturating_sub(1);
-        let identity_buf =
+        // The identity is read back as a NUL-terminated C string (`strdup`);
+        // its final byte is forced to NUL after the callback returns, so a
+        // callback filling the whole slice still leaves a terminated string.
+        let identity_sl =
             unsafe { zeroed_out_buf(identity.cast::<u8>(), max_identity_len as usize) };
-        let identity_sl = &mut identity_buf[..identity_cap];
         let psk_sl = unsafe { zeroed_out_buf(psk, max_psk_len as usize) };
         let psk_cap = psk_sl.len();
 
@@ -260,7 +313,12 @@ where
             return 0;
         };
 
-        match callback(ssl, hint, identity_sl, psk_sl) {
+        let result = callback(ssl, hint, &mut *identity_sl, psk_sl);
+        if let Some(last) = identity_sl.last_mut() {
+            *last = 0;
+        }
+
+        match result {
             // BoringSSL only `assert`s this bound on the client, so a larger
             // length would make release builds read past the PSK buffer.
             // `psk_len <= max_psk_len`, so the cast is lossless.
@@ -280,6 +338,13 @@ where
     })
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslContextBuilder::set_psk_server_callback`. `identity` is null or a
+/// NUL-terminated string; `psk` is writable for `max_psk_len` bytes and may
+/// start uninitialized. The session context holds `F`. Returns `0` or a PSK
+/// length of at most `max_psk_len`.
 pub(super) unsafe extern "C" fn raw_server_psk<F>(
     ssl: *mut ffi::SSL,
     identity: *const c_char,
@@ -293,7 +358,7 @@ where
         + Send,
 {
     unwind::catch_reported(0, || {
-        // SAFETY: boring provides valid inputs.
+        // SAFETY: guaranteed by the caller under the module's trampoline contract.
 
         let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
 
@@ -337,6 +402,12 @@ where
     })
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslRef::set_verify_callback`. `x509_ctx` is the store context being
+/// verified, with the `SSL` at `X509StoreContext::ssl_idx`; that connection's
+/// own ex_data holds `Arc<F>`.
 pub(super) unsafe extern "C" fn ssl_raw_verify<F>(
     preverify_ok: c_int,
     x509_ctx: *mut ffi::X509_STORE_CTX,
@@ -346,7 +417,7 @@ where
 {
     unwind::catch(
         || {
-            // SAFETY: boring provides valid inputs.
+            // SAFETY: guaranteed by the caller under the module's trampoline contract.
             let ctx = unsafe { X509StoreContextRef::from_ptr_mut(x509_ctx) };
 
             let ssl_idx =
@@ -369,6 +440,13 @@ where
     )
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslContextBuilder::set_servername_callback`. `al` is valid for reads and
+/// writes of one `c_int`; `arg` is the servername arg that setter stored, a
+/// pointer to the `F` in the ex_data of the context BoringSSL dispatches from
+/// (the connection's current context or its session context).
 pub(super) unsafe extern "C" fn raw_sni<F>(
     ssl: *mut ffi::SSL,
     al: *mut c_int,
@@ -379,7 +457,7 @@ where
 {
     unwind::catch(
         || {
-            // SAFETY: boring provides valid inputs.
+            // SAFETY: guaranteed by the caller under the module's trampoline contract.
             let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
             let al = unsafe { &mut *al };
 
@@ -418,11 +496,22 @@ where
     )
 }
 
+/// # Safety
+///
+/// `ptr` must be non-null, aligned and valid for writes of one `T` for `'a`,
+/// with no other access during `'a`. The pointee may be uninitialized.
 unsafe fn to_uninit<'a, T: 'a>(ptr: *mut T) -> &'a mut MaybeUninit<T> {
     assert!(!ptr.is_null());
     unsafe { &mut *ptr.cast::<MaybeUninit<T>>() }
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslContextBuilder::set_ticket_key_callback`. `key_name` (16 bytes) and
+/// `iv` (`EVP_MAX_IV_LENGTH` bytes) are writable; `evp_ctx` and `hmac_ctx` are
+/// live, initialized but unkeyed contexts that nothing else accesses during
+/// the call. The session context (`SESSION_CTX_INDEX`) holds `F`.
 pub(super) unsafe extern "C" fn raw_ticket_key<F>(
     ssl: *mut ffi::SSL,
     key_name: *mut u8,
@@ -445,7 +534,7 @@ where
         + Send,
 {
     unwind::catch_reported(-1, || {
-        // SAFETY: boring provides valid inputs.
+        // SAFETY: guaranteed by the caller under the module's trampoline contract.
         let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
 
         // BoringSSL invokes the ticket callback from the original session context.
@@ -486,6 +575,13 @@ where
     })
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslContextBuilder::set_alpn_select_callback`. `out` and `outlen` are
+/// valid for one write each; on success `*out` points into `inbuf` or to
+/// memory that outlives the handshake, with `1..=255` bytes. The connection's
+/// current context holds `F`.
 pub(super) unsafe extern "C" fn raw_alpn_select<F>(
     ssl: *mut ffi::SSL,
     out: *mut *const c_uchar,
@@ -498,9 +594,9 @@ where
     F: for<'a> Fn(&mut SslRef, &'a [u8]) -> Result<&'a [u8], AlpnError> + 'static + Sync + Send,
 {
     unwind::catch_reported(ffi::SSL_TLSEXT_ERR_ALERT_FATAL, || {
-        // SAFETY: boring provides valid inputs.
+        // SAFETY: guaranteed by the caller under the module's trampoline contract.
         let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
-        let protos = unsafe { slice::from_raw_parts(inbuf, inlen as usize) };
+        let protos = unsafe { crate::util::slice_or_empty(inbuf, inlen as usize) };
         let out = unsafe { &mut *out };
         let outlen = unsafe { &mut *outlen };
 
@@ -510,17 +606,34 @@ where
             .expect("BUG: alpn callback missing");
 
         match callback(ssl, protos) {
-            Ok(proto) => {
+            // The selection is reported through a one-byte length, and an
+            // empty protocol is invalid; anything else would be truncated.
+            Ok(proto) if !proto.is_empty() && proto.len() <= usize::from(c_uchar::MAX) => {
                 *out = proto.as_ptr();
+                // Lossless: `proto.len() <= c_uchar::MAX` was checked above.
                 *outlen = proto.len() as c_uchar;
 
                 ffi::SSL_TLSEXT_ERR_OK
+            }
+            Ok(proto) => {
+                ErrorStack::internal_error_string(format!(
+                    "ALPN select callback returned a {}-byte protocol (must be 1..=255 bytes)",
+                    proto.len()
+                ))
+                .put();
+                ffi::SSL_TLSEXT_ERR_ALERT_FATAL
             }
             Err(e) => e.0,
         }
     })
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslContextBuilder::set_select_certificate_callback`. `client_hello`
+/// points to a live `SSL_CLIENT_HELLO` whose buffers outlive the call. The
+/// connection's current context holds `F`.
 pub(super) unsafe extern "C" fn raw_select_cert<F>(
     client_hello: *const ffi::SSL_CLIENT_HELLO,
 ) -> ffi::ssl_select_cert_result_t
@@ -529,7 +642,7 @@ where
 {
     unwind::catch(
         || {
-            // SAFETY: boring provides valid inputs.
+            // SAFETY: guaranteed by the caller under the module's trampoline contract.
             let client_hello = ClientHello(unsafe { &*client_hello });
 
             let ssl_context =
@@ -552,13 +665,18 @@ where
     )
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslContextBuilder::set_status_callback`. The connection's current
+/// context holds `F`.
 pub(super) unsafe extern "C" fn raw_tlsext_status<F>(ssl: *mut ffi::SSL, _: *mut c_void) -> c_int
 where
     F: Fn(&mut SslRef) -> Result<bool, ErrorStack> + 'static + Sync + Send,
 {
     unwind::catch(
         || {
-            // SAFETY: boring provides valid inputs.
+            // SAFETY: guaranteed by the caller under the module's trampoline contract.
             let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
 
             let ssl_context = unwind::LeakOnUnwind::new(ssl.ssl_context().to_owned());
@@ -599,6 +717,12 @@ where
     )
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslContextBuilder::set_new_session_callback`. `session` is a live session
+/// whose reference moves to this call (returning `1` keeps it). The session
+/// context holds `F`.
 pub(super) unsafe extern "C" fn raw_new_session<F>(
     ssl: *mut ffi::SSL,
     session: *mut ffi::SSL_SESSION,
@@ -608,7 +732,7 @@ where
 {
     unwind::catch(
         || {
-            // SAFETY: boring provides valid inputs.
+            // SAFETY: guaranteed by the caller under the module's trampoline contract.
             let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
             let session = unsafe { SslSession::from_ptr(session) };
 
@@ -634,6 +758,11 @@ where
     )
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslContextBuilder::set_remove_session_callback`. `ctx` holds `F`;
+/// `session` is a live session borrowed for the call.
 pub(super) unsafe extern "C" fn raw_remove_session<F>(
     ctx: *mut ffi::SSL_CTX,
     session: *mut ffi::SSL_SESSION,
@@ -642,7 +771,7 @@ pub(super) unsafe extern "C" fn raw_remove_session<F>(
 {
     unwind::catch(
         || {
-            // SAFETY: boring provides valid inputs.
+            // SAFETY: guaranteed by the caller under the module's trampoline contract.
             let ctx = unsafe { SslContextRef::from_ptr(ctx) };
             let session = unsafe { SslSessionRef::from_ptr(session) };
 
@@ -658,6 +787,12 @@ pub(super) unsafe extern "C" fn raw_remove_session<F>(
 
 type DataPtr = *const c_uchar;
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslContextBuilder::set_get_session_callback`. `data` is readable for
+/// `len` bytes and `copy` is valid for one write. A returned session carries
+/// one reference for BoringSSL. The session context holds `F`.
 pub(super) unsafe extern "C" fn raw_get_session<F>(
     ssl: *mut ffi::SSL,
     data: DataPtr,
@@ -672,7 +807,7 @@ where
 {
     unwind::catch(
         || {
-            // SAFETY: boring provides valid inputs.
+            // SAFETY: guaranteed by the caller under the module's trampoline contract.
             let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
             let data = unsafe { slice::from_raw_parts(data, len as usize) };
             let copy = unsafe { &mut *copy };
@@ -708,13 +843,18 @@ where
     )
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslContextBuilder::set_keylog_callback`. `line` is a NUL-terminated
+/// string live for the call. The connection's current context holds `F`.
 pub(super) unsafe extern "C" fn raw_keylog<F>(ssl: *const ffi::SSL, line: *const c_char)
 where
     F: Fn(&SslRef, &str) + 'static + Sync + Send,
 {
     unwind::catch(
         || {
-            // SAFETY: boring provides valid inputs.
+            // SAFETY: guaranteed by the caller under the module's trampoline contract.
             let ssl = unsafe { SslRef::from_ptr(ssl.cast_mut()) };
             let line = unsafe { CStr::from_ptr(line).to_string_lossy() };
 
@@ -729,6 +869,13 @@ where
     )
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `set_private_key_method` (context or credential). `out` is writable
+/// for `max_out` bytes (it may start uninitialized), `out_len` for one
+/// `usize`, and `in_` readable for `in_len` bytes. The selected credential or
+/// the connection's context holds `M`. On success `*out_len <= max_out`.
 pub(super) unsafe extern "C" fn raw_sign<M>(
     ssl: *mut ffi::SSL,
     out: *mut u8,
@@ -741,7 +888,7 @@ pub(super) unsafe extern "C" fn raw_sign<M>(
 where
     M: PrivateKeyMethod,
 {
-    // SAFETY: boring provides valid inputs.
+    // SAFETY: guaranteed by the caller under the module's trampoline contract.
     let input = unsafe { slice::from_raw_parts(in_, in_len) };
 
     let signature_algorithm = SslSignatureAlgorithm(signature_algorithm);
@@ -750,10 +897,13 @@ where
         method.sign(ssl, input, signature_algorithm, output)
     };
 
-    // SAFETY: boring provides valid inputs.
+    // SAFETY: guaranteed by the caller under the module's trampoline contract.
     unsafe { raw_private_key_callback(ssl, out, out_len, max_out, callback) }
 }
 
+/// # Safety
+///
+/// Same as `raw_sign`, without a signature algorithm.
 pub(super) unsafe extern "C" fn raw_decrypt<M>(
     ssl: *mut ffi::SSL,
     out: *mut u8,
@@ -765,15 +915,18 @@ pub(super) unsafe extern "C" fn raw_decrypt<M>(
 where
     M: PrivateKeyMethod,
 {
-    // SAFETY: boring provides valid inputs.
+    // SAFETY: guaranteed by the caller under the module's trampoline contract.
     let input = unsafe { slice::from_raw_parts(in_, in_len) };
 
     let callback = |method: &M, ssl: &mut _, output: &mut _| method.decrypt(ssl, input, output);
 
-    // SAFETY: boring provides valid inputs.
+    // SAFETY: guaranteed by the caller under the module's trampoline contract.
     unsafe { raw_private_key_callback(ssl, out, out_len, max_out, callback) }
 }
 
+/// # Safety
+///
+/// Same as `raw_sign`, with no input buffer.
 pub(super) unsafe extern "C" fn raw_complete<M>(
     ssl: *mut ffi::SSL,
     out: *mut u8,
@@ -783,10 +936,14 @@ pub(super) unsafe extern "C" fn raw_complete<M>(
 where
     M: PrivateKeyMethod,
 {
-    // SAFETY: boring provides valid inputs.
+    // SAFETY: guaranteed by the caller under the module's trampoline contract.
     unsafe { raw_private_key_callback::<M>(ssl, out, out_len, max_out, M::complete) }
 }
 
+/// # Safety
+///
+/// Shared body of `raw_sign`, `raw_decrypt` and `raw_complete`: the
+/// arguments must satisfy the calling trampoline's contract.
 unsafe fn raw_private_key_callback<M>(
     ssl: *mut ffi::SSL,
     out: *mut u8,
@@ -799,7 +956,7 @@ where
 {
     unwind::catch(
         || {
-            // SAFETY: boring provides valid inputs.
+            // SAFETY: guaranteed by the caller under the module's trampoline contract.
             let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
             // SAFETY: BoringSSL passes an `out` buffer valid for writes of
             // `max_out` bytes (`ssl_private_key_method_st` in ssl.h). That
@@ -844,6 +1001,11 @@ where
     )
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslContextBuilder::set_info_callback`. The connection's current
+/// context holds `F`.
 pub(super) unsafe extern "C" fn raw_info_callback<F>(
     ssl: *const ffi::SSL,
     mode: c_int,
@@ -857,7 +1019,7 @@ pub(super) unsafe extern "C" fn raw_info_callback<F>(
             // foreign-types requires a *mut SSL to get the Rust SslRef
             let mut_ref = ssl.cast_mut();
 
-            // SAFETY: boring provides valid inputs.
+            // SAFETY: guaranteed by the caller under the module's trampoline contract.
             let ssl = unsafe { SslRef::from_ptr(mut_ref) };
             let ssl_context = ssl.ssl_context();
 
@@ -878,6 +1040,12 @@ pub(super) unsafe extern "C" fn raw_info_callback<F>(
     )
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslContextBuilder::add_certificate_compression_algorithm`. `out` is a
+/// live, initialized `CBB` used only by this call; `input` is readable for
+/// `input_len` bytes. The connection's current context holds `C`.
 pub(super) unsafe extern "C" fn raw_ssl_cert_compress<C>(
     ssl: *mut ffi::SSL,
     out: *mut ffi::CBB,
@@ -892,7 +1060,7 @@ where
             assert!(C::CAN_COMPRESS);
         }
 
-        // SAFETY: boring provides valid inputs.
+        // SAFETY: guaranteed by the caller under the module's trampoline contract.
         let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
 
         let ssl_context = ssl.ssl_context();
@@ -915,6 +1083,14 @@ where
     })
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslContextBuilder::add_certificate_compression_algorithm`. `out` is
+/// valid for one write; `input` is readable for `input_len` bytes, and
+/// `uncompressed_len` is peer-controlled (it may be `0`). On success `*out`
+/// carries one `CRYPTO_BUFFER` reference for BoringSSL. The connection's
+/// current context holds `C`.
 pub(super) unsafe extern "C" fn raw_ssl_cert_decompress<C>(
     ssl: *mut ffi::SSL,
     out: *mut *mut ffi::CRYPTO_BUFFER,
@@ -930,7 +1106,7 @@ where
             assert!(C::CAN_DECOMPRESS);
         }
 
-        // SAFETY: boring provides valid inputs.
+        // SAFETY: guaranteed by the caller under the module's trampoline contract.
         let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
 
         let ssl_context = ssl.ssl_context();
@@ -1009,8 +1185,9 @@ impl<'a> CryptoBufferBuilder<'a> {
         let mut data: *mut u8 = std::ptr::null_mut();
         let buffer = unsafe { crate::cvt_p(ffi::CRYPTO_BUFFER_alloc(&mut data, capacity))? };
         // SAFETY: `CRYPTO_BUFFER_alloc` makes `data` point to `capacity`
-        // writable bytes owned by `buffer`, which this builder owns and only
-        // frees on drop, after the cursor. A zero capacity (the peer controls
+        // writable bytes owned by `buffer`, which this builder owns. `Drop`
+        // frees `buffer` before the `cursor` field is dropped, which is fine:
+        // dropping a `Cursor<&mut [u8]>` never touches the bytes. A zero capacity (the peer controls
         // it) may come with a null `data`, hence `zeroed_out_buf`. The bytes
         // are zeroed so the slice never refers to uninitialized memory; the
         // cursor is only exposed as an opaque `impl Write`.
@@ -1058,6 +1235,11 @@ fn verify_panicked(x509_ctx: *mut ffi::X509_STORE_CTX, message: String) -> c_int
     0
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslContextBuilder::set_msg_callback`. `buf` is readable for `len`
+/// bytes. The session context holds `F`.
 pub(super) unsafe extern "C" fn raw_ctx_msg<F>(
     write_p: c_int,
     version: c_int,
@@ -1072,7 +1254,7 @@ pub(super) unsafe extern "C" fn raw_ctx_msg<F>(
     // Observation cannot fail the connection; a panic is contained.
     unwind::catch(
         || {
-            // SAFETY: boring provides valid inputs.
+            // SAFETY: guaranteed by the caller under the module's trampoline contract.
             let ssl = unsafe { SslRef::from_ptr(ssl) };
             let message =
                 unsafe { super::SslMessage::from_raw(write_p, version, content_type, buf, len) };
@@ -1087,6 +1269,11 @@ pub(super) unsafe extern "C" fn raw_ctx_msg<F>(
     )
 }
 
+/// # Safety
+///
+/// The [trampoline contract](self) for
+/// `SslRef::set_msg_callback`. `buf` is readable for `len` bytes; the
+/// connection's own ex_data holds `Arc<F>`.
 pub(super) unsafe extern "C" fn raw_ssl_msg<F>(
     write_p: c_int,
     version: c_int,
@@ -1100,7 +1287,7 @@ pub(super) unsafe extern "C" fn raw_ssl_msg<F>(
 {
     unwind::catch(
         || {
-            // SAFETY: boring provides valid inputs.
+            // SAFETY: guaranteed by the caller under the module's trampoline contract.
             let ssl = unsafe { SslRef::from_ptr(ssl) };
             let message =
                 unsafe { super::SslMessage::from_raw(write_p, version, content_type, buf, len) };
