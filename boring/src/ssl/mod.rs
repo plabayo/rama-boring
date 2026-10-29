@@ -2008,11 +2008,14 @@ impl SslContextBuilder {
 
     /// Sets the callback which is called when sessions are removed from the context.
     ///
-    /// Sessions can be removed because they have timed out or because they are considered faulty.
+    /// Sessions can be removed because they have timed out, are considered faulty,
+    /// or their context is being destroyed. The callback receives only the session:
+    /// a context undergoing destruction cannot safely be retained with `to_owned`.
+    /// Capture an application identifier if the callback needs to identify its cache.
     #[corresponds(SSL_CTX_sess_set_remove_cb)]
     pub fn set_remove_session_callback<F>(&mut self, callback: F)
     where
-        F: Fn(&SslContextRef, &SslSessionRef) + 'static + Sync + Send,
+        F: Fn(&SslSessionRef) + 'static + Sync + Send,
     {
         unsafe {
             self.replace_ex_data(SslContext::cached_ex_index::<F>(), callback);

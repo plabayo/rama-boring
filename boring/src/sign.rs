@@ -55,13 +55,29 @@ use crate::ffi::{EVP_MD_CTX_free, EVP_MD_CTX_new};
 /// `Signer` and `Verifier` are `Sync`, and their `&self` finalizers would
 /// otherwise hand the shared `EVP_PKEY_CTX` to the key's native sign/verify
 /// method, which takes it mutably. Working on an independent copy keeps every
-/// `&self` call from touching shared native state, whatever the key method
-/// does with its context.
+/// `&self` call from mutating the original operation context.
+///
+/// The copy is not a deep copy of the keys: BoringSSL's `EVP_PKEY_CTX_dup`
+/// retains `pkey` and `peerkey` by reference count, while allocating private
+/// method data (RSA options/label, EC options, ML-DSA context bytes;
+/// stateless Ed25519 needs none).
+/// The pinned native implementation's copy methods only read their source.
+/// Shared keys therefore still require BoringSSL's non-mutating key-operation
+/// guarantees (`evp.h`, `rsa.h`, and `ecdsa.h`); native reference counts and RSA
+/// precomputation/blinding caches are synchronized. Digest descriptors are
+/// immutable. These are dependency premises, not consequences of `const`.
 ///
 /// # Safety
 ///
 /// The caller must ensure that `md_ctx` points to a live, initialized
-/// `EVP_MD_CTX` that nothing mutates during the call.
+/// `EVP_MD_CTX` initialized by the supported BoringSSL digest/sign/verify APIs,
+/// including live descriptors and keys. Nothing may mutate the source operation
+/// context during this call, and its shared keys must support concurrent
+/// non-mutating operations as described above.
+///
+/// On success, `f` receives a private operation context, valid until `f` returns
+/// or unwinds. Keys and immutable descriptors remain shared. The copy is freed
+/// exactly once afterwards, including on error or unwind.
 unsafe fn with_ctx_copy<R>(
     md_ctx: *const ffi::EVP_MD_CTX,
     f: impl FnOnce(*mut ffi::EVP_MD_CTX) -> Result<R, ErrorStack>,
@@ -78,8 +94,9 @@ unsafe fn with_ctx_copy<R>(
     // SAFETY: allocating a fresh context has no preconditions.
     let copy = Owned(cvt_p(unsafe { EVP_MD_CTX_new() })?);
     // SAFETY: `copy.0` is a freshly initialized context and `md_ctx` is a live
-    // context that is only read (`# Safety`); `EVP_MD_CTX_copy_ex` takes it as
-    // `const` and duplicates its `EVP_PKEY_CTX`.
+    // context that is only read (`# Safety`). The native copy implementation
+    // copies digest storage and duplicates the operation context as described
+    // above, retaining the concurrently usable keys by reference count.
     cvt(unsafe { ffi::EVP_MD_CTX_copy_ex(copy.0, md_ctx) })?;
     f(copy.0)
 }
@@ -117,7 +134,9 @@ pub struct Signer<'a> {
 // SAFETY: `Signer` exclusively owns its `EVP_MD_CTX` (and the `EVP_PKEY_CTX`
 // inside it). Every method that changes them takes `&mut self`. Through `&self`
 // the contexts are only read: `len` and `sign` run on a private copy made with
-// `EVP_MD_CTX_copy_ex` (const source), and `rsa_padding` is a read-only query.
+// `EVP_MD_CTX_copy_ex`. Shared keys obey the native concurrency guarantees
+// documented on `with_ctx_copy`; the source-context copy methods and
+// `rsa_padding` only read operation state.
 unsafe impl Sync for Signer<'_> {}
 unsafe impl Send for Signer<'_> {}
 
@@ -195,6 +214,9 @@ impl<'a> Signer<'a> {
     /// This is only useful for RSA keys.
     #[corresponds(EVP_PKEY_CTX_get_rsa_padding)]
     pub fn rsa_padding(&self) -> Result<Padding, ErrorStack> {
+        // SAFETY: the live pctx is borrowed through `self`; native
+        // EVP_PKEY_CTRL_GET_RSA_PADDING reads pad_mode and writes only our
+        // local `pad`. It does not run a key operation or populate a cache.
         unsafe {
             let mut pad = 0;
             cvt(ffi::EVP_PKEY_CTX_get_rsa_padding(self.pctx, &mut pad))
@@ -449,6 +471,9 @@ impl<'a> Verifier<'a> {
     /// This is only useful for RSA keys.
     #[corresponds(EVP_PKEY_CTX_get_rsa_padding)]
     pub fn rsa_padding(&self) -> Result<Padding, ErrorStack> {
+        // SAFETY: the live pctx is borrowed through `self`; native
+        // EVP_PKEY_CTRL_GET_RSA_PADDING reads pad_mode and writes only our
+        // local `pad`. It does not run a key operation or populate a cache.
         unsafe {
             let mut pad = 0;
             cvt(ffi::EVP_PKEY_CTX_get_rsa_padding(self.pctx, &mut pad))

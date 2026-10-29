@@ -421,7 +421,7 @@ impl<'a> SslMessage<'a> {
     /// # Safety
     ///
     /// If `len > 0` and `buf` is non-null, the caller must ensure that `buf`
-    /// is readable for `len` bytes in one allocation that stays live and
+    /// points to `len` initialized bytes in one allocation that stays live and
     /// unmodified for `'a`.
     pub(super) unsafe fn from_raw(
         write_p: i32,
@@ -433,8 +433,13 @@ impl<'a> SslMessage<'a> {
         let bytes = if len == 0 || buf.is_null() {
             &[]
         } else {
-            // SAFETY: `buf` is non-null and readable for `len` bytes for `'a`
-            // (`# Safety`); a message length always fits in `isize`.
+            assert!(
+                len <= isize::MAX as usize,
+                "SSL message exceeds Rust slice bounds"
+            );
+            // SAFETY: `buf` is non-null and readable for `len` initialized bytes
+            // in one live, immutable allocation for `'a` (`# Safety`), and the
+            // checked length fits in `isize`.
             unsafe { slice::from_raw_parts(buf.cast::<u8>(), len) }
         };
         Self {
@@ -814,30 +819,21 @@ impl SslRef {
             return;
         }
         unsafe { ffi::SSL_set_shed_handshake_config(self.as_ptr(), enabled.into()) }
-        // BoringSSL has no query for "the configuration was shed", and its
-        // config getters `assert` (debug) or return NULL (release) afterwards,
-        // so remember the request on the Rust side.
-        self.set_ex_data(
-            super::Ssl::cached_ex_index::<ShedHandshakeConfig>(),
-            ShedHandshakeConfig(enabled),
-        );
     }
 
-    /// Returns `true` if the handshake configuration may have been freed by
-    /// [`Self::set_shed_handshake_config`].
+    /// Returns whether the native handshake configuration has been freed.
     ///
     /// # Safety-usable invariant
     ///
-    /// When this returns `false`, the SSL's handshake configuration is present,
-    /// so `SSL_get_ciphers`, `SSL_get0_param` and similar getters return
-    /// non-null pointers. (It may conservatively return `true` while the
-    /// configuration still exists, e.g. when renegotiation keeps it alive.)
+    /// A `false` result means the native configuration exists for the borrow of
+    /// `self`, including for imported SSLs. This establishes configuration
+    /// presence only; optional getters (such as `certificate`) may still return
+    /// null, and X.509 getters additionally require an X.509-capable method.
     pub(crate) fn handshake_config_shed(&self) -> bool {
-        // BoringSSL only sheds once shedding was requested and the handshake is
-        // finished (`ssl_maybe_shed_handshake_config`).
-        self.ex_data(super::Ssl::cached_ex_index::<ShedHandshakeConfig>())
-            .is_some_and(|shed| shed.0)
-            && unsafe { ffi::SSL_in_init(self.as_ptr()) } == 0
+        // SAFETY: `self` denotes a live SSL, and the native query only reads
+        // configuration presence. Handshake/configuration mutations require
+        // exclusive access, so they cannot race this shared borrow.
+        unsafe { ffi::RAMA_SSL_has_handshake_config(self.as_ptr()) == 0 }
     }
 
     /// Lets a server avoid a TLS 1.3 interoperability bug of JDK 11 clients.
@@ -911,6 +907,3 @@ impl SslRef {
 pub(super) fn session_context(ssl: &SslRef) -> Option<&SslContext> {
     ssl.ex_data(*SESSION_CTX_INDEX)
 }
-
-/// Whether `set_shed_handshake_config(true)` was requested for a connection.
-struct ShedHandshakeConfig(bool);

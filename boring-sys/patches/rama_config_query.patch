@@ -1,0 +1,48 @@
+diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
+--- a/include/openssl/ssl.h
++++ b/include/openssl/ssl.h
+@@ -5201,6 +5201,11 @@
+ // be useful for clients which support renegotiation with some ALPN protocols,
+ // such as HTTP/1.1, and not others, such as HTTP/2.
+ OPENSSL_EXPORT void SSL_set_shed_handshake_config(SSL *ssl, int enable);
++
++// RAMA_SSL_has_handshake_config returns one if the live `ssl` still owns its
++// handshake configuration, or zero if it has been shed. This is a non-mutating
++// query. A nonzero result does not imply that optional configuration is set.
++OPENSSL_EXPORT int RAMA_SSL_has_handshake_config(const SSL *ssl);
+ 
+ enum ssl_renegotiate_mode_t BORINGSSL_ENUM_INT {
+   ssl_renegotiate_never = 0,
+diff --git a/ssl/ssl_lib.cc b/ssl/ssl_lib.cc
+--- a/ssl/ssl_lib.cc
++++ b/ssl/ssl_lib.cc
+@@ -3304,6 +3304,10 @@
+   return FromOpaque(ssl)->s3->used_hello_retry_request;
+ }
+ 
++int RAMA_SSL_has_handshake_config(const SSL *ssl) {
++  return FromOpaque(ssl)->config != nullptr;
++}
++
+ void SSL_set_shed_handshake_config(SSL *ssl, int enable) {
+   auto *ssl_impl = FromOpaque(ssl);
+   if (!ssl_impl->config) {
+diff --git a/include/openssl/prefix_symbols.h b/include/openssl/prefix_symbols.h
+--- a/include/openssl/prefix_symbols.h
++++ b/include/openssl/prefix_symbols.h
+@@ -2412,6 +2412,7 @@
+ #pragma redefine_extname SSL_set_session BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_session)
+ #pragma redefine_extname SSL_set_session_id_context BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_session_id_context)
+ #pragma redefine_extname SSL_set_shed_handshake_config BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_shed_handshake_config)
++#pragma redefine_extname RAMA_SSL_has_handshake_config BORINGSSL_ADD_USER_LABEL_AND_PREFIX(RAMA_SSL_has_handshake_config)
+ #pragma redefine_extname SSL_set_shutdown BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_shutdown)
+ #pragma redefine_extname SSL_set_signed_cert_timestamp_list BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_signed_cert_timestamp_list)
+ #pragma redefine_extname SSL_set_signing_algorithm_prefs BORINGSSL_ADD_USER_LABEL_AND_PREFIX(SSL_set_signing_algorithm_prefs)
+@@ -5549,6 +5550,7 @@
+ #define SSL_set_session BORINGSSL_ADD_PREFIX(SSL_set_session)
+ #define SSL_set_session_id_context BORINGSSL_ADD_PREFIX(SSL_set_session_id_context)
+ #define SSL_set_shed_handshake_config BORINGSSL_ADD_PREFIX(SSL_set_shed_handshake_config)
++#define RAMA_SSL_has_handshake_config BORINGSSL_ADD_PREFIX(RAMA_SSL_has_handshake_config)
+ #define SSL_set_shutdown BORINGSSL_ADD_PREFIX(SSL_set_shutdown)
+ #define SSL_set_signed_cert_timestamp_list BORINGSSL_ADD_PREFIX(SSL_set_signed_cert_timestamp_list)
+ #define SSL_set_signing_algorithm_prefs BORINGSSL_ADD_PREFIX(SSL_set_signing_algorithm_prefs)

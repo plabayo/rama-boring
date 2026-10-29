@@ -30,6 +30,11 @@ pub(super) static SELECTED_CREDENTIAL_CONTEXT_INDEX: LazyLock<
     Index<Ssl, SelectedCredentialContext>,
 > = LazyLock::new(|| Ssl::new_ex_index().unwrap());
 
+/// # Safety-usable invariant
+///
+/// Returns the retained context captured for the currently selected credential
+/// when that credential still matches the capture, or the connection's current
+/// context otherwise. The returned context remains live for the borrow of `ssl`.
 pub(super) fn selected_credential_context(ssl: &SslRef) -> &SslContextRef {
     if let Some(owner) = ssl.ex_data(*SELECTED_CREDENTIAL_CONTEXT_INDEX) {
         if ssl

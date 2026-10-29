@@ -2,25 +2,39 @@
 //!
 //! # Trampoline contract
 //!
-//! Each trampoline is installed by exactly one setter (named in its
-//! `# Safety` section) and is only ever called by BoringSSL. For every call,
-//! the caller (BoringSSL) must ensure that:
+//! Each trampoline is registered through the setter(s) or method table named
+//! in its `# Safety` section. BoringSSL, as caller, must ensure that:
 //!
-//! - the `SSL`, `SSL_CTX`, `X509_STORE_CTX` or `SSL_CLIENT_HELLO` argument is
-//!   non-null and live for the whole call. Rust code reaches the connection
-//!   only through the reference the trampoline creates: a `&mut SslRef` held
-//!   by the frame driving the handshake is not used while the callback runs
-//!   (`SslRef` wraps a zero-sized `Opaque` with interior mutability, so the
-//!   two references do not overlap any Rust-visible bytes);
-//! - the context named in the function's `# Safety` section holds the
-//!   callback (or method / compressor) of the function's concrete type
-//!   parameter at its `cached_ex_index`. The setters store it there before
-//!   registering the trampoline, and a built context's ex_data is never
-//!   replaced;
-//! - every input `(pointer, length)` pair is readable for `length` bytes in
-//!   one live allocation for the whole call (a zero length may come with any
-//!   pointer, which is why `slice_or_empty` is used), and every output
-//!   pointer is valid for writes of the size its BoringSSL header documents.
+//! - object arguments are non-null, properly aligned, initialized native objects
+//!   that remain live for the call. Access through the trampoline-created wrappers
+//!   must not conflict with accesses on another thread or through other Rust
+//!   references. The driving native frame is suspended while the callback runs;
+//!   it must not invalidate callback-borrowed input during reentrant operations;
+//! - the owner and ex_data slot named by the individual contract contain the
+//!   specified concrete callback or method type. Context callbacks use
+//!   `SslContext::cached_ex_index`, connection callbacks use their stated
+//!   `Ssl::cached_ex_index` or dedicated index, and credentials use
+//!   `SslCredential::cached_ex_index`. Built context slots are immutable;
+//!   replaceable connection callbacks are retained independently before user code;
+//! - nonempty input buffers contain initialized bytes in a single live allocation,
+//!   are at most `isize::MAX` bytes long, and remain readable and unmodified for
+//!   the entire callback borrow, including during user code. Empty input buffers
+//!   may have any pointer and are normalized with `slice_or_empty`;
+//! - each nonempty output is non-null, properly aligned for its pointee, and readable and
+//!   writable over its entire stated extent in one live allocation, with byte
+//!   size at most `isize::MAX`. Except for access through the callback's derived
+//!   references, outputs are exclusively accessible for the call and are disjoint
+//!   from inputs, other outputs, and callback-accessible object storage. Outputs
+//!   may begin uninitialized only when they are written before being read or
+//!   exposed to safe user code. Empty byte-buffer outputs may have any pointer
+//!   and are normalized by `zeroed_out_buf`; scalar outputs are never empty;
+//! - C-string inputs are initialized through a terminating NUL in one live
+//!   allocation, within `isize::MAX` bytes, and remain unmodified for the call.
+//!   They are non-null unless the individual contract explicitly permits null.
+//!
+//! A native context passed to `raw_remove_session` may be undergoing destruction.
+//! Its ex_data is available until that callback returns, but it must not be
+//! retained or exposed to user code as an ordinary `SslContextRef`.
 //!
 //! The trampolines never let a panic unwind into C (`unwind::catch`).
 #![forbid(unsafe_op_in_unsafe_fn)]
@@ -79,9 +93,10 @@ unsafe fn zeroed_out_buf<'a>(buf: *mut u8, len: usize) -> &'a mut [u8] {
 
 /// # Safety
 ///
-/// BoringSSL (the only caller) must pass `x509_ctx` pointing to the live
-/// `X509_STORE_CTX` being verified, with the `SSL` stored at
-/// `X509StoreContext::ssl_idx`, and nothing else accessing it for the call.
+/// The [trampoline contract](self) for `SslContextBuilder::set_verify_callback`.
+/// `x509_ctx` is the store context being verified, exclusively accessible for
+/// this call, with the `SSL` at `X509StoreContext::ssl_idx`. The SSL's original
+/// session context (`SESSION_CTX_INDEX`) holds `F`.
 pub(super) unsafe extern "C" fn raw_verify<F>(
     preverify_ok: c_int,
     x509_ctx: *mut ffi::X509_STORE_CTX,
@@ -117,7 +132,9 @@ where
 
             c_int::from(verify(preverify_ok != 0, ctx))
         },
-        |message| verify_panicked(x509_ctx, message),
+        // SAFETY: the trampoline contract keeps the store context alive and
+        // exclusively accessible after the unwound user callback releases it.
+        |message| unsafe { verify_panicked(x509_ctx, message) },
     )
 }
 
@@ -192,7 +209,9 @@ where
 
             c_int::from(verify(ctx))
         },
-        |message| verify_panicked(x509_ctx, message),
+        // SAFETY: the trampoline contract keeps the store context alive and
+        // exclusively accessible after the unwound user callback releases it.
+        |message| unsafe { verify_panicked(x509_ctx, message) },
     )
 }
 
@@ -436,7 +455,9 @@ where
 
             c_int::from(callback(preverify_ok != 0, ctx))
         },
-        |message| verify_panicked(x509_ctx, message),
+        // SAFETY: the trampoline contract keeps the store context alive and
+        // exclusively accessible after the unwound user callback releases it.
+        |message| unsafe { verify_panicked(x509_ctx, message) },
     )
 }
 
@@ -512,6 +533,10 @@ unsafe fn to_uninit<'a, T: 'a>(ptr: *mut T) -> &'a mut MaybeUninit<T> {
 /// `iv` (`EVP_MAX_IV_LENGTH` bytes) are writable; `evp_ctx` and `hmac_ctx` are
 /// live, initialized but unkeyed contexts that nothing else accesses during
 /// the call. The session context (`SESSION_CTX_INDEX`) holds `F`.
+/// `encrypt` is 0 or 1. For 0, both arrays contain initialized input bytes;
+/// for 1, they may be uninitialized and this trampoline initializes them.
+/// `F` satisfies `SslContextBuilder::set_ticket_key_callback`'s success-context
+/// obligations: successful callbacks leave usable cipher and HMAC contexts.
 pub(super) unsafe extern "C" fn raw_ticket_key<F>(
     ssl: *mut ffi::SSL,
     key_name: *mut u8,
@@ -767,7 +792,7 @@ pub(super) unsafe extern "C" fn raw_remove_session<F>(
     ctx: *mut ffi::SSL_CTX,
     session: *mut ffi::SSL_SESSION,
 ) where
-    F: Fn(&SslContextRef, &SslSessionRef) + 'static + Sync + Send,
+    F: Fn(&SslSessionRef) + 'static + Sync + Send,
 {
     unwind::catch(
         || {
@@ -779,7 +804,10 @@ pub(super) unsafe extern "C" fn raw_remove_session<F>(
                 .ex_data(SslContext::cached_ex_index::<F>())
                 .expect("BUG: remove session callback missing");
 
-            callback(ctx, session);
+            // `ctx` can already be in SSLContext's destructor. Use its ex_data
+            // only while BoringSSL keeps it alive, and do not expose a retainable
+            // SslContextRef to user code.
+            callback(session);
         },
         |_| (),
     )
@@ -791,7 +819,7 @@ type DataPtr = *const c_uchar;
 ///
 /// The [trampoline contract](self) for
 /// `SslContextBuilder::set_get_session_callback`. `data` is readable for
-/// `len` bytes and `copy` is valid for one write. A returned session carries
+/// `len` bytes, `len >= 0`, and `copy` is valid for one write. A returned session carries
 /// one reference for BoringSSL. The session context holds `F`.
 pub(super) unsafe extern "C" fn raw_get_session<F>(
     ssl: *mut ffi::SSL,
@@ -809,7 +837,7 @@ where
         || {
             // SAFETY: guaranteed by the caller under the module's trampoline contract.
             let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
-            let data = unsafe { slice::from_raw_parts(data, len as usize) };
+            let data = unsafe { crate::util::slice_or_empty(data, len as usize) };
             let copy = unsafe { &mut *copy };
 
             let callback = ssl
@@ -874,8 +902,12 @@ where
 /// The [trampoline contract](self) for
 /// `set_private_key_method` (context or credential). `out` is writable
 /// for `max_out` bytes (it may start uninitialized), `out_len` for one
-/// `usize`, and `in_` readable for `in_len` bytes. The selected credential or
-/// the connection's context holds `M`. On success `*out_len <= max_out`.
+/// `usize`, and `in_` readable for `in_len` bytes. `M` is stored either on the
+/// selected credential at `SslCredential::cached_ex_index::<M>()`, or on the
+/// context returned by `selected_credential_context` at
+/// `SslContext::cached_ex_index::<M>()`. The latter can be a retained former
+/// context after routing, rather than the current `SSL_get_SSL_CTX` context.
+/// On success `*out_len <= max_out`.
 pub(super) unsafe extern "C" fn raw_sign<M>(
     ssl: *mut ffi::SSL,
     out: *mut u8,
@@ -889,7 +921,7 @@ where
     M: PrivateKeyMethod,
 {
     // SAFETY: guaranteed by the caller under the module's trampoline contract.
-    let input = unsafe { slice::from_raw_parts(in_, in_len) };
+    let input = unsafe { crate::util::slice_or_empty(in_, in_len) };
 
     let signature_algorithm = SslSignatureAlgorithm(signature_algorithm);
 
@@ -916,7 +948,7 @@ where
     M: PrivateKeyMethod,
 {
     // SAFETY: guaranteed by the caller under the module's trampoline contract.
-    let input = unsafe { slice::from_raw_parts(in_, in_len) };
+    let input = unsafe { crate::util::slice_or_empty(in_, in_len) };
 
     let callback = |method: &M, ssl: &mut _, output: &mut _| method.decrypt(ssl, input, output);
 
@@ -1225,9 +1257,13 @@ impl Drop for CryptoBufferBuilder<'_> {
 
 // A panicking verifier rejects the chain with an application error; BoringSSL
 // clears the reported panic itself when the verify mode ignores the result.
+/// # Safety
+///
+/// The caller must provide a live, initialized, exclusively accessible
+/// `X509_STORE_CTX` for this call, after the panicked callback releases its borrow.
 #[cold]
 #[inline(never)]
-fn verify_panicked(x509_ctx: *mut ffi::X509_STORE_CTX, message: String) -> c_int {
+unsafe fn verify_panicked(x509_ctx: *mut ffi::X509_STORE_CTX, message: String) -> c_int {
     unwind::report(message);
     // SAFETY: the panicked callback no longer borrows the store context.
     unsafe { X509StoreContextRef::from_ptr_mut(x509_ctx) }

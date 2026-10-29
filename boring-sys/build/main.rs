@@ -605,6 +605,7 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
     apply_patch(config, "rama_symbols.patch")?;
     apply_patch(config, "rama_boringssl_cmake.patch")?;
     apply_patch(config, "rama_boring_prefix.patch")?;
+    apply_patch(config, "rama_config_query.patch")?;
 
     Ok(())
 }

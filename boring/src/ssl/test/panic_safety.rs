@@ -246,7 +246,7 @@ isolated_test! {
         }
         let removals = Arc::new(AtomicUsize::new(0));
         let count = removals.clone();
-        server.set_remove_session_callback(move |_, _| {
+        server.set_remove_session_callback(move |_| {
             count.fetch_add(1, SeqCst);
             panic!("remove")
         });

@@ -511,3 +511,22 @@ fn alpn_selection_must_fit_the_one_byte_length() {
     assert!(alpn_selection(0));
     assert!(alpn_selection(256));
 }
+
+#[test]
+fn native_shedding_without_rust_ex_data_is_detected() {
+    use foreign_types::ForeignTypeRef;
+    let server = Server::builder().build();
+    let mut client = server.client().build().builder();
+    client.ssl().set_verify(SslVerifyMode::NONE);
+    // SAFETY: this is a live, exclusively borrowed SSL. Configure shedding
+    // as a native integrator would, without the Rust setter's bookkeeping.
+    unsafe { crate::ffi::SSL_set_shed_handshake_config(client.ssl().as_ptr(), 1) };
+    let mut stream = client.connect();
+    assert!(stream.ssl().handshake_config_shed());
+    assert!(stream.ssl().ciphers().is_empty());
+    assert!(stream.ssl_mut().certificate().is_none());
+    assert!(catch_unwind(AssertUnwindSafe(|| {
+        let _ = stream.ssl_mut().verify_param_mut();
+    }))
+    .is_err());
+}
