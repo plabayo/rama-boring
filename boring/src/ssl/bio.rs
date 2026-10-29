@@ -6,6 +6,8 @@ use crate::libc_types::{c_char, c_int, c_long, c_void, strlen};
 use std::io;
 use std::io::prelude::*;
 use std::panic::{catch_unwind, AssertUnwindSafe};
+
+use crate::util::slice_or_empty;
 use std::ptr;
 use std::slice;
 
@@ -69,6 +71,8 @@ impl BioMethod {
     }
 }
 
+// SAFETY: the `BIO_METHOD` is fully set up in `BioMethod::new` and never
+// mutated afterwards; BIOs only read it.
 unsafe impl Sync for BioMethod {}
 unsafe impl Send for BioMethod {}
 
@@ -170,10 +174,22 @@ unsafe extern "C" fn bwrite<S: Write>(bio: *mut BIO, buf: *const c_char, len: c_
     if state.poisoned() {
         return -1;
     }
-    let buf = slice::from_raw_parts(buf.cast(), len);
+    // SAFETY: `BIO_write` passes `buf` valid for reads of `len` bytes; an
+    // empty write may come with a null pointer.
+    let buf = unsafe { slice_or_empty(buf.cast::<u8>(), len) };
 
     match catch_unwind(AssertUnwindSafe(|| state.stream.write(buf))) {
-        Ok(Ok(len)) => len as c_int,
+        // `n <= len <= c_int::MAX`, so the cast is lossless.
+        Ok(Ok(n)) if n <= len => n as c_int,
+        Ok(Ok(n)) => {
+            // A `Write` impl claiming more than it was given would make the
+            // TLS stack consume bytes that were never written.
+            state.set_error(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Write::write reported {n} bytes written for a {len}-byte buffer"),
+            ));
+            -1
+        }
         Ok(Err(err)) => {
             if retriable_error(&err) {
                 BIO_set_retry_write(bio);
@@ -199,10 +215,30 @@ unsafe extern "C" fn bread<S: Read>(bio: *mut BIO, buf: *mut c_char, len: c_int)
     if state.poisoned() {
         return -1;
     }
-    let buf = slice::from_raw_parts_mut(buf.cast(), len);
+    // SAFETY: `BIO_read` passes `buf` valid for writes of `len` bytes. The TLS
+    // read buffer is `malloc`ed and not initialized, while a safe `Read` impl
+    // may read the slice it is given, so it is zeroed before being exposed.
+    let buf = unsafe {
+        if buf.is_null() || len == 0 {
+            &mut []
+        } else {
+            std::ptr::write_bytes(buf.cast::<u8>(), 0, len);
+            slice::from_raw_parts_mut(buf.cast::<u8>(), len)
+        }
+    };
 
     match catch_unwind(AssertUnwindSafe(|| state.stream.read(buf))) {
-        Ok(Ok(len)) => len as c_int,
+        // `n <= len <= c_int::MAX`, so the cast is lossless.
+        Ok(Ok(n)) if n <= len => n as c_int,
+        Ok(Ok(n)) => {
+            // A `Read` impl claiming more than the buffer holds would make the
+            // TLS stack treat bytes past what was read as received data.
+            state.set_error(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Read::read reported {n} bytes read into a {len}-byte buffer"),
+            ));
+            -1
+        }
         Ok(Err(err)) => {
             if retriable_error(&err) {
                 BIO_set_retry_read(bio);

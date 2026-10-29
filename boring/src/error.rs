@@ -149,6 +149,8 @@ enum Data {
     Static(&'static str),
 }
 
+// SAFETY: the only non-auto-`Send`/`Sync` field is `file`, a pointer to an
+// immutable static C string (see `Error::file`), which is only read.
 unsafe impl Sync for Error {}
 unsafe impl Send for Error {}
 
@@ -286,6 +288,11 @@ impl Error {
     /// Returns the name of the source file which encountered the error.
     #[must_use]
     pub fn file(&self) -> &'static str {
+        // SAFETY: `file` is either `BORING_INTERNAL` or the `file` argument of
+        // an `ERR_put_error` call, which BoringSSL documents as a static string
+        // (`__FILE__`). The symbol-prefixed BoringSSL used here is only reached
+        // through this crate or `rama-boring-sys`, whose unsafe
+        // `ERR_put_error` callers must pass a `'static` NUL-terminated string.
         unsafe {
             if self.file.is_null() {
                 return "";

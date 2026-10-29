@@ -312,6 +312,7 @@ impl Cipher {
     }
 }
 
+// SAFETY: `Cipher` wraps a pointer to a static, immutable `EVP_CIPHER`.
 unsafe impl Sync for Cipher {}
 unsafe impl Send for Cipher {}
 
@@ -378,8 +379,15 @@ unsafe impl Send for Cipher {}
 pub struct Crypter {
     ctx: *mut ffi::EVP_CIPHER_CTX,
     block_size: usize,
+    // Safety invariant: `true` only if the cipher has
+    // `EVP_CIPH_FLAG_CUSTOM_CIPHER`, i.e. `EVP_CipherUpdate` treats a null
+    // output pointer as "feed AAD" instead of writing ciphertext to it.
+    supports_aad: bool,
 }
 
+// SAFETY: `Crypter` exclusively owns its `EVP_CIPHER_CTX`. Every method that
+// changes it takes `&mut self`; the only `&self` method, `get_tag`, only reads
+// the context (`EVP_CTRL_GCM_GET_TAG` copies the stored tag out).
 unsafe impl Sync for Crypter {}
 unsafe impl Send for Crypter {}
 
@@ -404,6 +412,9 @@ impl Crypter {
             let crypter = Crypter {
                 ctx,
                 block_size: t.block_size(),
+                supports_aad: ffi::EVP_CIPHER_flags(t.as_ptr())
+                    & ffi::EVP_CIPH_FLAG_CUSTOM_CIPHER as u32
+                    != 0,
             };
 
             let mode = match mode {
@@ -483,37 +494,28 @@ impl Crypter {
 
     /// Sets the length of the authentication tag to generate in AES CCM.
     ///
-    /// When encrypting with AES CCM, the tag length needs to be explicitly set in order
-    /// to use a value different than the default 12 bytes.
+    /// BoringSSL does not implement AES CCM through this API, so this always
+    /// returns an error. (Forwarding the request would hand native code a null
+    /// tag pointer, which AES GCM copies from.)
+    #[deprecated(note = "AES CCM is not supported by BoringSSL; this always returns an error")]
     pub fn set_tag_len(&mut self, tag_len: usize) -> Result<(), ErrorStack> {
-        unsafe {
-            assert!(tag_len <= c_int::MAX as usize);
-            // NB: this constant is actually more general than just GCM.
-            cvt(ffi::EVP_CIPHER_CTX_ctrl(
-                self.ctx,
-                ffi::EVP_CTRL_GCM_SET_TAG,
-                try_int(tag_len)?,
-                ptr::null_mut(),
-            ))
-        }
+        let _ = tag_len;
+        Err(ErrorStack::internal_error_str(
+            "Crypter::set_tag_len is not supported (no AES CCM in BoringSSL)",
+        ))
     }
 
     /// Feeds total plaintext length to the cipher.
     ///
-    /// The total plaintext or ciphertext length MUST be passed to the cipher when it operates in
-    /// CCM mode.
+    /// BoringSSL does not implement AES CCM through this API, so this always
+    /// returns an error. (Forwarding the request would make native code read
+    /// `data_len` bytes from a null pointer.)
+    #[deprecated(note = "AES CCM is not supported by BoringSSL; this always returns an error")]
     pub fn set_data_len(&mut self, data_len: usize) -> Result<(), ErrorStack> {
-        unsafe {
-            assert!(data_len <= c_int::MAX as usize);
-            let mut len = 0;
-            cvt(ffi::EVP_CipherUpdate(
-                self.ctx,
-                ptr::null_mut(),
-                &mut len,
-                ptr::null_mut(),
-                try_int(data_len)?,
-            ))
-        }
+        let _ = data_len;
+        Err(ErrorStack::internal_error_str(
+            "Crypter::set_data_len is not supported (no AES CCM in BoringSSL)",
+        ))
     }
 
     /// Feeds Additional Authenticated Data (AAD) through the cipher.
@@ -521,10 +523,20 @@ impl Crypter {
     /// This can only be used with AEAD ciphers such as AES GCM. Data fed in is not encrypted, but
     /// is factored into the authentication tag. It must be called before the first call to
     /// `update`.
+    ///
+    /// Returns an error if the cipher is not an AEAD cipher.
     pub fn aad_update(&mut self, input: &[u8]) -> Result<(), ErrorStack> {
+        if !self.supports_aad {
+            return Err(ErrorStack::internal_error_str(
+                "Crypter::aad_update requires an AEAD cipher such as AES GCM",
+            ));
+        }
+        assert!(input.len() <= c_int::MAX as usize);
+        let mut len = 0;
+        // SAFETY: by the `supports_aad` invariant the cipher is a custom
+        // (AEAD) cipher, for which `EVP_CipherUpdate` with a null output only
+        // reads `input.len()` bytes of AAD from `input` and writes nothing.
         unsafe {
-            assert!(input.len() <= c_int::MAX as usize);
-            let mut len = 0;
             cvt(ffi::EVP_CipherUpdate(
                 self.ctx,
                 ptr::null_mut(),
@@ -1174,6 +1186,69 @@ mod tests {
         ] {
             let name = t.cipher.nid().short_name().unwrap_or("unknown");
             assert_eq!(t.cipher.nid().as_raw(), t.nid, "{}", name);
+        }
+    }
+
+    #[test]
+    fn aad_update_rejects_non_aead_ciphers() {
+        for cipher in [
+            Cipher::aes_128_cbc(),
+            Cipher::aes_128_ctr(),
+            Cipher::aes_128_ecb(),
+            Cipher::aes_128_ofb(),
+        ] {
+            let iv = cipher.iv_len().map(|len| vec![0; len]);
+            let mut c = Crypter::new(cipher, Mode::Encrypt, &[0; 16], iv.as_deref()).unwrap();
+            // A full block of AAD would make a non-AEAD cipher write
+            // ciphertext to the (null) AAD output pointer.
+            assert!(c.aad_update(&[0; 32]).is_err());
+        }
+
+        let mut tag = [0; 16];
+        assert!(encrypt_aead(
+            Cipher::aes_128_ctr(),
+            &[0; 16],
+            Some(&[0; 16]),
+            &[0; 64],
+            b"x",
+            &mut tag
+        )
+        .is_err());
+        assert!(decrypt_aead(
+            Cipher::aes_128_cbc(),
+            &[0; 16],
+            Some(&[0; 16]),
+            &[0; 64],
+            &[0; 16],
+            &tag
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn aad_update_accepts_gcm() {
+        let mut c = Crypter::new(
+            Cipher::aes_128_gcm(),
+            Mode::Encrypt,
+            &[0; 16],
+            Some(&[0; 12]),
+        )
+        .unwrap();
+        c.aad_update(&[0; 64]).unwrap();
+    }
+
+    #[test]
+    #[allow(deprecated)]
+    fn ccm_only_setters_are_refused() {
+        for mode in [Mode::Encrypt, Mode::Decrypt] {
+            let mut c =
+                Crypter::new(Cipher::aes_128_gcm(), mode, &[0; 16], Some(&[0; 12])).unwrap();
+            assert!(c.set_tag_len(16).is_err());
+            assert!(c.set_data_len(4096).is_err());
+            let mut c =
+                Crypter::new(Cipher::aes_128_cbc(), mode, &[0; 16], Some(&[0; 16])).unwrap();
+            assert!(c.set_tag_len(16).is_err());
+            assert!(c.set_data_len(4096).is_err());
         }
     }
 }

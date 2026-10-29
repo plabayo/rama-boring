@@ -139,8 +139,13 @@ impl Sha1 {
     #[inline]
     #[must_use]
     pub fn new() -> Sha1 {
+        // SAFETY: the `*_Init` functions are only documented to initialize
+        // the hash state, not every byte of the context (the SHA-512 family
+        // leaves the 128-byte block buffer untouched), so start from an
+        // all-zero context. All of its fields are integers or integer arrays,
+        // for which zero is a valid value, so `assume_init` is sound.
         unsafe {
-            let mut ctx = MaybeUninit::uninit();
+            let mut ctx = MaybeUninit::zeroed();
             ffi::SHA1_Init(ctx.as_mut_ptr());
             Sha1(ctx.assume_init())
         }
@@ -184,8 +189,13 @@ impl Sha224 {
     #[inline]
     #[must_use]
     pub fn new() -> Sha224 {
+        // SAFETY: the `*_Init` functions are only documented to initialize
+        // the hash state, not every byte of the context (the SHA-512 family
+        // leaves the 128-byte block buffer untouched), so start from an
+        // all-zero context. All of its fields are integers or integer arrays,
+        // for which zero is a valid value, so `assume_init` is sound.
         unsafe {
-            let mut ctx = MaybeUninit::uninit();
+            let mut ctx = MaybeUninit::zeroed();
             ffi::SHA224_Init(ctx.as_mut_ptr());
             Sha224(ctx.assume_init())
         }
@@ -229,8 +239,13 @@ impl Sha256 {
     #[inline]
     #[must_use]
     pub fn new() -> Sha256 {
+        // SAFETY: the `*_Init` functions are only documented to initialize
+        // the hash state, not every byte of the context (the SHA-512 family
+        // leaves the 128-byte block buffer untouched), so start from an
+        // all-zero context. All of its fields are integers or integer arrays,
+        // for which zero is a valid value, so `assume_init` is sound.
         unsafe {
-            let mut ctx = MaybeUninit::uninit();
+            let mut ctx = MaybeUninit::zeroed();
             ffi::SHA256_Init(ctx.as_mut_ptr());
             Sha256(ctx.assume_init())
         }
@@ -274,8 +289,13 @@ impl Sha384 {
     #[inline]
     #[must_use]
     pub fn new() -> Sha384 {
+        // SAFETY: the `*_Init` functions are only documented to initialize
+        // the hash state, not every byte of the context (the SHA-512 family
+        // leaves the 128-byte block buffer untouched), so start from an
+        // all-zero context. All of its fields are integers or integer arrays,
+        // for which zero is a valid value, so `assume_init` is sound.
         unsafe {
-            let mut ctx = MaybeUninit::uninit();
+            let mut ctx = MaybeUninit::zeroed();
             ffi::SHA384_Init(ctx.as_mut_ptr());
             Sha384(ctx.assume_init())
         }
@@ -319,8 +339,13 @@ impl Sha512 {
     #[inline]
     #[must_use]
     pub fn new() -> Sha512 {
+        // SAFETY: the `*_Init` functions are only documented to initialize
+        // the hash state, not every byte of the context (the SHA-512 family
+        // leaves the 128-byte block buffer untouched), so start from an
+        // all-zero context. All of its fields are integers or integer arrays,
+        // for which zero is a valid value, so `assume_init` is sound.
         unsafe {
-            let mut ctx = MaybeUninit::uninit();
+            let mut ctx = MaybeUninit::zeroed();
             ffi::SHA512_Init(ctx.as_mut_ptr());
             Sha512(ctx.assume_init())
         }
@@ -364,8 +389,13 @@ impl Sha512_256 {
     #[inline]
     #[must_use]
     pub fn new() -> Sha512_256 {
+        // SAFETY: the `*_Init` functions are only documented to initialize
+        // the hash state, not every byte of the context (the SHA-512 family
+        // leaves the 128-byte block buffer untouched), so start from an
+        // all-zero context. All of its fields are integers or integer arrays,
+        // for which zero is a valid value, so `assume_init` is sound.
         unsafe {
-            let mut ctx = MaybeUninit::uninit();
+            let mut ctx = MaybeUninit::zeroed();
             ffi::SHA512_256_Init(ctx.as_mut_ptr());
             Sha512_256(ctx.assume_init())
         }
@@ -527,5 +557,14 @@ mod test {
         hasher.update(b"a");
         hasher.update(b"bc");
         assert_eq!(hex::encode(&hasher.finish()[..]), expected);
+    }
+
+    #[test]
+    fn sha512_family_contexts_are_fully_initialized() {
+        // The SHA-512 `*_Init` functions leave the block buffer untouched; it
+        // must still be initialized before the context is moved into Rust.
+        assert!(Sha384::new().0.p.iter().all(|b| *b == 0));
+        assert!(Sha512::new().0.p.iter().all(|b| *b == 0));
+        assert!(Sha512_256::new().0.p.iter().all(|b| *b == 0));
     }
 }

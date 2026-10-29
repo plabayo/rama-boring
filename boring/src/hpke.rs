@@ -12,8 +12,8 @@ foreign_type_and_impl_send_sync! {
 
 impl HpkeKey {
     /// Allocates and initializes a key with the `EVP_HPKE_KEY` type using the
-    /// `EVP_hpke_x25519_hkdf_sha256` KEM algorithm.
-    pub fn dhkem_p256_sha256(pkey: &[u8]) -> Result<HpkeKey, ErrorStack> {
+    /// `EVP_hpke_x25519_hkdf_sha256` KEM algorithm (DHKEM(X25519, HKDF-SHA256)).
+    pub fn dhkem_x25519_sha256(pkey: &[u8]) -> Result<HpkeKey, ErrorStack> {
         unsafe {
             ffi::init();
             let hpke = cvt_p(ffi::EVP_HPKE_KEY_new()).map(|p| HpkeKey::from_ptr(p))?;
@@ -27,5 +27,15 @@ impl HpkeKey {
 
             Ok(hpke)
         }
+    }
+
+    /// Same as [`HpkeKey::dhkem_x25519_sha256`].
+    ///
+    /// Despite its name this has always used the X25519 KEM
+    /// (`EVP_hpke_x25519_hkdf_sha256`), not P-256. It keeps that behavior so
+    /// existing ECH keys continue to load; prefer
+    /// [`HpkeKey::dhkem_x25519_sha256`] in new code.
+    pub fn dhkem_p256_sha256(pkey: &[u8]) -> Result<HpkeKey, ErrorStack> {
+        Self::dhkem_x25519_sha256(pkey)
     }
 }

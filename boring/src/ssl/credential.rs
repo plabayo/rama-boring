@@ -354,13 +354,18 @@ impl SslCredentialBuilder {
         unsafe {
             self.replace_ex_data(SslCredential::cached_ex_index::<M>(), method);
 
+            // BoringSSL keeps this pointer for the lifetime of the context or
+            // credential (ssl.h), so the table must be `'static`. The explicit
+            // annotation makes the compiler prove it via constant promotion.
+            let method_table: &'static ffi::SSL_PRIVATE_KEY_METHOD = &ffi::SSL_PRIVATE_KEY_METHOD {
+                sign: Some(callbacks::raw_sign::<M>),
+                decrypt: Some(callbacks::raw_decrypt::<M>),
+                complete: Some(callbacks::raw_complete::<M>),
+            };
+
             cvt_0i(ffi::SSL_CREDENTIAL_set_private_key_method(
                 self.0.as_ptr(),
-                &ffi::SSL_PRIVATE_KEY_METHOD {
-                    sign: Some(callbacks::raw_sign::<M>),
-                    decrypt: Some(callbacks::raw_decrypt::<M>),
-                    complete: Some(callbacks::raw_complete::<M>),
-                },
+                method_table,
             ))
             .map(|_| ())
         }

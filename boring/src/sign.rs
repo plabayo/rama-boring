@@ -80,6 +80,9 @@ pub struct Signer<'a> {
     _p: PhantomData<&'a ()>,
 }
 
+// SAFETY: `Signer` exclusively owns its `EVP_MD_CTX`. Every method that changes
+// it takes `&mut self`; the `&self` methods only read it
+// (`EVP_DigestSignFinal` finalizes a copy of the context).
 unsafe impl Sync for Signer<'_> {}
 unsafe impl Send for Signer<'_> {}
 
@@ -324,6 +327,7 @@ pub struct Verifier<'a> {
     pkey_pd: PhantomData<&'a ()>,
 }
 
+// SAFETY: as for `Signer`; `EVP_DigestVerifyFinal` also works on a copy.
 unsafe impl Sync for Verifier<'_> {}
 unsafe impl Send for Verifier<'_> {}
 

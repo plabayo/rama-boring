@@ -20,6 +20,14 @@ impl SslEchKeysBuilder {
         }
     }
 
+    /// Wraps a raw `SSL_ECH_KEYS` pointer.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `keys` is a non-null pointer to a live
+    /// `SSL_ECH_KEYS` whose ownership (one reference) moves to the builder, and
+    /// that it has not been installed on any `SSL_CTX` yet, since the builder
+    /// mutates it.
     pub unsafe fn from_ptr(keys: *mut ffi::SSL_ECH_KEYS) -> Self {
         Self {
             keys: SslEchKeys::from_ptr(keys),

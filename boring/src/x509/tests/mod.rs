@@ -748,3 +748,76 @@ fn test_check_ip_asc() {
     assert!(cert.check_ip_asc("0:0:0:0:0:0:0:1").unwrap());
     assert!(!cert.check_ip_asc("0:0:0:0:0:0:0:2").unwrap());
 }
+
+fn cert_with_ocsp_uri(uri: &[u8]) -> X509 {
+    let key = PKey::private_key_from_pem(include_bytes!("../../../test/key.pem")).unwrap();
+    let mut builder = X509::builder().unwrap();
+    builder.set_pubkey(&key).unwrap();
+    builder.set_version(2).unwrap();
+    let serial = BigNum::from_u32(7).unwrap().to_asn1_integer().unwrap();
+    builder.set_serial_number(&serial).unwrap();
+    let now = Asn1Time::days_from_now(1).unwrap();
+    builder.set_not_before(&now).unwrap();
+    builder.set_not_after(&now).unwrap();
+    let mut name = X509Name::builder().unwrap();
+    name.append_entry_by_text("CN", "ocsp").unwrap();
+    let name = name.build();
+    builder.set_subject_name(&name).unwrap();
+    builder.set_issuer_name(&name).unwrap();
+
+    // AuthorityInfoAccess: SEQ { SEQ { id-ad-ocsp, [6] IA5String uri } }
+    let access_location = [&[0x86, uri.len() as u8][..], uri].concat();
+    let access = [
+        &[0x30, (10 + access_location.len()) as u8][..],
+        &[0x06, 0x08, 0x2b, 0x06, 0x01, 0x05, 0x05, 0x07, 0x30, 0x01],
+        &access_location,
+    ]
+    .concat();
+    let aia = [&[0x30, access.len() as u8][..], &access].concat();
+    let oid = crate::asn1::Asn1Object::from_str("1.3.6.1.5.5.7.1.1").unwrap();
+    builder
+        .append_extension_der_payload(&oid, false, &aia)
+        .unwrap();
+    builder.sign(&key, MessageDigest::sha256()).unwrap();
+    // Round-trip through DER, as a peer certificate would arrive.
+    X509::from_der(&builder.build().to_der().unwrap()).unwrap()
+}
+
+#[test]
+fn ocsp_responders_skips_non_utf8_urls() {
+    // BoringSSL does not validate IA5String contents.
+    let cert = cert_with_ocsp_uri(b"\x80\xff");
+    assert!(cert.ocsp_responders().unwrap().is_empty());
+
+    let cert = cert_with_ocsp_uri(b"http://ocsp.example");
+    let responders = cert.ocsp_responders().unwrap();
+    assert_eq!(responders.len(), 1);
+    assert_eq!(&*responders[0], "http://ocsp.example");
+}
+
+#[test]
+fn verify_param_requires_an_initialized_context() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    let mut ctx = X509StoreContext::new().unwrap();
+    assert!(catch_unwind(AssertUnwindSafe(|| {
+        ctx.verify_param_mut().set_depth(3);
+    }))
+    .is_err());
+    assert!(catch_unwind(AssertUnwindSafe(|| {
+        let _ = ctx.verify_param();
+    }))
+    .is_err());
+
+    // Inside `init` the param exists and can be used and replaced.
+    let store = X509StoreBuilder::new().unwrap().build();
+    let cert = X509::from_pem(include_bytes!("../../../test/cert.pem")).unwrap();
+    let chain = Stack::new().unwrap();
+    ctx.init(&store, &cert, &chain, |ctx| {
+        ctx.verify_param_mut().set_depth(3);
+        ctx.set_verify_param(crate::x509::verify::X509VerifyParam::new().unwrap());
+        ctx.verify_param_mut().set_depth(4);
+        Ok(())
+    })
+    .unwrap();
+}

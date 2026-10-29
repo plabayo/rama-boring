@@ -41,6 +41,7 @@ mod private_key_method;
 mod server;
 mod session;
 mod session_resumption;
+mod soundness;
 mod trust_anchors;
 
 #[test]

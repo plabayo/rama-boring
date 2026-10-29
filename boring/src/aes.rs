@@ -91,7 +91,11 @@ impl AesKey {
         unsafe {
             assert!(key.len() <= c_int::MAX as usize / 8);
 
-            let mut aes_key = MaybeUninit::uninit();
+            // SAFETY: `AES_set_encrypt_key` only writes the `4 * (rounds + 1)`
+            // round-key words it needs (44 for AES-128, 52 for AES-192), so the
+            // schedule starts zeroed: every byte of `AES_KEY` is then
+            // initialized and `assume_init` below is valid for its integer fields.
+            let mut aes_key = MaybeUninit::<ffi::AES_KEY>::zeroed();
             let r = ffi::AES_set_encrypt_key(
                 key.as_ptr(),
                 (key.len() * 8).try_into().map_err(|_| KeyError(()))?,
@@ -115,7 +119,8 @@ impl AesKey {
         unsafe {
             assert!(key.len() <= c_int::MAX as usize / 8);
 
-            let mut aes_key = MaybeUninit::uninit();
+            // SAFETY: zeroed for the same reason as in `new_encrypt`.
+            let mut aes_key = MaybeUninit::<ffi::AES_KEY>::zeroed();
             let r = ffi::AES_set_decrypt_key(
                 key.as_ptr(),
                 (key.len() * 8).try_into().map_err(|_| KeyError(()))?,
@@ -155,7 +160,7 @@ pub fn wrap_key(
         assert!(out.len() >= in_.len() + 8); // Ciphertext is 64 bits longer (see 2.2.1)
 
         let written = ffi::AES_wrap_key(
-            std::ptr::addr_of!(key.0).cast_mut(), // this is safe, the implementation only uses the key as a const pointer.
+            std::ptr::addr_of!(key.0),
             iv.as_ref().map_or(ptr::null(), |iv| iv.as_ptr()),
             out.as_mut_ptr(),
             in_.as_ptr(),
@@ -180,8 +185,8 @@ pub fn wrap_key(
 ///
 /// # Panics
 ///
-/// Panics if either `out` or `in_` do not have sizes that are a multiple of 8, or
-/// if `in_` is not 8 bytes longer than `out`
+/// Panics if `in_` is shorter than 8 bytes or if `out` is shorter than
+/// `in_.len() - 8` bytes.
 #[corresponds(AES_unwrap_key)]
 pub fn unwrap_key(
     key: &AesKey,
@@ -189,22 +194,27 @@ pub fn unwrap_key(
     out: &mut [u8],
     in_: &[u8],
 ) -> Result<usize, KeyError> {
-    unsafe {
-        assert!(out.len() + 8 <= in_.len());
+    // `AES_unwrap_key` writes `in_len - 8` bytes to `out` on success.
+    assert!(in_.len() >= 8 && out.len() >= in_.len() - 8);
 
-        let written = ffi::AES_unwrap_key(
-            std::ptr::addr_of!(key.0).cast_mut(), // this is safe, the implementation only uses the key as a const pointer.
+    // SAFETY: `AES_unwrap_key` reads `in_len` bytes from `in_` and, by the
+    // assert above, `out` has room for the `in_len - 8` bytes it writes. `out`
+    // is derived from `as_mut_ptr`, so the write goes through a unique borrow.
+    // `iv` is either null or points to the 8 bytes of the local array.
+    let written = unsafe {
+        ffi::AES_unwrap_key(
+            std::ptr::addr_of!(key.0),
             iv.as_ref().map_or(ptr::null(), |iv| iv.as_ptr().cast()),
-            out.as_ptr().cast_mut(),
+            out.as_mut_ptr(),
             in_.as_ptr().cast(),
             in_.len(),
-        );
+        )
+    };
 
-        if written <= 0 {
-            Err(KeyError(()))
-        } else {
-            Ok(written as usize)
-        }
+    if written <= 0 {
+        Err(KeyError(()))
+    } else {
+        Ok(written as usize)
     }
 }
 
@@ -263,5 +273,58 @@ mod test {
             16
         );
         assert_eq!(&unwrapped[..], &key_data[..]);
+    }
+
+    #[test]
+    #[should_panic]
+    fn unwrap_key_rejects_short_output() {
+        let raw_key = [7u8; 32];
+        let enc_key = AesKey::new_encrypt(&raw_key).unwrap();
+        let mut wrapped = [0; 24];
+        wrap_key(&enc_key, None, &mut wrapped, &[0x42; 16]).unwrap();
+
+        // 16 bytes would be written; a 1-byte output must be refused before
+        // any native code runs.
+        let dec_key = AesKey::new_decrypt(&raw_key).unwrap();
+        let mut output = [0xaa; 32];
+        let _ = unwrap_key(&dec_key, None, &mut output[..1], &wrapped);
+    }
+
+    #[test]
+    #[should_panic]
+    fn unwrap_key_rejects_input_shorter_than_iv() {
+        let dec_key = AesKey::new_decrypt(&[7u8; 16]).unwrap();
+        let _ = unwrap_key(&dec_key, None, &mut [], &[0; 4]);
+    }
+
+    #[test]
+    fn unwrap_key_accepts_larger_output() {
+        let raw_key = [7u8; 24];
+        let enc_key = AesKey::new_encrypt(&raw_key).unwrap();
+        let mut wrapped = [0; 24];
+        wrap_key(&enc_key, None, &mut wrapped, &[0x42; 16]).unwrap();
+
+        let dec_key = AesKey::new_decrypt(&raw_key).unwrap();
+        let mut output = [0xaa; 32];
+        assert_eq!(
+            unwrap_key(&dec_key, None, &mut output, &wrapped).unwrap(),
+            16
+        );
+        assert_eq!(output[..16], [0x42; 16]);
+        assert_eq!(output[16..], [0xaa; 16]);
+    }
+
+    #[test]
+    fn short_key_schedules_are_fully_initialized() {
+        // AES-128/192 schedules use fewer than the 60 round-key words in
+        // `AES_KEY`; the unused tail must still be initialized (zero).
+        for (len, used) in [(16, 44), (24, 52)] {
+            for key in [
+                AesKey::new_encrypt(&vec![7; len]).unwrap(),
+                AesKey::new_decrypt(&vec![7; len]).unwrap(),
+            ] {
+                assert!(key.0.rd_key[used..].iter().all(|w| *w == 0));
+            }
+        }
     }
 }

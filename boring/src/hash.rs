@@ -96,6 +96,7 @@ impl MessageDigest {
     }
 }
 
+// SAFETY: `MessageDigest` wraps a pointer to a static, immutable `EVP_MD`.
 unsafe impl Sync for MessageDigest {}
 unsafe impl Send for MessageDigest {}
 
@@ -152,6 +153,9 @@ pub struct Hasher {
     state: State,
 }
 
+// SAFETY: `Hasher` exclusively owns its `EVP_MD_CTX`. Every method that changes
+// it takes `&mut self`; through `&self` it is only read (`Clone` copies it with
+// `EVP_MD_CTX_copy_ex`, which does not modify the source).
 unsafe impl Sync for Hasher {}
 unsafe impl Send for Hasher {}
 
@@ -363,9 +367,15 @@ pub(crate) fn hmac<const N: usize>(
     key: &[u8],
     data: &[u8],
 ) -> Result<[u8; N], ErrorStack> {
+    // `HMAC` writes `EVP_MD_size(digest)` bytes to `out`, so the output array
+    // must be exactly that large before any native code runs.
+    assert_eq!(digest.size(), N);
+
     let mut out = [0u8; N];
     let mut out_len: c_uint = 0;
 
+    // SAFETY: `out` has room for the `digest.size() == N` bytes `HMAC` writes;
+    // `key` and `data` are valid for their lengths.
     cvt_p(unsafe {
         ffi::HMAC(
             digest.as_ptr(),

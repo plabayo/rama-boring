@@ -97,25 +97,49 @@ impl Id {
 }
 
 /// A trait indicating that a key has parameters.
-#[allow(clippy::missing_safety_doc)]
+///
+/// # Safety
+///
+/// Implementors must ensure that every key (`PKey`, `Rsa`, `Dsa`, `EcKey`, ...)
+/// typed with `Self` has its domain parameters set. Accessors on such keys
+/// convert the native parameter pointers to references without null checks.
 pub unsafe trait HasParams {}
 
+// SAFETY: `Params` keys are only produced by constructors that set parameters.
 unsafe impl HasParams for Params {}
 
+// SAFETY: `HasPublic` requires the parameters to be set as well.
 unsafe impl<T> HasParams for T where T: HasPublic {}
 
 /// A trait indicating that a key has public components.
-#[allow(clippy::missing_safety_doc)]
+///
+/// # Safety
+///
+/// Implementors must ensure that every key typed with `Self` has its public
+/// components set (and therefore its parameters, see [`HasParams`]). Public
+/// accessors such as `RsaRef::n` convert the native pointers to references
+/// without null checks.
 pub unsafe trait HasPublic {}
 
+// SAFETY: `Public` keys are only produced by constructors and parsers that
+// set (or derive) the public components.
 unsafe impl HasPublic for Public {}
 
+// SAFETY: `HasPrivate` requires the public components to be set as well.
 unsafe impl<T> HasPublic for T where T: HasPrivate {}
 
 /// A trait indicating that a key has private components.
-#[allow(clippy::missing_safety_doc)]
+///
+/// # Safety
+///
+/// Implementors must ensure that every key typed with `Self` has its private
+/// components set (and therefore its public components, see [`HasPublic`]).
+/// Private accessors such as `RsaRef::d` convert the native pointers to
+/// references without null checks.
 pub unsafe trait HasPrivate {}
 
+// SAFETY: `Private` keys are only produced by generators and private-key
+// parsers, which set the private components and compute missing public ones.
 unsafe impl HasPrivate for Private {}
 
 generic_foreign_type_and_impl_send_sync! {
@@ -665,6 +689,46 @@ mod tests {
         })
         .unwrap();
         assert!(password_queried);
+    }
+
+    #[test]
+    fn password_callback_cannot_overstate_its_length() {
+        let key = PKey::private_key_from_pem(include_bytes!("../test/key.pem")).unwrap();
+        let pem = key
+            .private_key_to_pem_pkcs8_passphrase(Cipher::aes_256_cbc(), b"password")
+            .unwrap();
+
+        for oversize in [1, 1024 * 1024, usize::MAX] {
+            let result = PKey::private_key_from_pem_callback(&pem, |buf| {
+                buf[..8].copy_from_slice(b"password");
+                Ok(buf.len().saturating_add(oversize))
+            });
+            assert!(result.is_err());
+        }
+
+        let der = include_bytes!("../test/pkcs8.der");
+        assert!(PKey::private_key_from_pkcs8_callback(der, |buf| Ok(buf.len() + 1)).is_err());
+
+        // The exact buffer length is still accepted.
+        PKey::private_key_from_pem_callback(&pem, |buf| {
+            buf[..8].copy_from_slice(b"password");
+            Ok(8)
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn password_callback_buffer_is_initialized() {
+        let key = PKey::private_key_from_pem(include_bytes!("../test/key.pem")).unwrap();
+        let pem = key
+            .private_key_to_pem_pkcs8_passphrase(Cipher::aes_256_cbc(), b"password")
+            .unwrap();
+        let mut seen_nonzero = true;
+        let _ = PKey::private_key_from_pem_callback(&pem, |buf| {
+            seen_nonzero = buf.iter().any(|b| *b != 0);
+            Ok(0)
+        });
+        assert!(!seen_nonzero);
     }
 
     #[test]

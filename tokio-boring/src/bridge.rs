@@ -46,10 +46,17 @@ where
 {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         self.with_context(|ctx, stream| {
+            let start = buf.as_ptr();
             let mut buf = ReadBuf::new(buf);
 
             match stream.poll_read(ctx, &mut buf)? {
-                Poll::Ready(()) => Ok(buf.filled().len()),
+                // A `poll_read` impl may swap in a different `ReadBuf`; only
+                // bytes filled into our buffer count as read.
+                Poll::Ready(()) if buf.filled().as_ptr() == start => Ok(buf.filled().len()),
+                Poll::Ready(()) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "AsyncRead::poll_read replaced the read buffer",
+                )),
                 Poll::Pending => Err(io::Error::from(io::ErrorKind::WouldBlock)),
             }
         })

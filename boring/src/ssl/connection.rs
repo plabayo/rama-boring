@@ -795,9 +795,40 @@ impl SslRef {
 
     /// Frees the handshake configuration once the handshake completes, saving
     /// memory on long-lived connections. Disables renegotiation.
+    ///
+    /// Afterwards, configuration getters stop working: [`SslRef::ciphers`]
+    /// returns an empty stack and [`SslRef::verify_param_mut`] panics.
     #[corresponds(SSL_set_shed_handshake_config)]
     pub fn set_shed_handshake_config(&mut self, enabled: bool) {
+        if self.handshake_config_shed() {
+            // Already shed: there is no configuration left to change.
+            return;
+        }
         unsafe { ffi::SSL_set_shed_handshake_config(self.as_ptr(), enabled.into()) }
+        // BoringSSL has no query for "the configuration was shed", and its
+        // config getters `assert` (debug) or return NULL (release) afterwards,
+        // so remember the request on the Rust side.
+        self.set_ex_data(
+            super::Ssl::cached_ex_index::<ShedHandshakeConfig>(),
+            ShedHandshakeConfig(enabled),
+        );
+    }
+
+    /// Returns `true` if the handshake configuration may have been freed by
+    /// [`Self::set_shed_handshake_config`].
+    ///
+    /// # Safety-usable invariant
+    ///
+    /// When this returns `false`, the SSL's handshake configuration is present,
+    /// so `SSL_get_ciphers`, `SSL_get0_param` and similar getters return
+    /// non-null pointers. (It may conservatively return `true` while the
+    /// configuration still exists, e.g. when renegotiation keeps it alive.)
+    pub(crate) fn handshake_config_shed(&self) -> bool {
+        // BoringSSL only sheds once shedding was requested and the handshake is
+        // finished (`ssl_maybe_shed_handshake_config`).
+        self.ex_data(super::Ssl::cached_ex_index::<ShedHandshakeConfig>())
+            .is_some_and(|shed| shed.0)
+            && unsafe { ffi::SSL_in_init(self.as_ptr()) } == 0
     }
 
     /// Lets a server avoid a TLS 1.3 interoperability bug of JDK 11 clients.
@@ -871,3 +902,6 @@ impl SslRef {
 pub(super) fn session_context(ssl: &SslRef) -> Option<&SslContext> {
     ssl.ex_data(*SESSION_CTX_INDEX)
 }
+
+/// Whether `set_shed_handshake_config(true)` was requested for a connection.
+struct ShedHandshakeConfig(bool);

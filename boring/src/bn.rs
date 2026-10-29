@@ -183,7 +183,7 @@ impl BigNumRef {
     #[corresponds(BN_set_bit)]
     #[allow(clippy::useless_conversion)]
     pub fn set_bit(&mut self, n: i32) -> Result<(), ErrorStack> {
-        unsafe { cvt(ffi::BN_clear_bit(self.as_ptr(), n.into())) }
+        unsafe { cvt(ffi::BN_set_bit(self.as_ptr(), n.into())) }
     }
 
     /// Clears bit `n`, setting it to 0. Equivalent to `self &= ~(1 << n)`.
@@ -332,6 +332,15 @@ impl BigNumRef {
     #[corresponds(BN_rand)]
     #[allow(clippy::useless_conversion)]
     pub fn rand(&mut self, bits: i32, msb: MsbOption, odd: bool) -> Result<(), ErrorStack> {
+        // `BN_rand` does not reject a negative `bits`: it computes a zero word
+        // count and then writes to the word before `d`.
+        if bits < 0 {
+            return Err(ErrorStack::internal_error_str(
+                "BN_rand: bits must not be negative",
+            ));
+        }
+        // SAFETY: `self` is a valid, exclusively borrowed `BIGNUM` and
+        // `bits >= 0`, which `BN_rand` handles without out-of-bounds access.
         unsafe {
             cvt(ffi::BN_rand(
                 self.as_ptr(),
@@ -346,6 +355,15 @@ impl BigNumRef {
     #[corresponds(BN_pseudo_rand)]
     #[allow(clippy::useless_conversion)]
     pub fn pseudo_rand(&mut self, bits: i32, msb: MsbOption, odd: bool) -> Result<(), ErrorStack> {
+        // `BN_pseudo_rand` does not reject a negative `bits`: it computes a zero word
+        // count and then writes to the word before `d`.
+        if bits < 0 {
+            return Err(ErrorStack::internal_error_str(
+                "BN_pseudo_rand: bits must not be negative",
+            ));
+        }
+        // SAFETY: `self` is a valid, exclusively borrowed `BIGNUM` and
+        // `bits >= 0`, which `BN_pseudo_rand` handles without out-of-bounds access.
         unsafe {
             cvt(ffi::BN_pseudo_rand(
                 self.as_ptr(),
@@ -774,8 +792,9 @@ impl BigNumRef {
     #[corresponds(BN_bn2dec)]
     pub fn to_dec_str(&self) -> Result<OpensslString, ErrorStack> {
         unsafe {
-            let buf = cvt_p(ffi::BN_bn2dec(self.as_ptr()))?;
-            Ok(OpensslString::from_ptr(buf))
+            // SAFETY: `BN_bn2dec` returns null or an owned, NUL-terminated
+            // `OPENSSL_malloc`ed string; `from_c_ptr` checks it is UTF-8.
+            OpensslString::from_c_ptr(ffi::BN_bn2dec(self.as_ptr()))
         }
     }
 
@@ -790,8 +809,9 @@ impl BigNumRef {
     #[corresponds(BN_bn2hex)]
     pub fn to_hex_str(&self) -> Result<OpensslString, ErrorStack> {
         unsafe {
-            let buf = cvt_p(ffi::BN_bn2hex(self.as_ptr()))?;
-            Ok(OpensslString::from_ptr(buf))
+            // SAFETY: `BN_bn2hex` returns null or an owned, NUL-terminated
+            // `OPENSSL_malloc`ed string; `from_c_ptr` checks it is UTF-8.
+            OpensslString::from_c_ptr(ffi::BN_bn2hex(self.as_ptr()))
         }
     }
 
@@ -1125,7 +1145,7 @@ impl Neg for BigNum {
 
 #[cfg(test)]
 mod tests {
-    use crate::bn::{BigNum, BigNumContext};
+    use crate::bn::{BigNum, BigNumContext, MsbOption};
 
     #[test]
     fn test_to_from_slice() {
@@ -1176,5 +1196,28 @@ mod tests {
         let mut ctx = BigNumContext::new().unwrap();
         assert!(p.is_prime(100, &mut ctx).unwrap());
         assert!(p.is_prime_fasttest(100, &mut ctx, true).unwrap());
+    }
+
+    #[test]
+    fn rand_rejects_negative_bits() {
+        for mut bn in [BigNum::new().unwrap(), BigNum::from_u32(5).unwrap()] {
+            for bits in [-1, -64, -126, i32::MIN] {
+                assert!(bn.rand(bits, MsbOption::MAYBE_ZERO, false).is_err());
+                assert!(bn.pseudo_rand(bits, MsbOption::MAYBE_ZERO, true).is_err());
+            }
+            bn.rand(0, MsbOption::MAYBE_ZERO, false).unwrap();
+            assert_eq!(bn, BigNum::new().unwrap());
+        }
+    }
+
+    #[test]
+    fn set_bit_sets_and_clear_bit_clears() {
+        let mut bn = BigNum::new().unwrap();
+        bn.set_bit(5).unwrap();
+        assert!(bn.is_bit_set(5));
+        assert_eq!(bn, BigNum::from_u32(32).unwrap());
+        bn.clear_bit(5).unwrap();
+        assert!(!bn.is_bit_set(5));
+        assert!(bn.set_bit(-1).is_err());
     }
 }

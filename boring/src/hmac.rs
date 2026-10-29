@@ -1,9 +1,9 @@
 use openssl_macros::corresponds;
 
-use crate::cvt;
 use crate::error::ErrorStack;
 use crate::foreign_types::ForeignTypeRef;
 use crate::hash::MessageDigest;
+use crate::{cvt, cvt_p};
 
 foreign_type_and_impl_send_sync! {
     type CType = ffi::HMAC_CTX;
@@ -40,20 +40,23 @@ impl Hmac {
     pub fn init(key: &[u8], md: &MessageDigest) -> Result<Hmac, ErrorStack> {
         ffi::init();
 
-        let ctx = unsafe {
-            let ctx = ffi::HMAC_CTX_new();
+        // Wrap the context before initializing it so that it is freed when
+        // `HMAC_Init_ex` fails, and refuse a null context on allocation failure.
+        let hmac = Hmac(cvt_p(unsafe { ffi::HMAC_CTX_new() })?);
+        // SAFETY: `hmac.0` is a non-null context owned by `hmac`, `key` is
+        // valid for `key.len()` bytes and `md` is a static `EVP_MD`.
+        unsafe {
             cvt(ffi::HMAC_Init_ex(
-                ctx,
+                hmac.0,
                 key.as_ptr().cast(),
                 key.len(),
                 md.as_ptr(),
                 // ENGINE api is deprecated
                 core::ptr::null_mut(),
             ))?;
-            ctx
-        };
+        }
 
-        Ok(Hmac(ctx))
+        Ok(hmac)
     }
 
     /// Updates the HMAC input.

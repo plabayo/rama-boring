@@ -95,8 +95,12 @@ macro_rules! to_der {
                 let len = crate::cvt_nz($f(::foreign_types::ForeignTypeRef::as_ptr(self),
                                         ptr::null_mut()))?;
                 let mut buf = vec![0; len.get()];
-                crate::cvt($f(::foreign_types::ForeignTypeRef::as_ptr(self),
+                // `i2d_*` writes the same number of bytes it reported above:
+                // the object is not mutated in between (the encoders reachable
+                // here only read, and `self` is borrowed).
+                let written = crate::cvt_nz($f(::foreign_types::ForeignTypeRef::as_ptr(self),
                               &mut buf.as_mut_ptr()))?;
+                assert_eq!(written.get(), buf.len(), "i2d length changed between calls");
                 Ok(buf)
             }
         }
@@ -131,6 +135,16 @@ macro_rules! from_pem {
     }
 }
 
+/// Declares an owned/borrowed pair for a native type and implements `Send` and
+/// `Sync` for both.
+///
+/// Safety contract for every use: the native object must be safe to move
+/// between threads, and every method reachable through `&$owned` / `&$borrowed`
+/// must only read native state that no other `&` method writes (or the native
+/// library must synchronize it). Methods that mutate native state take `&mut`.
+/// Methods that cannot meet this must be `unsafe` (e.g.
+/// `X509StoreRef::objects`) or take `&mut self` (e.g.
+/// `SslRef::set_enable_ech_grease`).
 macro_rules! foreign_type_and_impl_send_sync {
     (
         $(#[$impl_attr:meta])*
@@ -154,6 +168,8 @@ macro_rules! foreign_type_and_impl_send_sync {
         };
 }
 
+/// Generic variant of `foreign_type_and_impl_send_sync!`; the same safety
+/// contract applies to every instantiation.
 macro_rules! generic_foreign_type_and_impl_send_sync {
     (
         $(#[$impl_attr:meta])*

@@ -154,18 +154,28 @@ impl Clone for X509Store {
 }
 
 impl X509StoreRef {
-    /// **Warning: this method is unsound**
-    ///
     /// Get a reference to the cache of certificates in this store.
     ///
+    /// BoringSSL reads this cache without its internal lock and modifies it
+    /// while verifying (for example the `by_dir` lookup installed by
+    /// `set_default_paths` inserts and sorts entries), so the returned
+    /// reference can dangle or race.
+    ///
     /// # Safety
-    /// References may be invalidated by any access to the shared cache.
+    ///
+    /// For as long as the returned reference is used, the caller must ensure
+    /// that nothing modifies the store's object cache: no certificate
+    /// verification uses this store, and no certificates or CRLs are added to
+    /// it, on any thread.
     #[deprecated(
         note = "This method is unsound https://github.com/sfackler/rust-openssl/issues/2096"
     )]
     #[corresponds(X509_STORE_get0_objects)]
     #[must_use]
-    pub fn objects(&self) -> &StackRef<X509Object> {
+    pub unsafe fn objects(&self) -> &StackRef<X509Object> {
+        // SAFETY: `X509_STORE_get0_objects` returns the store's non-null object
+        // stack, owned by the store; the caller guarantees it is not modified
+        // while the reference is used (`# Safety`).
         unsafe { StackRef::from_ptr(ffi::X509_STORE_get0_objects(self.as_ptr())) }
     }
 
@@ -174,7 +184,9 @@ impl X509StoreRef {
     #[allow(deprecated)]
     #[must_use]
     pub fn objects_len(&self) -> usize {
-        self.objects().len()
+        // SAFETY: tests only call this while no other thread uses the store,
+        // and the reference does not outlive this call.
+        unsafe { self.objects().len() }
     }
 }
 

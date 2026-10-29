@@ -67,6 +67,29 @@ jobs:
         env:
           DOCS_RS: 1
 
+  semver-checks:
+    permissions:
+      contents: read
+    name: semver-checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          submodules: "recursive"
+      # Compares the public API against the latest release on crates.io and
+      # fails if a breaking change is not matched by a major (0.x minor)
+      # version bump.
+      - name: Check semver
+        uses: obi1kenobi/cargo-semver-checks-action@6b69fcf40e9b5fb17adeb57e4b6ecd020649a239 # v2.9
+        with:
+          # rama-boring-sys is left out: its symbol prefix leaks the crate
+          # version into one bindgen type name
+          # (`rama_boring_<version>_ssl_session_st`), so every release would
+          # be reported as breaking.
+          package: rama-boring, rama-boring-tokio
+          rust-toolchain: stable
+
   test:
     permissions:
       contents: read

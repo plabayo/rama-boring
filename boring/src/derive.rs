@@ -12,6 +12,9 @@ use crate::{cvt, cvt_p};
 /// A type used to derive a shared secret between two keys.
 pub struct Deriver<'a>(*mut ffi::EVP_PKEY_CTX, PhantomData<&'a ()>);
 
+// SAFETY: `Deriver` owns its `EVP_PKEY_CTX` (which holds its own reference to
+// the key) and has no `&self` methods that touch it, so moving it across
+// threads or sharing `&Deriver` cannot race on native state.
 unsafe impl Sync for Deriver<'_> {}
 unsafe impl Send for Deriver<'_> {}
 

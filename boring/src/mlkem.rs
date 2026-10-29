@@ -228,7 +228,10 @@ impl MlKem768PrivateKey {
             ffi::init();
             let mut bytes = [0; MlKem768PublicKey::PUBLIC_KEY_BYTES];
             let mut seed = [0; PRIVATE_KEY_SEED_BYTES];
-            let mut expanded: MaybeUninit<ffi::MLKEM768_private_key> = MaybeUninit::uninit();
+            // SAFETY: start zeroed so `assume_init` below does not depend on the
+            // C code writing every byte of the opaque key struct (its header only
+            // promises the struct is large enough).
+            let mut expanded: MaybeUninit<ffi::MLKEM768_private_key> = MaybeUninit::zeroed();
 
             ffi::MLKEM768_generate_key(
                 bytes.as_mut_ptr().cast(),
@@ -251,7 +254,10 @@ impl MlKem768PrivateKey {
         // SAFETY: seed is 64 bytes, out parameter correctly sized
         unsafe {
             ffi::init();
-            let mut expanded: MaybeUninit<ffi::MLKEM768_private_key> = MaybeUninit::uninit();
+            // SAFETY: start zeroed so `assume_init` below does not depend on the
+            // C code writing every byte of the opaque key struct (its header only
+            // promises the struct is large enough).
+            let mut expanded: MaybeUninit<ffi::MLKEM768_private_key> = MaybeUninit::zeroed();
             cvt(ffi::MLKEM768_private_key_from_seed(
                 expanded.as_mut_ptr(),
                 seed.as_ptr(),
@@ -270,7 +276,10 @@ impl MlKem768PrivateKey {
         // SAFETY: expanded key is valid, buffers correctly sized
         unsafe {
             ffi::init();
-            let mut parsed: MaybeUninit<ffi::MLKEM768_public_key> = MaybeUninit::uninit();
+            // SAFETY: start zeroed so `assume_init` below does not depend on the
+            // C code writing every byte of the opaque key struct (its header only
+            // promises the struct is large enough).
+            let mut parsed: MaybeUninit<ffi::MLKEM768_public_key> = MaybeUninit::zeroed();
             ffi::MLKEM768_public_from_private(parsed.as_mut_ptr(), &self.expanded);
 
             let mut bytes = [0u8; MlKem768PublicKey::PUBLIC_KEY_BYTES];
@@ -354,7 +363,10 @@ impl MlKem768PublicKey {
         unsafe {
             ffi::init();
             let mut cbs = cbs_init(slice);
-            let mut parsed: MaybeUninit<ffi::MLKEM768_public_key> = MaybeUninit::uninit();
+            // SAFETY: start zeroed so `assume_init` below does not depend on the
+            // C code writing every byte of the opaque key struct (its header only
+            // promises the struct is large enough).
+            let mut parsed: MaybeUninit<ffi::MLKEM768_public_key> = MaybeUninit::zeroed();
 
             cvt(ffi::MLKEM768_parse_public_key(
                 parsed.as_mut_ptr(),
@@ -433,7 +445,10 @@ impl MlKem1024PrivateKey {
             ffi::init();
             let mut bytes = [0; MlKem1024PublicKey::PUBLIC_KEY_BYTES];
             let mut seed = [0; PRIVATE_KEY_SEED_BYTES];
-            let mut expanded: MaybeUninit<ffi::MLKEM1024_private_key> = MaybeUninit::uninit();
+            // SAFETY: start zeroed so `assume_init` below does not depend on the
+            // C code writing every byte of the opaque key struct (its header only
+            // promises the struct is large enough).
+            let mut expanded: MaybeUninit<ffi::MLKEM1024_private_key> = MaybeUninit::zeroed();
 
             ffi::MLKEM1024_generate_key(
                 bytes.as_mut_ptr().cast(),
@@ -456,7 +471,10 @@ impl MlKem1024PrivateKey {
         // SAFETY: seed is 64 bytes, out parameter correctly sized
         unsafe {
             ffi::init();
-            let mut expanded: MaybeUninit<ffi::MLKEM1024_private_key> = MaybeUninit::uninit();
+            // SAFETY: start zeroed so `assume_init` below does not depend on the
+            // C code writing every byte of the opaque key struct (its header only
+            // promises the struct is large enough).
+            let mut expanded: MaybeUninit<ffi::MLKEM1024_private_key> = MaybeUninit::zeroed();
             cvt(ffi::MLKEM1024_private_key_from_seed(
                 expanded.as_mut_ptr(),
                 seed.as_ptr(),
@@ -475,7 +493,10 @@ impl MlKem1024PrivateKey {
         // SAFETY: expanded key is valid, buffers correctly sized
         unsafe {
             ffi::init();
-            let mut parsed: MaybeUninit<ffi::MLKEM1024_public_key> = MaybeUninit::uninit();
+            // SAFETY: start zeroed so `assume_init` below does not depend on the
+            // C code writing every byte of the opaque key struct (its header only
+            // promises the struct is large enough).
+            let mut parsed: MaybeUninit<ffi::MLKEM1024_public_key> = MaybeUninit::zeroed();
             ffi::MLKEM1024_public_from_private(parsed.as_mut_ptr(), &self.expanded);
 
             let mut bytes = [0u8; MlKem1024PublicKey::PUBLIC_KEY_BYTES];
@@ -561,7 +582,10 @@ impl MlKem1024PublicKey {
         unsafe {
             ffi::init();
             let mut cbs = cbs_init(slice);
-            let mut parsed: MaybeUninit<ffi::MLKEM1024_public_key> = MaybeUninit::uninit();
+            // SAFETY: start zeroed so `assume_init` below does not depend on the
+            // C code writing every byte of the opaque key struct (its header only
+            // promises the struct is large enough).
+            let mut parsed: MaybeUninit<ffi::MLKEM1024_public_key> = MaybeUninit::zeroed();
 
             cvt(ffi::MLKEM1024_parse_public_key(
                 parsed.as_mut_ptr(),

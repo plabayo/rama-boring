@@ -66,6 +66,109 @@ foreign_type_and_impl_send_sync! {
 }
 
 impl X509StoreContext {
+    /// Initializes this context with the given certificate, certificates chain and certificate
+    /// store. After initializing the context, the `with_context` closure is called with the prepared
+    /// context. As long as the closure is running, the context stays initialized and can be used
+    /// to e.g. verify a certificate. The context will be cleaned up, after the closure finished.
+    ///
+    /// * `trust` - The certificate store with the trusted certificates.
+    /// * `cert` - The certificate that should be verified.
+    /// * `cert_chain` - The certificates chain.
+    /// * `with_context` - The closure that is called with the initialized context.
+    ///
+    /// Calls [`X509_STORE_CTX_cleanup`] after calling `with_context`.
+    ///
+    /// [`X509_STORE_CTX_cleanup`]:  https://www.openssl.org/docs/man1.0.2/crypto/X509_STORE_CTX_cleanup.html
+    ///
+    /// This is only available on the owned context, not on the
+    /// `X509StoreContextRef` handed to verify callbacks, where re-initializing
+    /// would free state the running verification still uses:
+    ///
+    /// ```compile_fail
+    /// # use rama_boring::x509::{X509StoreContextRef, X509Ref, store::X509StoreRef};
+    /// # use rama_boring::stack::StackRef;
+    /// fn reinit(ctx: &mut X509StoreContextRef, s: &X509StoreRef, c: &X509Ref, ch: &StackRef<rama_boring::x509::X509>) {
+    ///     let _ = ctx.init(s, c, ch, |_| Ok(()));
+    /// }
+    /// ```
+    #[corresponds(X509_STORE_CTX_init)]
+    pub fn init<F, T>(
+        &mut self,
+        trust: &store::X509StoreRef,
+        cert: &X509Ref,
+        cert_chain: &StackRef<X509>,
+        with_context: F,
+    ) -> Result<T, ErrorStack>
+    where
+        F: FnOnce(&mut X509StoreContextRef) -> Result<T, ErrorStack>,
+    {
+        struct Cleanup<'a>(&'a mut X509StoreContextRef);
+
+        impl Drop for Cleanup<'_> {
+            fn drop(&mut self) {
+                unsafe {
+                    ffi::X509_STORE_CTX_cleanup(self.0.as_ptr());
+                }
+            }
+        }
+
+        // SAFETY: `X509StoreContext` is the owned context, which is never the
+        // one BoringSSL is verifying with while running a callback (callbacks
+        // only receive `&mut X509StoreContextRef`), so re-initializing it here
+        // cannot free state an in-progress `X509_verify_cert` still uses.
+        // `trust`, `cert` and `cert_chain` are borrowed for the whole
+        // initialized period, which ends with the cleanup in `Cleanup::drop`.
+        unsafe {
+            let cleanup = Cleanup(self);
+
+            cvt(ffi::X509_STORE_CTX_init(
+                cleanup.0.as_ptr(),
+                trust.as_ptr(),
+                cert.as_ptr(),
+                cert_chain.as_ptr(),
+            ))?;
+
+            with_context(cleanup.0)
+        }
+    }
+
+    /// Initializes this context with the given certificate, certificates chain and certificate
+    /// store.
+    ///
+    /// * `trust` - The certificate store with the trusted certificates.
+    /// * `cert` - The certificate that should be verified.
+    /// * `cert_chain` - The certificates chain.
+    #[corresponds(X509_STORE_CTX_init)]
+    pub fn reset_with_context_data(
+        &mut self,
+        trust: store::X509Store,
+        cert: X509,
+        cert_chain: Stack<X509>,
+    ) -> Result<(), ErrorStack> {
+        // SAFETY: as in `init`, this owned context is not the one a running
+        // `X509_verify_cert` uses. `trust`, `cert` and `cert_chain` are kept
+        // alive in this context's ex_data below, for as long as the context
+        // references them.
+        unsafe {
+            if let Err(e) = cvt(ffi::X509_STORE_CTX_init(
+                self.as_ptr(),
+                trust.as_ptr(),
+                cert.as_ptr(),
+                cert_chain.as_ptr(),
+            )) {
+                ffi::X509_STORE_CTX_cleanup(self.as_ptr());
+
+                return Err(e);
+            }
+        }
+
+        self.set_ex_data(*STORE_INDEX, trust);
+        self.set_ex_data(*CERT_INDEX, cert);
+        self.set_ex_data(*CERT_CHAIN_INDEX, cert_chain);
+
+        Ok(())
+    }
+
     /// Returns the index which can be used to obtain a reference to the `Ssl` associated with a
     /// context.
     #[corresponds(SSL_get_ex_data_X509_STORE_CTX_idx)]
@@ -112,8 +215,22 @@ impl X509StoreContextRef {
     }
 
     /// Returns a mutable reference to the extra data at the specified index.
+    ///
+    /// Always returns `None` for [`X509StoreContext::ssl_idx`]: the SSL
+    /// connection being verified is already mutably borrowed by the handshake
+    /// that runs the verification, so only shared access ([`Self::ex_data`])
+    /// is given out for it.
     #[corresponds(X509_STORE_CTX_get_ex_data)]
     pub fn ex_data_mut<T>(&mut self, index: Index<X509StoreContext, T>) -> Option<&mut T> {
+        // A `&mut SslRef` here would alias the handshake's own `&mut` to the
+        // connection and lets user code switch its context (freeing the
+        // running callback or the store being verified against).
+        if Some(index.as_raw()) == X509StoreContext::ssl_idx().ok().map(|idx| idx.as_raw()) {
+            return None;
+        }
+        // SAFETY: indices are typed: a safe `Index<X509StoreContext, T>` only
+        // comes from `new_ex_index::<T>`, whose slot only ever holds a boxed
+        // `T` set by `set_ex_data`. `self` is exclusively borrowed.
         unsafe {
             ffi::X509_STORE_CTX_get_ex_data(self.as_ptr(), index.as_raw())
                 .cast::<T>()
@@ -150,102 +267,66 @@ impl X509StoreContextRef {
         unsafe { X509VerifyError::from_raw(ffi::X509_STORE_CTX_get_error(self.as_ptr())) }
     }
 
-    /// Initializes this context with the given certificate, certificates chain and certificate
-    /// store. After initializing the context, the `with_context` closure is called with the prepared
-    /// context. As long as the closure is running, the context stays initialized and can be used
-    /// to e.g. verify a certificate. The context will be cleaned up, after the closure finished.
-    ///
-    /// * `trust` - The certificate store with the trusted certificates.
-    /// * `cert` - The certificate that should be verified.
-    /// * `cert_chain` - The certificates chain.
-    /// * `with_context` - The closure that is called with the initialized context.
-    ///
-    /// Calls [`X509_STORE_CTX_cleanup`] after calling `with_context`.
-    ///
-    /// [`X509_STORE_CTX_cleanup`]:  https://www.openssl.org/docs/man1.0.2/crypto/X509_STORE_CTX_cleanup.html
-    #[corresponds(X509_STORE_CTX_init)]
-    pub fn init<F, T>(
-        &mut self,
-        trust: &store::X509StoreRef,
-        cert: &X509Ref,
-        cert_chain: &StackRef<X509>,
-        with_context: F,
-    ) -> Result<T, ErrorStack>
-    where
-        F: FnOnce(&mut X509StoreContextRef) -> Result<T, ErrorStack>,
-    {
-        struct Cleanup<'a>(&'a mut X509StoreContextRef);
-
-        impl Drop for Cleanup<'_> {
-            fn drop(&mut self) {
-                unsafe {
-                    ffi::X509_STORE_CTX_cleanup(self.0.as_ptr());
-                }
-            }
-        }
-
-        unsafe {
-            let cleanup = Cleanup(self);
-
-            cvt(ffi::X509_STORE_CTX_init(
-                cleanup.0.as_ptr(),
-                trust.as_ptr(),
-                cert.as_ptr(),
-                cert_chain.as_ptr(),
-            ))?;
-
-            with_context(cleanup.0)
-        }
-    }
-
-    /// Initializes this context with the given certificate, certificates chain and certificate
-    /// store.
-    ///
-    /// * `trust` - The certificate store with the trusted certificates.
-    /// * `cert` - The certificate that should be verified.
-    /// * `cert_chain` - The certificates chain.
-    #[corresponds(X509_STORE_CTX_init)]
-    pub fn reset_with_context_data(
-        &mut self,
-        trust: store::X509Store,
-        cert: X509,
-        cert_chain: Stack<X509>,
-    ) -> Result<(), ErrorStack> {
-        unsafe {
-            if let Err(e) = cvt(ffi::X509_STORE_CTX_init(
-                self.as_ptr(),
-                trust.as_ptr(),
-                cert.as_ptr(),
-                cert_chain.as_ptr(),
-            )) {
-                ffi::X509_STORE_CTX_cleanup(self.as_ptr());
-
-                return Err(e);
-            }
-        }
-
-        self.set_ex_data(*STORE_INDEX, trust);
-        self.set_ex_data(*CERT_INDEX, cert);
-        self.set_ex_data(*CERT_CHAIN_INDEX, cert_chain);
-
-        Ok(())
-    }
-
     /// Returns a reference to the X509 verification configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the context has no verification configuration, which is the
+    /// case before [`X509StoreContext::init`] and after it returns.
     #[corresponds(X509_STORE_CTX_get0_param)]
     pub fn verify_param(&mut self) -> &X509VerifyParamRef {
-        unsafe { X509VerifyParamRef::from_ptr(ffi::X509_STORE_CTX_get0_param(self.as_ptr())) }
+        let param = self.param_ptr();
+        // SAFETY: `param` is non-null and owned by this context, which outlives
+        // the returned borrow of `self`.
+        unsafe { X509VerifyParamRef::from_ptr(param) }
     }
 
     /// Returns a mutable reference to the X509 verification configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the context has no verification configuration, which is the
+    /// case before [`X509StoreContext::init`] and after it returns.
     #[corresponds(X509_STORE_CTX_get0_param)]
     pub fn verify_param_mut(&mut self) -> &mut X509VerifyParamRef {
-        unsafe { X509VerifyParamRef::from_ptr_mut(ffi::X509_STORE_CTX_get0_param(self.as_ptr())) }
+        let param = self.param_ptr();
+        // SAFETY: `param` is non-null and owned by this context; the exclusive
+        // borrow of `self` rules out any other Rust access to it.
+        unsafe { X509VerifyParamRef::from_ptr_mut(param) }
+    }
+
+    /// Returns the context's non-null `X509_VERIFY_PARAM`, or panics.
+    fn param_ptr(&self) -> *mut ffi::X509_VERIFY_PARAM {
+        // `X509_STORE_CTX_new` leaves `param` null until `X509_STORE_CTX_init`,
+        // and `X509_STORE_CTX_cleanup` resets it to null.
+        let param = unsafe { ffi::X509_STORE_CTX_get0_param(self.as_ptr()) };
+        assert!(
+            !param.is_null(),
+            "X509StoreContext has no verify param: it is not initialized"
+        );
+        param
     }
 
     /// Sets the X509 verification configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics once certificate verification has started on this context (for
+    /// example inside a verify callback): `X509_verify_cert` keeps using the
+    /// configuration it started with, so it cannot be replaced then. Use
+    /// [`Self::verify_param_mut`] to adjust it instead.
     #[corresponds(X509_STORE_CTX_set0_param)]
     pub fn set_verify_param(&mut self, param: X509VerifyParam) {
+        // `X509_verify_cert` builds `chain` first and holds on to the current
+        // `param` (e.g. in `check_id`) across verify callbacks; `set0` would
+        // free that param under it.
+        let verifying = unsafe { !ffi::X509_STORE_CTX_get0_chain(self.as_ptr()).is_null() };
+        assert!(
+            !verifying,
+            "set_verify_param: cannot replace the verify param once verification has started"
+        );
+        // SAFETY: no verification is in progress on this context, so nothing
+        // holds the old param; ownership of `param` moves to the context.
         unsafe { ffi::X509_STORE_CTX_set0_param(self.as_ptr(), param.into_ptr()) }
     }
 
@@ -758,9 +839,35 @@ impl X509Ref {
 
     /// Returns the list of OCSP responder URLs specified in the certificate's Authority Information
     /// Access field.
+    ///
+    /// Entries that are not valid UTF-8 are skipped: BoringSSL does not check
+    /// the encoding of the IA5String URLs, and the certificate may come from
+    /// an untrusted peer.
     #[corresponds(X509_get1_ocsp)]
     pub fn ocsp_responders(&self) -> Result<Stack<OpensslString>, ErrorStack> {
-        unsafe { cvt_p(ffi::X509_get1_ocsp(self.as_ptr())).map(|p| Stack::from_ptr(p)) }
+        // SAFETY: `X509_get1_ocsp` returns null or a new `STACK_OF(OPENSSL_STRING)`
+        // that the caller owns, as are the NUL-terminated `OPENSSL_malloc`ed
+        // strings in it. Each string is moved out exactly once (into
+        // `from_c_ptr`, which frees it if it is not UTF-8), and then only the
+        // stack itself is freed.
+        unsafe {
+            let raw = cvt_p(ffi::X509_get1_ocsp(self.as_ptr()))?;
+            let raw = raw.cast::<ffi::_STACK>();
+            let mut strings = Vec::with_capacity(ffi::sk_num(raw));
+            for i in 0..ffi::sk_num(raw) {
+                strings.push(ffi::sk_value(raw, i).cast::<std::ffi::c_char>());
+            }
+            ffi::sk_free(raw);
+
+            let mut out = Stack::new();
+            for ptr in strings {
+                let string = OpensslString::from_c_ptr(ptr);
+                if let (Ok(out), Ok(string)) = (&mut out, string) {
+                    out.push(string)?;
+                }
+            }
+            out
+        }
     }
 
     /// Checks that this certificate issued `subject`.

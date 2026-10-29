@@ -107,6 +107,7 @@ use crate::ssl::callbacks::*;
 use crate::ssl::error::InnerError;
 use crate::stack::{Stack, StackRef, Stackable};
 use crate::symm::CipherCtxRef;
+use crate::util::slice_or_empty;
 use crate::x509::store::{X509Store, X509StoreBuilder, X509StoreBuilderRef, X509StoreRef};
 use crate::x509::verify::X509VerifyParamRef;
 use crate::x509::{
@@ -380,6 +381,7 @@ impl SslMethod {
     }
 }
 
+// SAFETY: `SslMethod` wraps a pointer to a static, immutable `SSL_METHOD`.
 unsafe impl Sync for SslMethod {}
 unsafe impl Send for SslMethod {}
 
@@ -1252,7 +1254,7 @@ impl SslContextBuilder {
     /// prior to TLS 1.3, retroactively decrypt all application traffic from sessions using that
     /// ticket key. Thus ticket keys must be regularly rotated for forward secrecy.
     ///
-    /// CipherCtx and HmacCtx are guaranteed to be initialized.
+    /// The `CipherCtx` and `HmacCtx` handed to the callback are allocated but not keyed.
     ///
     /// # Panics
     ///
@@ -1260,8 +1262,13 @@ impl SslContextBuilder {
     ///
     /// # Safety
     ///
-    /// The application is responsible for correctly setting the key_name, iv, encryption context
-    /// and hmac context. See the [`SSL_CTX_set_tlsext_ticket_key_cb`] docs for additional info.
+    /// The caller must ensure that whenever the callback returns a success result
+    /// (anything other than failure or "no key"), it has fully written `key_name` and `iv` and
+    /// initialized both the cipher context (`EVP_EncryptInit_ex`/`EVP_DecryptInit_ex` with a
+    /// cipher and key) and the HMAC context (`HMAC_Init_ex` with a digest and key). BoringSSL
+    /// uses both contexts unconditionally after a success result; an unkeyed context has no
+    /// cipher or digest and is dereferenced as NULL. See the [`SSL_CTX_set_tlsext_ticket_key_cb`]
+    /// docs for additional info.
     ///
     /// [`SSL_CTX_set_tlsext_ticket_key_cb`]: https://commondatastorage.googleapis.com/chromium-boringssl-docs/ssl.h.html#SSL_CTX_set_tlsext_ticket_key_cb
     #[corresponds(SSL_CTX_set_tlsext_ticket_key_cb)]
@@ -1840,14 +1847,16 @@ impl SslContextBuilder {
         unsafe {
             self.replace_ex_data(SslContext::cached_ex_index::<M>(), method);
 
-            ffi::SSL_CTX_set_private_key_method(
-                self.as_ptr(),
-                &ffi::SSL_PRIVATE_KEY_METHOD {
-                    sign: Some(callbacks::raw_sign::<M>),
-                    decrypt: Some(callbacks::raw_decrypt::<M>),
-                    complete: Some(callbacks::raw_complete::<M>),
-                },
-            );
+            // BoringSSL keeps this pointer for the lifetime of the context or
+            // credential (ssl.h), so the table must be `'static`. The explicit
+            // annotation makes the compiler prove it via constant promotion.
+            let method_table: &'static ffi::SSL_PRIVATE_KEY_METHOD = &ffi::SSL_PRIVATE_KEY_METHOD {
+                sign: Some(callbacks::raw_sign::<M>),
+                decrypt: Some(callbacks::raw_decrypt::<M>),
+                complete: Some(callbacks::raw_complete::<M>),
+            };
+
+            ffi::SSL_CTX_set_private_key_method(self.as_ptr(), method_table);
         }
     }
 
@@ -1915,7 +1924,11 @@ impl SslContextBuilder {
     ///
     /// The callback will be called with the SSL context, an identity hint if one was provided
     /// by the server, a mutable slice for each of the identity and pre-shared key bytes. The
-    /// identity must be written as a null-terminated C string.
+    /// identity must be written as a null-terminated C string. Both slices start zeroed, and the
+    /// identity slice excludes the final terminator byte, so the identity is always terminated.
+    ///
+    /// The callback returns the length of the pre-shared key it wrote. A length larger than the
+    /// key slice fails the handshake.
     #[corresponds(SSL_CTX_set_psk_client_callback)]
     pub fn set_psk_client_callback<F>(&mut self, callback: F)
     where
@@ -2571,6 +2584,21 @@ pub struct CipherBits {
     pub algorithm: i32,
 }
 
+/// An empty `STACK_OF(SSL_CIPHER)`, returned when an SSL no longer has a
+/// cipher list.
+fn empty_cipher_stack() -> &'static StackRef<SslCipher> {
+    // Safety invariant: the stack is created once, never mutated and never
+    // freed, so sharing references to it across threads is sound.
+    struct EmptyStack(Stack<SslCipher>);
+    unsafe impl Send for EmptyStack {}
+    unsafe impl Sync for EmptyStack {}
+
+    static EMPTY: LazyLock<EmptyStack> = LazyLock::new(|| {
+        EmptyStack(Stack::new().expect("failed to allocate an empty cipher stack"))
+    });
+    &EMPTY.0
+}
+
 #[repr(transparent)]
 pub struct ClientHello<'ssl>(&'ssl ffi::SSL_CLIENT_HELLO);
 
@@ -2587,7 +2615,10 @@ impl ClientHello<'_> {
             if result == 0 {
                 return None;
             }
-            Some(slice::from_raw_parts(ptr, len))
+            // SAFETY: on success `ptr`/`len` describe the extension body inside
+            // the ClientHello buffer, which outlives `self`. An empty body may
+            // be represented by any pointer, so use the null-tolerant helper.
+            Some(slice_or_empty(ptr, len))
         }
     }
 
@@ -2620,25 +2651,33 @@ impl ClientHello<'_> {
 
     /// Returns the raw data of the client hello message
     pub fn as_bytes(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.0.client_hello, self.0.client_hello_len) }
+        // SAFETY: the `SSL_CLIENT_HELLO` fields describe buffers owned by the
+        // handshake for at least the lifetime of `self`. Empty fields may be
+        // null (e.g. `extensions` when the ClientHello has none), which
+        // `slice_or_empty` maps to `&[]`.
+        unsafe { slice_or_empty(self.0.client_hello, self.0.client_hello_len) }
     }
 
     /// Returns the client random data
     #[must_use]
     pub fn random(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.0.random, self.0.random_len) }
+        // SAFETY: see `as_bytes`.
+        unsafe { slice_or_empty(self.0.random, self.0.random_len) }
     }
 
     /// Returns the raw list of ciphers supported by the client in its Client Hello record.
     #[must_use]
     pub fn ciphers(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.0.cipher_suites, self.0.cipher_suites_len) }
+        // SAFETY: see `as_bytes`.
+        unsafe { slice_or_empty(self.0.cipher_suites, self.0.cipher_suites_len) }
     }
 
     /// Returns the raw encoded ClientHello extension block.
     #[must_use]
     pub fn extensions(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(self.0.extensions, self.0.extensions_len) }
+        // SAFETY: see `as_bytes`; `extensions` is null when the ClientHello
+        // carries no extensions block.
+        unsafe { slice_or_empty(self.0.extensions, self.0.extensions_len) }
     }
 }
 
@@ -2693,6 +2732,7 @@ impl Deref for SslCipher {
 /// [`SslCipher`]: struct.SslCipher.html
 pub struct SslCipherRef(Opaque);
 
+// SAFETY: `SSL_CIPHER` values are static and immutable.
 unsafe impl Send for SslCipherRef {}
 unsafe impl Sync for SslCipherRef {}
 
@@ -3413,13 +3453,26 @@ impl SslRef {
     }
 
     /// Returns the stack of available SslCiphers for `SSL`, sorted by preference.
+    ///
+    /// Returns an empty stack once the handshake configuration has been shed
+    /// (see [`SslRef::set_shed_handshake_config`]).
     #[corresponds(SSL_get_ciphers)]
     #[must_use]
     pub fn ciphers(&self) -> &StackRef<SslCipher> {
-        unsafe {
-            let cipher_list = ffi::SSL_get_ciphers(self.as_ptr());
-            StackRef::from_ptr(cipher_list)
+        // `SSL_get_ciphers` asserts (debug) or returns NULL (release) once the
+        // configuration is shed, so it must not be called then.
+        if self.handshake_config_shed() {
+            return empty_cipher_stack();
         }
+        let cipher_list = unsafe { ffi::SSL_get_ciphers(self.as_ptr()) };
+        if cipher_list.is_null() {
+            return empty_cipher_stack();
+        }
+        // SAFETY: `cipher_list` is a non-null `STACK_OF(SSL_CIPHER)` owned by
+        // the SSL's configuration (or context), which is not freed while `self`
+        // is borrowed (shedding happens inside handshake calls that need
+        // `&mut self`).
+        unsafe { StackRef::from_ptr(cipher_list) }
     }
 
     /// Returns the current cipher if the session is active.
@@ -3809,10 +3862,28 @@ impl SslRef {
     }
 
     /// Returns a mutable reference to the X509 verification configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the handshake configuration has been shed (see
+    /// [`SslRef::set_shed_handshake_config`]); there is no configuration to
+    /// return then.
     #[corresponds(SSL_get0_param)]
     pub fn verify_param_mut(&mut self) -> &mut X509VerifyParamRef {
         self.ssl_context().check_x509();
-        unsafe { X509VerifyParamRef::from_ptr_mut(ffi::SSL_get0_param(self.as_ptr())) }
+        assert!(
+            !self.handshake_config_shed(),
+            "verify_param_mut: the handshake configuration has been shed"
+        );
+        let param = unsafe { ffi::SSL_get0_param(self.as_ptr()) };
+        assert!(
+            !param.is_null(),
+            "verify_param_mut: the handshake configuration has been shed"
+        );
+        // SAFETY: `param` is non-null and owned by the SSL's configuration;
+        // the exclusive borrow of `self` prevents any other access to it, and
+        // the configuration is only shed by handshake calls needing `&mut self`.
+        unsafe { X509VerifyParamRef::from_ptr_mut(param) }
     }
 
     /// See [`Self::verify_param_mut`].
@@ -3971,8 +4042,8 @@ impl SslRef {
     /// This can be used to provide data to callbacks registered with the context. Use the
     /// `Ssl::new_ex_index` method to create an `Index`.
     ///
-    /// Note that if this method is called multiple times with the same index, any previous
-    /// value stored in the `SslContextBuilder` will be leaked.
+    /// If this method is called multiple times with the same index, the previous value is
+    /// dropped and replaced.
     #[corresponds(SSL_set_ex_data)]
     pub fn set_ex_data<T>(&mut self, index: Index<Ssl, T>, data: T) {
         if let Some(old) = self.ex_data_mut(index) {
@@ -4334,9 +4405,11 @@ impl SslRef {
     /// Defaults to disabled. [`ClientHelloShape::set_ech_grease`] optionally
     /// controls its algorithms and lengths without enabling it.
     #[corresponds(SSL_set_enable_ech_grease)]
-    pub fn set_enable_ech_grease(&self, enable: bool) {
+    pub fn set_enable_ech_grease(&mut self, enable: bool) {
         let enable = if enable { 1 } else { 0 };
 
+        // SAFETY: `self` is exclusively borrowed, so this write to the SSL's
+        // configuration cannot race with any other access to it.
         unsafe {
             ffi::SSL_set_enable_ech_grease(self.as_ptr(), enable);
         }
@@ -4550,7 +4623,14 @@ impl<S: Read + Write> SslStream<S> {
     ///
     /// # Safety
     ///
-    /// The caller must ensure the pointer is valid.
+    /// The caller must ensure that:
+    ///
+    /// - `ssl` is a non-null pointer to a live `SSL` whose ownership (one
+    ///   reference) moves to the returned stream, which frees it on drop;
+    /// - no other owner, `Ssl`, `SslStream` or raw pointer accesses that `SSL`
+    ///   for as long as the returned stream exists;
+    /// - no BIO is attached to it yet (this function attaches its own, which
+    ///   owns `stream`).
     pub unsafe fn from_raw_parts(ssl: *mut ffi::SSL, stream: S) -> Self {
         let ssl = Ssl::from_ptr(ssl);
         Self::new(ssl, stream).unwrap()

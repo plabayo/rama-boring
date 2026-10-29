@@ -270,7 +270,9 @@ impl fmt::Display for Asn1TimeRef {
             let print_result = cvt(ffi::ASN1_TIME_print(mem_bio.as_ptr(), self.as_ptr()));
             match print_result {
                 Err(_) => f.write_str("error"),
-                Ok(_) => f.write_str(str::from_utf8_unchecked(mem_bio.get_buf())),
+                // `ASN1_TIME_print` output is ASCII today, but that is not a
+                // documented guarantee, so check rather than assume.
+                Ok(_) => f.write_str(str::from_utf8(mem_bio.get_buf()).unwrap_or("error")),
             }
         }
     }
@@ -405,7 +407,9 @@ impl Asn1StringRef {
                 return Err(ErrorStack::get());
             }
 
-            Ok(OpensslString::from_ptr(ptr.cast()))
+            // SAFETY: on success `ptr` is an owned, NUL-terminated
+            // `OPENSSL_malloc`ed string; `from_c_ptr` checks it is UTF-8.
+            OpensslString::from_c_ptr(ptr.cast())
         }
     }
 
@@ -417,7 +421,10 @@ impl Asn1StringRef {
     /// [`as_utf8`]: struct.Asn1String.html#method.as_utf8
     #[corresponds(ASN1_STRING_get0_data)]
     pub fn as_slice(&self) -> &[u8] {
-        unsafe { slice::from_raw_parts(ASN1_STRING_get0_data(self.as_ptr()), self.len()) }
+        // SAFETY: the string's data is valid for `self.len()` bytes and owned
+        // by `self`. A string created by `ASN1_STRING_new` and never set has
+        // null data, which `slice_or_empty` maps to `&[]`.
+        unsafe { crate::util::slice_or_empty(ASN1_STRING_get0_data(self.as_ptr()), self.len()) }
     }
 
     /// Returns the number of bytes in the string.

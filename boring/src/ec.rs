@@ -322,13 +322,20 @@ impl EcPointRef {
     }
 
     /// Inverts `self`.
+    ///
+    /// `ctx` is unused: BoringSSL documents that `EC_POINT_invert` ignores its
+    /// context, so a shared `BigNumContextRef` is never handed to native code
+    /// (a `BN_CTX` is not safe to use from several threads at once).
     #[corresponds(EC_POINT_invert)]
     pub fn invert(&mut self, group: &EcGroupRef, ctx: &BigNumContextRef) -> Result<(), ErrorStack> {
+        let _ = ctx;
+        // SAFETY: `group` and `self` are valid and `self` is exclusively
+        // borrowed; `EC_POINT_invert` accepts a null `BN_CTX`.
         unsafe {
             cvt(ffi::EC_POINT_invert(
                 group.as_ptr(),
                 self.as_ptr(),
-                ctx.as_ptr(),
+                std::ptr::null_mut(),
             ))
         }
     }

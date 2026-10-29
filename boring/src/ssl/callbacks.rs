@@ -25,7 +25,40 @@ use std::slice;
 use std::str;
 use std::sync::Arc;
 
-pub extern "C" fn raw_verify<F>(preverify_ok: c_int, x509_ctx: *mut ffi::X509_STORE_CTX) -> c_int
+/// Zeroes a native output buffer and returns it as a mutable slice.
+///
+/// Native code often passes uninitialized output buffers to callbacks; safe
+/// user code may read any `&mut [u8]` it receives, so the bytes must be
+/// initialized first.
+///
+/// # Safety
+///
+/// If `len > 0`, the caller must ensure that `buf` is non-null and valid for
+/// reads and writes of `len` bytes, and that nothing else accesses those bytes
+/// for the returned lifetime `'a`.
+///
+/// If these hold, the result is `&mut []` when `len == 0` or `buf` is null, and
+/// otherwise the `len` zeroed bytes at `buf`.
+unsafe fn zeroed_out_buf<'a>(buf: *mut u8, len: usize) -> &'a mut [u8] {
+    if buf.is_null() || len == 0 {
+        return &mut [];
+    }
+    // SAFETY: `buf` is non-null and valid for writes of `len` bytes (`# Safety`).
+    unsafe { ptr::write_bytes(buf, 0, len) };
+    // SAFETY: the `len` bytes are now initialized, valid for reads and writes,
+    // and exclusively ours for `'a` (`# Safety`).
+    unsafe { slice::from_raw_parts_mut(buf, len) }
+}
+
+/// # Safety
+///
+/// BoringSSL (the only caller) must pass `x509_ctx` pointing to the live
+/// `X509_STORE_CTX` being verified, with the `SSL` stored at
+/// `X509StoreContext::ssl_idx`, and nothing else accessing it for the call.
+pub(super) unsafe extern "C" fn raw_verify<F>(
+    preverify_ok: c_int,
+    x509_ctx: *mut ffi::X509_STORE_CTX,
+) -> c_int
 where
     F: Fn(bool, &mut X509StoreContextRef) -> bool + 'static + Sync + Send,
 {
@@ -38,16 +71,21 @@ where
                 X509StoreContext::ssl_idx().expect("BUG: store context ssl index missing");
             let verify_idx = SslContext::cached_ex_index::<F>();
 
-            let Some(verify) = ctx
-                .ex_data(ssl_idx)
-                .and_then(|ssl| ssl.ex_data(*SESSION_CTX_INDEX))
-                .and_then(|ctx| ctx.ex_data(verify_idx))
-            else {
+            // Own a reference to the context holding the callback, so the
+            // callback stays alive for the whole call even if the user code
+            // it runs changes which context the connection uses.
+            let ssl_context = unwind::LeakOnUnwind::new(
+                ctx.ex_data(ssl_idx)
+                    .and_then(|ssl| ssl.ex_data(*SESSION_CTX_INDEX))
+                    .cloned(),
+            );
+            let Some(verify) = ssl_context.as_ref().and_then(|c| c.ex_data(verify_idx)) else {
                 return 0;
             };
-
-            // SAFETY: The callback won't outlive the context it's associated with
-            // because there is no `X509StoreContextRef::ssl_mut(&mut self)` method.
+            // SAFETY: `verify` lives in the ex_data of `ssl_context`, which this
+            // frame owns a reference to until the call returns; the ex_data of
+            // a built context is never replaced. Widening the borrow only
+            // detaches it from the `ctx` borrow so `ctx` can be passed as `&mut`.
             let verify = unsafe { &*std::ptr::from_ref::<F>(verify) };
 
             c_int::from(verify(preverify_ok != 0, ctx))
@@ -95,16 +133,23 @@ where
                 X509StoreContext::ssl_idx().expect("BUG: store context ssl index missing");
             let verify_idx = SslContext::cached_ex_index::<F>();
 
-            let verify = ctx
-                .ex_data(ssl_idx)
-                .expect("BUG: store context missing ssl")
-                .ssl_context()
+            // BoringSSL dispatches this callback from the connection's current
+            // context (`ssl->ctx`), which the connection may hold the last
+            // reference to. Own a reference so the callback outlives the call.
+            let ssl_context = unwind::LeakOnUnwind::new(
+                ctx.ex_data(ssl_idx)
+                    .expect("BUG: store context missing ssl")
+                    .ssl_context()
+                    .to_owned(),
+            );
+            let verify = ssl_context
                 .ex_data(verify_idx)
                 .expect("BUG: verify callback missing");
 
-            // SAFETY: The callback won't outlive the context it's associated with
-            // because there is no way to get a mutable reference to the `SslContext`,
-            // so the callback can't replace itself.
+            // SAFETY: `verify` lives in the ex_data of `ssl_context`, which this
+            // frame owns a reference to until the call returns; the ex_data of
+            // a built context is never replaced. Widening the borrow only
+            // detaches it from the `ctx` borrow so `ctx` can be passed as `&mut`.
             let verify = unsafe { &*std::ptr::from_ref::<F>(verify) };
 
             c_int::from(verify(ctx))
@@ -190,9 +235,21 @@ where
         };
 
         // Give the callback mutable slices into which it can write the identity and psk.
-        let identity_sl =
-            unsafe { slice::from_raw_parts_mut(identity.cast::<u8>(), max_identity_len as usize) };
-        let psk_sl = unsafe { slice::from_raw_parts_mut(psk, max_psk_len as usize) };
+        //
+        // SAFETY: BoringSSL passes `identity` valid for `max_identity_len`
+        // bytes and `psk` valid for `max_psk_len` bytes, both stack buffers of
+        // the handshake that outlive this call; `zeroed_out_buf` initializes
+        // them before safe code can read them.
+        //
+        // The identity is read back as a NUL-terminated C string (`strdup`),
+        // so the last byte is kept out of the slice and stays NUL: a callback
+        // filling the whole slice still leaves a terminated string.
+        let identity_cap = (max_identity_len as usize).saturating_sub(1);
+        let identity_buf =
+            unsafe { zeroed_out_buf(identity.cast::<u8>(), max_identity_len as usize) };
+        let identity_sl = &mut identity_buf[..identity_cap];
+        let psk_sl = unsafe { zeroed_out_buf(psk, max_psk_len as usize) };
+        let psk_cap = psk_sl.len();
 
         // SSL_new copies this callback; routing does not replace it.
         let ssl_context = unwind::LeakOnUnwind::new(ssl.ex_data(*SESSION_CTX_INDEX).cloned());
@@ -204,7 +261,17 @@ where
         };
 
         match callback(ssl, hint, identity_sl, psk_sl) {
-            Ok(psk_len) => psk_len as u32,
+            // BoringSSL only `assert`s this bound on the client, so a larger
+            // length would make release builds read past the PSK buffer.
+            // `psk_len <= max_psk_len`, so the cast is lossless.
+            Ok(psk_len) if psk_len <= psk_cap => psk_len as u32,
+            Ok(psk_len) => {
+                ErrorStack::internal_error_string(format!(
+                    "PSK client callback returned {psk_len} bytes for a {psk_cap}-byte buffer"
+                ))
+                .put();
+                0
+            }
             Err(e) => {
                 e.put();
                 0
@@ -237,7 +304,11 @@ where
         };
 
         // Give the callback mutable slices into which it can write the psk.
-        let psk_sl = unsafe { slice::from_raw_parts_mut(psk, max_psk_len as usize) };
+        //
+        // SAFETY: BoringSSL passes `psk` valid for `max_psk_len` bytes, an
+        // uninitialized stack buffer that `zeroed_out_buf` initializes.
+        let psk_sl = unsafe { zeroed_out_buf(psk, max_psk_len as usize) };
+        let psk_cap = psk_sl.len();
 
         // SSL_new copies this callback; routing does not replace it.
         let ssl_context = unwind::LeakOnUnwind::new(ssl.ex_data(*SESSION_CTX_INDEX).cloned());
@@ -249,7 +320,15 @@ where
         };
 
         match callback(ssl, identity, psk_sl) {
-            Ok(psk_len) => psk_len as u32,
+            // `psk_len <= max_psk_len`, so the cast is lossless.
+            Ok(psk_len) if psk_len <= psk_cap => psk_len as u32,
+            Ok(psk_len) => {
+                ErrorStack::internal_error_string(format!(
+                    "PSK server callback returned {psk_len} bytes for a {psk_cap}-byte buffer"
+                ))
+                .put();
+                0
+            }
             Err(e) => {
                 e.put();
                 0
@@ -273,9 +352,9 @@ where
             let ssl_idx =
                 X509StoreContext::ssl_idx().expect("BUG: store context ssl index missing");
 
-            // NOTE(nox): I'm pretty sure this Arc<F> is unnecessary here as there is
-            // no way to get a `&mut SslRef` from a `&mut X509StoreContextRef`, and I
-            // don't understand how this callback is different from `raw_verify` above.
+            // The callback is stored per connection as an `Arc<F>`; cloning it
+            // keeps it alive even if the connection's callback is replaced
+            // while it runs.
             let callback = unwind::LeakOnUnwind::new(
                 ctx.ex_data(ssl_idx)
                     .expect("BUG: store context missing ssl")
@@ -304,11 +383,20 @@ where
             let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
             let al = unsafe { &mut *al };
 
-            // SAFETY: We can make `callback` outlive `ssl` because it is a callback
-            // stored in the original context with which `ssl` was built. That
-            // original context is always stored as the session context in
-            // `Ssl::new` so it is always guaranteed to outlive the lifetime of
-            // this function's scope.
+            // `arg` points to the `F` in the ex_data of the context BoringSSL
+            // dispatched from: the connection's current context (`ssl->ctx`)
+            // if that has an SNI callback, otherwise the session context.
+            // Keep the current context alive for the whole call: the callback
+            // may switch the connection to another context, which would
+            // otherwise free the current one (and this callback) mid-call. The
+            // session context is kept alive by the connection itself.
+            let _current_context = unwind::LeakOnUnwind::new(ssl.ssl_context().to_owned());
+
+            // SAFETY: `arg` was set by `SslContextBuilder::set_servername_callback`
+            // to the `F` stored in that context's ex_data, which is never
+            // replaced once the context is built. Whichever context dispatched
+            // this call is kept alive until it returns (see above), so the
+            // reference is valid for the whole call.
             let callback = unsafe { &*(arg as *const F) };
 
             let mut alert = SslAlert(*al);
@@ -713,7 +801,12 @@ where
         || {
             // SAFETY: boring provides valid inputs.
             let ssl = unsafe { SslRef::from_ptr_mut(ssl) };
-            let output = unsafe { slice::from_raw_parts_mut(out, max_out) };
+            // SAFETY: BoringSSL passes an `out` buffer valid for writes of
+            // `max_out` bytes (`ssl_private_key_method_st` in ssl.h). That
+            // buffer is reserved but not initialized (`CBB_reserve`,
+            // `InitForOverwrite`), and it is handed to a safe trait method
+            // that may read it, so it is zeroed before the slice is created.
+            let output = unsafe { zeroed_out_buf(out, max_out) };
             let out_len = unsafe { &mut *out_len };
 
             // Keep native owners alive independently of `ssl` while the callback can
@@ -807,8 +900,12 @@ where
             .ex_data(SslContext::cached_ex_index::<C>())
             .expect("BUG: certificate compression missed");
 
-        let input_slice = unsafe { std::slice::from_raw_parts(input, input_len) };
-        let mut writer = CryptoByteBuilder::from_ptr(out);
+        // SAFETY: BoringSSL passes `input` valid for `input_len` bytes; an empty
+        // input may come with any pointer.
+        let input_slice = unsafe { crate::util::slice_or_empty(input, input_len) };
+        // SAFETY: `out` is the live, initialized `CBB` BoringSSL hands to the
+        // compression callback for the duration of this call.
+        let mut writer = unsafe { CryptoByteBuilder::from_ptr(out) };
         if compressor.compress(input_slice, &mut writer).is_err() {
             return 0;
         }
@@ -846,7 +943,9 @@ where
             return 0;
         };
 
-        let input_slice = unsafe { std::slice::from_raw_parts(input, input_len) };
+        // SAFETY: BoringSSL passes `input` valid for `input_len` bytes; the
+        // peer controls `input_len`, which may be zero.
+        let input_slice = unsafe { crate::util::slice_or_empty(input, input_len) };
 
         if compressor
             .decompress(input_slice, decompression_buffer.as_writer())
@@ -865,10 +964,19 @@ where
     })
 }
 
-struct CryptoByteBuilder<'a>(*mut ffi::CBB, std::marker::PhantomData<&'a [u8]>);
+struct CryptoByteBuilder<'a>(
+    // Safety invariant: points to a live, initialized `CBB` that nothing else
+    // accesses for `'a`.
+    *mut ffi::CBB,
+    std::marker::PhantomData<&'a [u8]>,
+);
 
 impl CryptoByteBuilder<'_> {
-    fn from_ptr(ptr: *mut ffi::CBB) -> Self {
+    /// # Safety
+    ///
+    /// The caller must ensure that `ptr` points to a live, initialized `CBB`
+    /// that nothing else accesses while the returned builder exists.
+    unsafe fn from_ptr(ptr: *mut ffi::CBB) -> Self {
         Self(ptr, Default::default())
     }
 }
@@ -900,9 +1008,16 @@ impl<'a> CryptoBufferBuilder<'a> {
     fn with_capacity(capacity: usize) -> Result<CryptoBufferBuilder<'a>, ErrorStack> {
         let mut data: *mut u8 = std::ptr::null_mut();
         let buffer = unsafe { crate::cvt_p(ffi::CRYPTO_BUFFER_alloc(&mut data, capacity))? };
+        // SAFETY: `CRYPTO_BUFFER_alloc` makes `data` point to `capacity`
+        // writable bytes owned by `buffer`, which this builder owns and only
+        // frees on drop, after the cursor. A zero capacity (the peer controls
+        // it) may come with a null `data`, hence `zeroed_out_buf`. The bytes
+        // are zeroed so the slice never refers to uninitialized memory; the
+        // cursor is only exposed as an opaque `impl Write`.
+        let data = unsafe { zeroed_out_buf(data, capacity) };
         Ok(CryptoBufferBuilder {
             buffer,
-            cursor: std::io::Cursor::new(unsafe { std::slice::from_raw_parts_mut(data, capacity) }),
+            cursor: std::io::Cursor::new(data),
         })
     }
 
