@@ -253,6 +253,8 @@ fn ech_grease_hrr_reuses_extension_and_freezes_shape() {
 fn ech_grease_unusable_real_config_falls_back() {
     let mut ssl = client();
     ssl.set_enable_ech_grease(true);
+    ssl.set_reject_unusable_ech_config(true);
+    ssl.set_reject_unusable_ech_config(false);
     // A syntactically valid list containing an unknown ECH version.
     ssl.set_ech_config_list(&[0, 4, 0xba, 0xdc, 0, 0]).unwrap();
     apply(&mut ssl, EchGreaseCipherSuite::HkdfSha256Aes256Gcm, 17);
@@ -267,9 +269,7 @@ fn ech_grease_shape_preserves_unusable_config_rejection_policy() {
     let mut ssl = client();
     ssl.set_enable_ech_grease(true);
     ssl.set_ech_config_list(&[0, 4, 0xba, 0xdc, 0, 0]).unwrap();
-    unsafe {
-        crate::ffi::SSL_set_reject_unusable_ech_config(ssl.as_ptr(), 1);
-    }
+    ssl.set_reject_unusable_ech_config(true);
     apply(&mut ssl, EchGreaseCipherSuite::HkdfSha256Aes128Gcm, 144);
     let seen = observe(&mut ssl);
     let (a, mut b) = memory::ends();
@@ -282,4 +282,31 @@ fn ech_grease_shape_preserves_unusable_config_rejection_policy() {
         b.read(&mut [0u8; 1]).unwrap_err().kind(),
         std::io::ErrorKind::WouldBlock
     );
+}
+
+#[test]
+fn required_ech_refuses_missing_config_and_tls12_before_client_hello() {
+    use std::io::Read;
+
+    for tls12 in [false, true] {
+        let mut ssl = client();
+        ssl.set_enable_ech_grease(true);
+        ssl.set_reject_unusable_ech_config(true);
+        if tls12 {
+            ssl.set_ech_config_list(include_bytes!("../../../test/echconfiglist"))
+                .unwrap();
+            ssl.set_max_proto_version(Some(SslVersion::TLS1_2)).unwrap();
+        }
+        let seen = observe(&mut ssl);
+        let (client, mut peer) = memory::ends();
+        assert!(matches!(
+            ssl.connect(client),
+            Err(crate::ssl::HandshakeError::Failure(_))
+        ));
+        assert!(seen.lock().unwrap().is_empty());
+        assert_eq!(
+            peer.read(&mut [0; 1]).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
 }

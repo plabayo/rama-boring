@@ -37,7 +37,8 @@ fn bootstrap_ech(config: &[u8], key: &[u8], list: &[u8]) -> (Server, ClientSslBu
 
 #[test]
 fn ech() {
-    let (_server, client) = bootstrap_ech(ECH_CONFIG, ECH_KEY, ECH_CONFIG_LIST);
+    let (_server, mut client) = bootstrap_ech(ECH_CONFIG, ECH_KEY, ECH_CONFIG_LIST);
+    client.ssl().set_reject_unusable_ech_config(true);
 
     let ssl_stream = client.connect();
     assert!(ssl_stream.ssl().ech_accepted());
@@ -79,6 +80,13 @@ fn ech_rejection() {
         failed_ssl_stream.ssl().get_ech_name_override(),
         Some(b"ech.com".to_vec().as_ref())
     );
+    assert!(failed_ssl_stream
+        .error()
+        .ssl_error()
+        .unwrap()
+        .errors()
+        .iter()
+        .any(|error| crate::ssl::is_ech_rejected(error.library_code(), error.reason_code())));
     assert!(failed_ssl_stream.ssl().get_ech_retry_configs().is_some());
     assert!(!failed_ssl_stream.ssl().ech_accepted());
 }
@@ -219,4 +227,23 @@ fn ech_grease_shape_yields_to_real_ech_and_retry_configs() {
         )
         .unwrap();
     assert!(client.connect().ssl().ech_accepted());
+}
+
+#[test]
+fn ech_rejection_classification_checks_library_and_reason() {
+    use crate::{ffi, ssl::is_ech_rejected};
+    assert!(is_ech_rejected(
+        ffi::ERR_LIB_SSL.0 as i32,
+        ffi::SSL_R_ECH_REJECTED
+    ));
+    assert!(!is_ech_rejected(
+        ffi::ERR_LIB_X509.0 as i32,
+        ffi::SSL_R_ECH_REJECTED
+    ));
+    assert!(!is_ech_rejected(
+        ffi::ERR_LIB_SSL.0 as i32,
+        ffi::SSL_R_CERTIFICATE_VERIFY_FAILED
+    ));
+    assert!(!is_ech_rejected(0, 0));
+    assert!(!is_ech_rejected(-1, -1));
 }

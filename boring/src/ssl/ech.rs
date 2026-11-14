@@ -6,6 +6,20 @@ use crate::error::ErrorStack;
 use crate::hpke::HpkeKey;
 use crate::{cvt_0i, cvt_p};
 
+/// Whether a native library/reason pair identifies an ECH rejection.
+///
+/// Pass [`crate::error::Error::library_code`] and
+/// [`crate::error::Error::reason_code`], or copies preserved by a transport.
+/// Neither a packed native error nor [`super::ErrorCode`] is a reason code.
+/// Both the library and reason must match; other TLS failures are not rejections.
+///
+/// This classifies an error, not the peer's authentication. Only consume retry
+/// configurations after authenticating the rejecting server's public name.
+#[must_use]
+pub fn is_ech_rejected(library_code: i32, reason_code: i32) -> bool {
+    library_code == ffi::ERR_LIB_SSL.0 as i32 && reason_code == ffi::SSL_R_ECH_REJECTED
+}
+
 pub struct SslEchKeysBuilder {
     keys: SslEchKeys,
 }

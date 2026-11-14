@@ -131,7 +131,9 @@ pub use self::connector::{
     ConnectConfiguration, SslAcceptor, SslAcceptorBuilder, SslConnector, SslConnectorBuilder,
 };
 pub use self::credential::{SslCredential, SslCredentialBuilder, SslCredentialRef};
-pub use self::ech::{EchGreaseCipherSuite, EchGreaseShape, SslEchKeys, SslEchKeysRef};
+pub use self::ech::{
+    is_ech_rejected, EchGreaseCipherSuite, EchGreaseShape, SslEchKeys, SslEchKeysRef,
+};
 pub use self::error::{Error, ErrorCode, HandshakeError};
 
 mod async_callbacks;
@@ -4362,6 +4364,20 @@ impl SslRef {
         }
     }
 
+    /// Fail the client handshake if no valid, supported ECH configuration can
+    /// be selected. The default is `false`, allowing an unusable configuration
+    /// to fall back to an ordinary ClientHello or ECH GREASE.
+    ///
+    /// Configure this before starting the handshake. This policy only requires
+    /// a real ECH offer: the caller must still handle server rejection and check
+    /// [`Self::ech_accepted`] after a successful handshake.
+    #[corresponds(SSL_set_reject_unusable_ech_config)]
+    pub fn set_reject_unusable_ech_config(&mut self, enable: bool) {
+        unsafe {
+            ffi::SSL_set_reject_unusable_ech_config(self.as_ptr(), i32::from(enable));
+        }
+    }
+
     /// Configures `ech_config_list` on `SSL` for offering ECH during handshakes. If the server
     /// cannot decrypt the encrypted ClientHello, `SSL` will instead handshake using
     /// the cleartext parameters of the ClientHelloOuter.
@@ -4384,9 +4400,10 @@ impl SslRef {
     /// This function returns a serialized `ECHConfigList` as provided by the
     /// server, if one exists.
     ///
-    /// Clients should call this function when handling an `SSL_R_ECH_REJECTED` error code to
-    /// recover from potential key mismatches. If the result is `Some`, the client should retry the
-    /// connection using the returned `ECHConfigList`.
+    /// Clients should call this function when handling an ECH rejection (see
+    /// [`is_ech_rejected`]) to recover from potential key mismatches. After
+    /// authenticating the rejecting server's public name, the client may retry
+    /// the connection using the returned `ECHConfigList`.
     #[corresponds(SSL_get0_ech_retry_configs)]
     #[must_use]
     pub fn get_ech_retry_configs(&self) -> Option<&[u8]> {
