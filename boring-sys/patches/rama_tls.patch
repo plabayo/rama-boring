@@ -1366,7 +1366,7 @@ diff --git a/ssl/handshake_client.cc b/ssl/handshake_client.cc
 index a4a53cd..238f790 100644
 --- a/ssl/handshake_client.cc
 +++ b/ssl/handshake_client.cc
-@@ -102,12 +102,38 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
+@@ -102,12 +102,45 @@ static bool ssl_write_client_cipher_list(const SSL_HANDSHAKE *hs, CBB *out,
      return false;
    }
  
@@ -1391,6 +1391,13 @@ index a4a53cd..238f790 100644
 +                                                   &grease_slot))) {
 +          return false;
 +        }
++        continue;
++      }
++      // ECH inner offers TLS 1.3 only, just like the native cipher path.
++      // Preserve GREASE and unknown slots, but omit known legacy suites.
++      const SSL_CIPHER *known = SSL_get_cipher_by_value(cipher);
++      if (type == ssl_client_hello_inner && known != nullptr &&
++          SSL_CIPHER_get_max_version(known) < TLS1_3_VERSION) {
 +        continue;
 +      }
 +      raw_has_fallback_scsv |= cipher == SSL_CIPHER_FALLBACK_SCSV;

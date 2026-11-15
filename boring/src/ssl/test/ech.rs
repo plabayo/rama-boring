@@ -57,14 +57,27 @@ fn ech_with_raw_cipher_list() {
     let server = server.build();
 
     let mut client = server.client_with_root_ca();
-    client.ctx().set_raw_cipher_list(&[0x1301]).unwrap();
+    client
+        .ctx()
+        .set_raw_cipher_list(&[0x3a3a, 0x1301, 0xc02f, 0xfefe, 0x00ff, 0x1302, 0x009c])
+        .unwrap();
     let mut client = client.build().builder();
+    client
+        .ssl()
+        .set_client_hello_shape(
+            &crate::ssl::ClientHelloShape::new()
+                .with_grease_values(crate::ssl::GreaseValues::Pinned),
+        )
+        .unwrap();
     client.ssl().set_ech_config_list(ECH_CONFIG_LIST).unwrap();
     client.ssl().set_hostname("foobar.com").unwrap();
 
     let ssl_stream = client.connect();
     assert!(ssl_stream.ssl().ech_accepted());
-    assert_eq!(*captured.lock().unwrap(), [[0x1301]]);
+    assert_eq!(
+        *captured.lock().unwrap(),
+        [[0x3a3a, 0x1301, 0xfefe, 0x00ff, 0x1302]]
+    );
 }
 
 #[test]
