@@ -583,6 +583,76 @@ fn x509_req_builder() {
     assert!(req.verify(&pkey).unwrap());
 }
 
+fn ed25519_pkey() -> PKey<Private> {
+    PKey::from_ed25519_private_key(&[7; 32]).unwrap()
+}
+
+fn common_name(value: &str) -> X509Name {
+    let mut name = X509Name::builder().unwrap();
+    name.append_entry_by_nid(Nid::COMMONNAME, value).unwrap();
+    name.build()
+}
+
+#[test]
+fn x509_builder_signs_ed25519_without_digest() {
+    let pkey = ed25519_pkey();
+    let name = common_name("foobar.com");
+
+    let mut builder = X509::builder().unwrap();
+    builder.set_version(2).unwrap();
+    builder.set_subject_name(&name).unwrap();
+    builder.set_issuer_name(&name).unwrap();
+    builder
+        .set_not_before(&Asn1Time::days_from_now(0).unwrap())
+        .unwrap();
+    builder
+        .set_not_after(&Asn1Time::days_from_now(365).unwrap())
+        .unwrap();
+    builder.set_pubkey(&pkey).unwrap();
+
+    // Ed25519 signs the message itself, so a digest is refused.
+    builder.sign(&pkey, MessageDigest::sha256()).unwrap_err();
+    builder.sign_without_digest(&pkey).unwrap();
+
+    let x509 = builder.build();
+    assert!(x509.verify(&pkey).unwrap());
+    assert_eq!(
+        x509.signature_algorithm().object().nid().as_raw(),
+        crate::ffi::NID_ED25519
+    );
+}
+
+#[test]
+fn x509_builder_refuses_rsa_without_digest() {
+    let pkey = pkey();
+    let name = common_name("foobar.com");
+
+    let mut builder = X509::builder().unwrap();
+    builder.set_version(2).unwrap();
+    builder.set_subject_name(&name).unwrap();
+    builder.set_issuer_name(&name).unwrap();
+    builder.set_pubkey(&pkey).unwrap();
+
+    builder.sign_without_digest(&pkey).unwrap_err();
+}
+
+#[test]
+fn x509_req_builder_signs_ed25519_without_digest() {
+    let pkey = ed25519_pkey();
+
+    let mut builder = X509Req::builder().unwrap();
+    builder.set_version(0).unwrap();
+    builder
+        .set_subject_name(&common_name("foobar.com"))
+        .unwrap();
+    builder.set_pubkey(&pkey).unwrap();
+
+    builder.sign(&pkey, MessageDigest::sha256()).unwrap_err();
+    builder.sign_without_digest(&pkey).unwrap();
+
+    assert!(builder.build().verify(&pkey).unwrap());
+}
+
 #[test]
 fn test_stack_from_pem() {
     let certs = include_bytes!("../../../test/certs.pem");

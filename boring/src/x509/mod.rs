@@ -607,6 +607,20 @@ impl X509Builder {
         unsafe { cvt(ffi::X509_sign(self.0.as_ptr(), key.as_ptr(), hash.as_ptr())) }
     }
 
+    /// Signs the certificate with a private key that takes no digest.
+    ///
+    /// This is the only way to sign with an Ed25519 key. A key that needs a digest,
+    /// such as an RSA key, fails; use [`Self::sign`] for those.
+    #[corresponds(X509_sign)]
+    pub fn sign_without_digest<T>(&mut self, key: &PKeyRef<T>) -> Result<(), ErrorStack>
+    where
+        T: HasPrivate,
+    {
+        // SAFETY: both pointers are live for the call; `X509_sign` takes a null `md` for a
+        // key that signs without a digest.
+        unsafe { cvt(ffi::X509_sign(self.0.as_ptr(), key.as_ptr(), ptr::null())) }
+    }
+
     /// Consumes the builder, returning the certificate.
     #[must_use]
     pub fn build(self) -> X509 {
@@ -1633,6 +1647,26 @@ impl X509ReqBuilder {
                 self.0.as_ptr(),
                 key.as_ptr(),
                 hash.as_ptr(),
+            ))
+        }
+    }
+
+    /// Sign the request using a private key that takes no digest.
+    ///
+    /// This is the only way to sign with an Ed25519 key. A key that needs a digest,
+    /// such as an RSA key, fails; use [`Self::sign`] for those.
+    #[corresponds(X509_REQ_sign)]
+    pub fn sign_without_digest<T>(&mut self, key: &PKeyRef<T>) -> Result<(), ErrorStack>
+    where
+        T: HasPrivate,
+    {
+        // SAFETY: both pointers are live for the call; `X509_REQ_sign` takes a null `md` for
+        // a key that signs without a digest.
+        unsafe {
+            cvt(ffi::X509_REQ_sign(
+                self.0.as_ptr(),
+                key.as_ptr(),
+                ptr::null(),
             ))
         }
     }
