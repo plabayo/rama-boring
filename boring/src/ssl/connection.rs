@@ -715,24 +715,23 @@ impl SslRef {
                 len: body.len(),
             })
             .collect();
-        let native = ffi::RAMA_SSL_CLIENT_HELLO_SHAPE {
-            grease_lists_set: shape.grease_lists.is_some().into(),
-            grease_lists: shape.grease_lists.map_or(0, |lists| lists.bits()),
-            grease_values: grease_values as _,
-            grease_seed,
-            unknown_values: unknown_values as _,
-            padding: padding as _,
-            padding_length,
-            extension_bodies: bodies.as_ptr(),
-            num_extension_bodies: bodies.len(),
-            legacy_extensions: shape.legacy_extensions.into(),
-            ech_grease_kdf_id: shape.ech_grease.map_or(0, |s| s.cipher_suite().ids().0),
-            ech_grease_aead_id: shape.ech_grease.map_or(0, |s| s.cipher_suite().ids().1),
-            ech_grease_payload_len: shape.ech_grease.map_or(0, |s| s.payload_len()),
-            ec_point_formats: shape.ec_point_formats.into(),
-            omit_psk_key_exchange_modes: shape.omit_psk_key_exchange_modes.into(),
-            omit_renegotiation_info: shape.omit_renegotiation_info.into(),
-        };
+        let mut native = ffi::RAMA_SSL_CLIENT_HELLO_SHAPE::default();
+        native.grease_lists_set = shape.grease_lists.is_some().into();
+        native.grease_lists = shape.grease_lists.map_or(0, |lists| lists.bits());
+        native.grease_values = grease_values as _;
+        native.grease_seed = grease_seed;
+        native.unknown_values = unknown_values as _;
+        native.padding = padding as _;
+        native.padding_length = padding_length;
+        native.extension_bodies = bodies.as_ptr();
+        native.num_extension_bodies = bodies.len();
+        native.legacy_extensions = shape.legacy_extensions.into();
+        native.ech_grease_kdf_id = shape.ech_grease.map_or(0, |s| s.cipher_suite().ids().0);
+        native.ech_grease_aead_id = shape.ech_grease.map_or(0, |s| s.cipher_suite().ids().1);
+        native.ech_grease_payload_len = shape.ech_grease.map_or(0, |s| s.payload_len());
+        native.ec_point_formats = shape.ec_point_formats.into();
+        native.omit_psk_key_exchange_modes = shape.omit_psk_key_exchange_modes.into();
+        native.omit_renegotiation_info = shape.omit_renegotiation_info.into();
         unsafe { cvt(ffi::RAMA_SSL_set_client_hello_shape(self.as_ptr(), &native)).map(|_| ()) }
     }
 

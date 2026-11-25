@@ -831,7 +831,8 @@ fn generate_bindings(config: &Config) {
         .blocklist_function("malloc|calloc|realloc|free|aligned_alloc|posix_memalign")
         .clang_args(get_extra_clang_args_for_bindgen(config))
         .clang_arg("-I")
-        .clang_arg(include_path.display().to_string());
+        .clang_arg(include_path.display().to_string())
+        .parse_callbacks(Box::new(NonExhaustiveOptions));
 
     if let Some(sysroot) = &config.env.sysroot {
         builder = builder
@@ -918,6 +919,20 @@ impl bindgen::callbacks::ParseCallbacks for UnprefixedTypeNames {
                 .strip_prefix(self.prefix.as_str())
                 .map(str::to_owned),
             _ => None,
+        }
+    }
+}
+
+/// Marks option structs that gain fields over time `#[non_exhaustive]`, so a
+/// new field is not a breaking change. Callers start from `Default`.
+#[derive(Debug)]
+struct NonExhaustiveOptions;
+
+impl bindgen::callbacks::ParseCallbacks for NonExhaustiveOptions {
+    fn add_attributes(&self, info: &bindgen::callbacks::AttributeInfo<'_>) -> Vec<String> {
+        match info.name {
+            "rama_ssl_client_hello_shape_st" => vec!["#[non_exhaustive]".to_owned()],
+            _ => Vec::new(),
         }
     }
 }
