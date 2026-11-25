@@ -390,6 +390,14 @@ jobs:
             choco install nasm --no-progress -y
             "C:\Program Files\NASM" >> $env:GITHUB_PATH
           }
+          if ('${{ matrix.assembler }}' -eq 'clang') {
+            # The Visual Studio STL refuses a clang-cl older than its minimum.
+            $major = [int]((clang --version | Select-String 'version (\d+)').Matches[0].Groups[1].Value)
+            if ($major -lt 22) {
+              choco upgrade llvm --no-progress -y
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          }
           $clang = (Get-Command clang).Source
           "LIBCLANG_PATH=$(Split-Path $clang)" >> $env:GITHUB_ENV
           if ('${{ matrix.generator }}' -ne '') {
