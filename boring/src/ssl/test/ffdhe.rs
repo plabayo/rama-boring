@@ -114,26 +114,70 @@ fn send(from: &mut SslStream<End>, to: &mut SslStream<End>, len: usize) {
     assert_eq!(read, data);
 }
 
-#[test]
-fn each_group_negotiates_tls13_and_exchanges_data() {
-    for group in GROUPS {
-        let server = server(&[group.curve]);
-        // A key share up front, and one after a HelloRetryRequest.
-        for (key_shares, retry) in [(&[group.id][..], false), (&[X25519][..], true)] {
-            let client = client(SslVersion::TLS1_3, &[X25519, group.id], key_shares);
-            let (client, server) = handshake(client, Ssl::new(&server).unwrap());
-            let (mut client, mut server) = (client.done(), server.done());
-            for side in [client.ssl(), server.ssl()] {
-                assert_eq!(side.version(), Some(SslVersion::TLS1_3));
-                assert_eq!(side.curve(), Some(group.curve));
-            }
-            assert_eq!(client.ssl().used_hello_retry_request(), retry);
-            for len in [1, 100, 5000] {
-                send(&mut client, &mut server, len);
-                send(&mut server, &mut client, len);
-            }
+/// Every ClientHello `ssl` writes.
+fn written_hellos(ssl: &mut Ssl) -> Arc<Mutex<Vec<Vec<u8>>>> {
+    let hellos = Arc::new(Mutex::new(Vec::new()));
+    let sink = hellos.clone();
+    ssl.set_msg_callback(move |_, message| {
+        if message.is_written() && message.handshake_type() == Some(1) {
+            sink.lock().unwrap().push(message.bytes().to_vec());
         }
+    });
+    hellos
+}
+
+/// The key share groups of a ClientHello.
+fn key_share_groups(hello: &[u8]) -> Vec<u16> {
+    let hello = wire::ClientHello::parse(hello).unwrap();
+    client_key_shares(hello.extension(KEY_SHARE).unwrap())
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Negotiates `group` with data both ways; returns whether a HelloRetryRequest
+/// was used and the key share groups of each ClientHello.
+fn negotiate(group: &Group, key_shares: &[u16]) -> (bool, Vec<Vec<u16>>) {
+    let server = server(&[group.curve]);
+    let mut client = client(SslVersion::TLS1_3, &[X25519, group.id], key_shares);
+    let hellos = written_hellos(&mut client);
+    let (client, server) = handshake(client, Ssl::new(&server).unwrap());
+    let (mut client, mut server) = (client.done(), server.done());
+    for side in [client.ssl(), server.ssl()] {
+        assert_eq!(side.version(), Some(SslVersion::TLS1_3));
+        assert_eq!(side.curve(), Some(group.curve));
+    }
+    for len in [1, 100, 5000] {
+        send(&mut client, &mut server, len);
+        send(&mut server, &mut client, len);
+    }
+    let shares = hellos
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|hello| key_share_groups(hello))
+        .collect();
+    (client.ssl().used_hello_retry_request(), shares)
+}
+
+#[test]
+fn each_group_negotiates_tls13_with_a_first_key_share() {
+    for group in GROUPS {
+        let (retry, shares) = negotiate(group, &[group.id]);
+        assert!(!retry);
+        assert_eq!(shares, [vec![group.id]]);
         assert_eq!(group.curve.name(), Some(group.name));
+    }
+}
+
+/// The client offers only an X25519 share and lists the group; a server that
+/// prefers the group asks again, and the second ClientHello carries its share.
+#[test]
+fn each_group_negotiates_tls13_after_a_hello_retry_request() {
+    for group in GROUPS {
+        let (retry, shares) = negotiate(group, &[X25519]);
+        assert!(retry);
+        assert_eq!(shares, [vec![X25519], vec![group.id]]);
     }
 }
 
@@ -253,7 +297,27 @@ fn malformed(group: &Group) -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
-/// Replaces the key_share body of the ClientHello at the front of a server's
+/// `p - 2`: in range, yet outside the order-q subgroup. With p = 3 mod 4, -1
+/// is a quadratic non-residue, and the subgroup is the quadratic residues.
+fn non_residue(group: &Group) -> Vec<u8> {
+    let p = group.p();
+    let mut y = p.to_owned().unwrap();
+    y.sub_word(2).unwrap();
+    let mut p_minus_1 = p.to_owned().unwrap();
+    p_minus_1.sub_word(1).unwrap();
+    assert!(y > BigNum::from_u32(1).unwrap() && y < p_minus_1);
+    let mut q = BigNum::new().unwrap();
+    q.rshift1(&p).unwrap();
+    let mut ctx = BigNumContext::new().unwrap();
+    let mut r = BigNum::new().unwrap();
+    r.mod_exp(&y, &q, &p, &mut ctx).unwrap();
+    assert_ne!(r, BigNum::from_u32(1).unwrap());
+    // Euler's criterion: a non-residue gives -1.
+    assert_eq!(r, p_minus_1);
+    y.to_vec_padded(group.len()).unwrap()
+}
+
+/// Replaces the key_share body of the ClientHello at the front of a server's/// Replaces the key_share body of the ClientHello at the front of a server's
 /// pending input.
 fn rewrite_client_key_share(rx: &Buffer, body: &[u8]) {
     let mut rx = rx.lock().unwrap();
@@ -280,26 +344,48 @@ fn failed_with(side: &Side<End>, reason: &str) {
     side.panicked_or_failed_with(reason);
 }
 
+/// A server receiving `bad` as the client's share fails with `reason` and
+/// `illegal_parameter`.
+fn reject_client_share(group: &Group, reason: &str, bad: &[u8]) {
+    let (a, b) = ends();
+    let server_rx = b.rx.clone();
+    let _client = Side::from(client(SslVersion::TLS1_3, &[group.id], &[group.id]).connect(a));
+    let body = encode_client_key_shares(&[(group.id, bad.to_vec())]);
+    rewrite_client_key_share(&server_rx, &body);
+    let mut server = Ssl::new(&server(&[group.curve])).unwrap();
+    let alerts = alerts(&mut server);
+    let server = Side::from(server.accept(b));
+    failed_with(&server, reason);
+    assert_eq!(
+        *alerts.lock().unwrap(),
+        [ILLEGAL_PARAMETER_ALERT],
+        "{reason}"
+    );
+}
+
+/// A client receiving `bad` as the server's share fails with `reason`.
+fn reject_server_share(group: &Group, reason: &str, bad: &[u8]) {
+    let (a, b) = ends();
+    let client_rx = a.rx.clone();
+    let mut ssl = client(SslVersion::TLS1_3, &[group.id], &[group.id]);
+    let alerts = alerts(&mut ssl);
+    let client = Side::from(ssl.connect(a));
+    let _server = Side::from(Ssl::new(&server(&[group.curve])).unwrap().accept(b));
+    let body = wire::encode_server_key_share(group.id, bad);
+    rewrite_server_hello(&client_rx, |_, extensions| {
+        replace_extension(extensions, KEY_SHARE, &body);
+    });
+    failed_with(&client.step(), reason);
+    // A client reports any failed key share as an internal error, for every
+    // group, as upstream does.
+    assert_eq!(*alerts.lock().unwrap(), [INTERNAL_ERROR_ALERT], "{reason}");
+}
+
 #[test]
 fn malformed_client_shares_are_rejected() {
     for group in GROUPS {
-        let server_ctx = server(&[group.curve]);
         for (reason, bad) in malformed(group) {
-            let (a, b) = ends();
-            let server_rx = b.rx.clone();
-            let _client =
-                Side::from(client(SslVersion::TLS1_3, &[group.id], &[group.id]).connect(a));
-            let body = encode_client_key_shares(&[(group.id, bad.clone())]);
-            rewrite_client_key_share(&server_rx, &body);
-            let mut server = Ssl::new(&server_ctx).unwrap();
-            let alerts = alerts(&mut server);
-            let server = Side::from(server.accept(b));
-            failed_with(&server, reason);
-            assert_eq!(
-                *alerts.lock().unwrap(),
-                [ILLEGAL_PARAMETER_ALERT],
-                "{reason}"
-            );
+            reject_client_share(group, reason, &bad);
         }
     }
 }
@@ -307,23 +393,20 @@ fn malformed_client_shares_are_rejected() {
 #[test]
 fn malformed_server_shares_are_rejected() {
     for group in GROUPS {
-        let server_ctx = server(&[group.curve]);
         for (reason, bad) in malformed(group) {
-            let (a, b) = ends();
-            let client_rx = a.rx.clone();
-            let mut ssl = client(SslVersion::TLS1_3, &[group.id], &[group.id]);
-            let alerts = alerts(&mut ssl);
-            let client = Side::from(ssl.connect(a));
-            let _server = Side::from(Ssl::new(&server_ctx).unwrap().accept(b));
-            let body = wire::encode_server_key_share(group.id, &bad);
-            rewrite_server_hello(&client_rx, |_, extensions| {
-                replace_extension(extensions, KEY_SHARE, &body);
-            });
-            failed_with(&client.step(), reason);
-            // A client reports any failed key share as an internal error, for
-            // every group, as upstream does.
-            assert_eq!(*alerts.lock().unwrap(), [INTERNAL_ERROR_ALERT], "{reason}");
+            reject_server_share(group, reason, &bad);
         }
+    }
+}
+
+/// RFC 7919 only requires 1 < Y < p-1; a value in that range outside the
+/// order-q subgroup is rejected too, from either peer.
+#[test]
+fn shares_outside_the_subgroup_are_rejected() {
+    for group in GROUPS {
+        let y = non_residue(group);
+        reject_client_share(group, "INVALID_PUBKEY", &y);
+        reject_server_share(group, "INVALID_PUBKEY", &y);
     }
 }
 

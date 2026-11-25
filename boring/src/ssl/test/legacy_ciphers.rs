@@ -112,6 +112,11 @@ fn ecdsa_identity(ctx: &mut SslContextBuilder) {
 
 /// A server that enables only `suite`, by name.
 fn server(suite: &Suite) -> SslContext {
+    server_with(suite, suite.name, SslVersion::TLS1_3)
+}
+
+/// A server with `suite`'s identity, the cipher `rule` and maximum version.
+fn server_with(suite: &Suite, rule: &str, max: SslVersion) -> SslContext {
     let mut ctx = if suite.ecdsa {
         let mut ctx = SslContext::builder(SslMethod::tls()).unwrap();
         ecdsa_identity(&mut ctx);
@@ -120,7 +125,8 @@ fn server(suite: &Suite) -> SslContext {
         server_context()
     };
     ctx.set_min_proto_version(Some(SslVersion::TLS1)).unwrap();
-    ctx.set_strict_cipher_list(suite.name).unwrap();
+    ctx.set_max_proto_version(Some(max)).unwrap();
+    ctx.set_strict_cipher_list(rule).unwrap();
     ctx.build()
 }
 
@@ -594,6 +600,54 @@ fn sealed_records_match_an_independent_computation() {
             );
             assert_eq!(mac.len(), mac_len);
             assert_eq!(mac, expected, "{} length {len}", suite.name);
+        }
+    }
+}
+
+/// The SHA-256 and SHA-384 CBC suites exist only in TLS 1.2: below it, a server
+/// never selects them and a client rejects a server that does.
+#[test]
+fn sha2_cbc_suites_are_not_negotiated_below_tls12() {
+    for suite in SUITES.iter().filter(|suite| suite.versions == TLS12) {
+        // A TLS 1.0 or 1.1 suite with the same identity, offered alongside.
+        let (fallback, fallback_name) = if suite.ecdsa {
+            (0xc009, "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA")
+        } else {
+            (0xc013, "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA")
+        };
+        let both = format!("{}:{fallback_name}", suite.name);
+        for version in [SslVersion::TLS1, SslVersion::TLS1_1] {
+            // Only the suite listed: no shared cipher at this version.
+            let (client_side, server_side) = handshake(
+                client(version, &[suite.id]),
+                Ssl::new(&server(suite)).unwrap(),
+            );
+            server_side.panicked_or_failed_with("NO_SHARED_CIPHER");
+            client_side.failed();
+
+            // A server capped at this version skips it for the other suite.
+            let mut ctx = client_context();
+            ctx.set_min_proto_version(Some(SslVersion::TLS1)).unwrap();
+            let mut ssl = Ssl::new(&ctx.build()).unwrap();
+            ssl.set_raw_cipher_list(&[suite.id, fallback]).unwrap();
+            let capped = server_with(suite, &both, version);
+            let (client_side, _) = handshake(ssl, Ssl::new(&capped).unwrap());
+            let client_side = client_side.done();
+            assert_eq!(client_side.ssl().version(), Some(version));
+            assert_eq!(
+                client_side.ssl().current_cipher().unwrap().protocol_id(),
+                fallback
+            );
+
+            // A server selecting it at this version anyway is rejected.
+            let (a, b) = ends();
+            let rx = a.rx.clone();
+            let client_side = Side::from(client(version, &[suite.id, fallback]).connect(a));
+            let _server = Side::from(Ssl::new(&capped).unwrap().accept(b));
+            rewrite_server_hello(&rx, |cipher, _| *cipher = suite.id);
+            client_side
+                .step()
+                .panicked_or_failed_with("WRONG_CIPHER_RETURNED");
         }
     }
 }
