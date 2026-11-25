@@ -41,8 +41,8 @@ static KNOWN_CIPHERS: [u16; 11] = [
 // Renegotiation SCSV, fallback SCSV, TLS_AES_128_CCM_SHA256 and unassigned.
 static UNKNOWN_CIPHERS: [u16; 6] = [0x0000, 0x00ff, 0x5600, 0x1304, 0xc0ff, 0xffff];
 static KNOWN_GROUPS: [u16; 5] = [X25519, P256, 0x0018, 0x0019, X25519_MLKEM768];
-// FFDHE 2048/3072, X448 and unassigned.
-static UNKNOWN_GROUPS: [u16; 5] = [0x0100, 0x0101, 0x001e, 0x0000, 0xffff];
+// FFDHE 4096/6144, X448 and unassigned.
+static UNKNOWN_GROUPS: [u16; 5] = [0x0102, 0x0103, 0x001e, 0x0000, 0xffff];
 static KNOWN_VERSIONS: [u16; 2] = [0x0304, 0x0303];
 // TLS 1.1, TLS 1.0, a TLS 1.3 draft and DTLS 1.2.
 static UNKNOWN_VERSIONS: [u16; 4] = [0x0302, 0x0301, 0x7f1c, 0xfefd];
@@ -1322,11 +1322,11 @@ fn unsupported_key_shares_are_dropped_under_every_policy() {
         UnknownValues::Preserve,
     ] {
         let mut case = Case::new(Versions::Tls13).shape(shape_with(|s| s.unknown = unknown));
-        case.key_shares = Some(vec![0x0100, 0x001e, 0xffff]);
+        case.key_shares = Some(vec![0x0102, 0x001e, 0xffff]);
         assert!(completes(&run_tcp(&case).unwrap()).retried);
         // Known groups the connection does not list are dropped too.
         case.groups = Some(vec![X25519]);
-        case.key_shares = Some(vec![P256, 0x0100]);
+        case.key_shares = Some(vec![P256, 0x0102]);
         assert!(completes(&run_tcp(&case).unwrap()).retried);
     }
 }
@@ -1535,7 +1535,7 @@ fn every_policy_and_value_mode_with_every_version_range() {
                         s.unknown = unknown;
                         s.values = values;
                     }));
-                case.groups = Some(vec![0x0a0a, X25519, 0x0100, P256]);
+                case.groups = Some(vec![0x0a0a, X25519, 0x0102, P256]);
                 case.supported_versions = Some(vec![0x1a1a, 0x0304, 0x0303, 0x0302]);
                 case.sigalgs = Some(vec![0x0804, 0x0808, 0x0403, 0x0a0a]);
                 case.resume = true;

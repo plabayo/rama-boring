@@ -56,7 +56,7 @@ const RSA_PSS_SHA256: u16 = 0x0804;
 const RSA_PSS_SHA384: u16 = 0x0805;
 
 /// Values a client can list but BoringSSL cannot negotiate.
-const UNKNOWN_GROUP: u16 = 0x0100; // ffdhe2048
+const UNKNOWN_GROUP: u16 = 0x0102; // ffdhe4096
 const UNKNOWN_VERSION: u16 = 0x7f1c; // a TLS 1.3 draft
 const UNKNOWN_SIGALG: u16 = 0x0909;
 const UNKNOWN_CIPHER: u16 = 0x13ff;

@@ -38,7 +38,7 @@ const P256: u16 = 0x0017;
 const P384: u16 = 0x0018;
 const X25519_MLKEM768: u16 = 0x11ec;
 /// A real group BoringSSL does not implement.
-const FFDHE2048: u16 = 0x0100;
+const FFDHE4096: u16 = 0x0102;
 
 const TLS12: SslVersion = SslVersion::TLS1_2;
 const TLS13: SslVersion = SslVersion::TLS1_3;
@@ -359,7 +359,7 @@ fn raw_cipher_lists_are_exact_in_both_versions() {
 fn raw_supported_groups_in_both_versions() {
     for version in VERSIONS {
         let mut ssl = client(version);
-        ssl.set_raw_supported_groups(&[0x0a0a, P384, FFDHE2048, X25519_MLKEM768, P256])
+        ssl.set_raw_supported_groups(&[0x0a0a, P384, FFDHE4096, X25519_MLKEM768, P256])
             .unwrap();
         let done = connect(ssl, server(version));
         let groups = done.hello().groups().expect("supported_groups");
@@ -598,7 +598,7 @@ fn seeded_grease_values_in_both_versions() {
 /// A client listing values it cannot negotiate in every list.
 fn with_unknown_values(version: SslVersion, policy: UnknownValues) -> Ssl {
     let mut ssl = client(version);
-    ssl.set_raw_supported_groups(&[X25519, FFDHE2048, P256])
+    ssl.set_raw_supported_groups(&[X25519, FFDHE4096, P256])
         .unwrap();
     // Ed448 is a real algorithm BoringSSL does not implement.
     ssl.set_raw_signature_algorithms(&[0x0804, 0x0808, 0x0403])
@@ -624,7 +624,7 @@ fn unknown_value_policies_in_both_versions() {
             server(version),
         );
         let hello = done.hello();
-        assert_eq!(hello.groups().unwrap(), [X25519, FFDHE2048, P256]);
+        assert_eq!(hello.groups().unwrap(), [X25519, FFDHE4096, P256]);
         assert_eq!(hello.sigalgs().unwrap(), [0x0804, 0x0808, 0x0403]);
         assert_eq!(
             hello.ids()[..3],
@@ -1393,7 +1393,7 @@ fn raw_groups_set_before_accept_configure_a_server() {
         for offer in clients {
             // A fresh `Ssl` takes the client setters: its role is chosen at accept.
             let mut ssl = server(version);
-            ssl.set_raw_supported_groups(&[0x0a0a, P384, FFDHE2048, P256])
+            ssl.set_raw_supported_groups(&[0x0a0a, P384, FFDHE4096, P256])
                 .unwrap();
             let done = connect(offer(version), ssl);
             let group = done.server.ssl().group_id().expect("a negotiated group");

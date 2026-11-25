@@ -820,6 +820,9 @@ impl From<u16> for SslSignatureAlgorithm {
 }
 
 /// A TLS Curve.
+///
+/// The RFC 7919 finite field groups, `FFDHE2048` and `FFDHE3072`, work only in
+/// TLS 1.3, and only when listed explicitly: no default list has them.
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct SslCurve(c_int);
@@ -847,6 +850,10 @@ impl SslCurve {
     pub const P256_KYBER768_DRAFT00: SslCurve = SslCurve(ffi::SSL_GROUP_P256_KYBER768_DRAFT00 as _);
 
     pub const MLKEM1024: SslCurve = SslCurve(ffi::SSL_GROUP_MLKEM1024 as _);
+
+    pub const FFDHE2048: SslCurve = SslCurve(ffi::SSL_GROUP_FFDHE2048 as _);
+
+    pub const FFDHE3072: SslCurve = SslCurve(ffi::SSL_GROUP_FFDHE3072 as _);
 
     /// Returns the curve name
     #[corresponds(SSL_get_curve_name)]

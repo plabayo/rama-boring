@@ -1,7 +1,9 @@
 //! A ClientHello that omits renegotiation_info and signals RFC 5746 through
 //! the SCSV in its raw cipher list instead, as some TLS 1.2 browser hellos do.
 
-use super::memory::{client_context, ends, handshake, server_context, Buffer, End, Side};
+use super::memory::{
+    client_context, ends, handshake, rewrite_server_hello, server_context, End, Side,
+};
 use super::wire::{self, Extension};
 use crate::ssl::{ClientHelloShape, Ssl, SslContext, SslRef, SslVersion};
 use std::sync::{Arc, Mutex};
@@ -102,31 +104,16 @@ fn omitted_renegotiation_info_keeps_ems_over_tls12() {
     }
 }
 
-/// Puts `extension` into the ServerHello at the front of the client's input.
-fn rewrite_server_hello(rx: &Buffer, extension: Extension<'static>) {
-    let mut rx = rx.lock().unwrap();
-    let bytes: Vec<u8> = rx.drain(..).collect();
-    let message = wire::first_record_message(&bytes).expect("a ServerHello record");
-    let mut hello = wire::ServerHello::parse(message).unwrap();
-    hello.extensions.retain(|(id, _)| *id != extension.0);
-    hello.extensions.push(extension);
-    let rewritten = hello.reencode(message).unwrap();
-    let end = 5 + usize::from(u16::from_be_bytes([bytes[3], bytes[4]]));
-    let fragment = [&rewritten[..], &bytes[5 + message.len()..end]].concat();
-    let len = u16::try_from(fragment.len()).unwrap().to_be_bytes();
-    rx.extend(&bytes[..3]);
-    rx.extend(len);
-    rx.extend(fragment);
-    rx.extend(&bytes[end..]);
-}
-
 /// The client's handshake after it reads a ServerHello carrying `extension`.
 fn answered_with(client: Ssl, extension: Extension<'static>) -> Side<End> {
     let (a, b) = ends();
     let rx = a.rx.clone();
     let client = Side::from(client.connect(a));
     let _server = Side::from(Ssl::new(&tls12_server()).unwrap().accept(b));
-    rewrite_server_hello(&rx, extension);
+    rewrite_server_hello(&rx, |_, extensions| {
+        extensions.retain(|(id, _)| *id != extension.0);
+        extensions.push((extension.0, extension.1.to_vec()));
+    });
     client.step()
 }
 

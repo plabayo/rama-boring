@@ -602,6 +602,9 @@ fn ensure_patches_applied(config: &Config) -> io::Result<()> {
     println!("cargo:info=applying post quantum crypto patch to boringssl");
     apply_patch(config, "rama_boring_pq.patch")?;
 
+    // Legacy cipher suites and groups browsers still offer, off by default.
+    apply_patch(config, "rama_legacy_tls.patch")?;
+
     apply_patch(config, "rama_symbols.patch")?;
     apply_patch(config, "rama_boringssl_cmake.patch")?;
     apply_patch(config, "rama_boring_prefix.patch")?;

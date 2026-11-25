@@ -1898,6 +1898,8 @@ mod browser_fixtures;
 mod client_hello_shape;
 mod connection;
 mod extension_presence;
+mod ffdhe;
+mod legacy_ciphers;
 mod lifecycle;
 mod memory;
 mod panic_safety;

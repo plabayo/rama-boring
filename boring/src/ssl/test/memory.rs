@@ -1,6 +1,7 @@
 //! An in-memory, nonblocking TLS transport and a driver that runs both ends of
 //! a handshake in one thread.
 
+use super::wire;
 use crate::ssl::{
     HandshakeError, MidHandshakeSslStream, Ssl, SslContext, SslContextBuilder, SslFiletype,
     SslMethod, SslStream,
@@ -182,4 +183,47 @@ fn describe(error: &crate::ssl::Error) -> String {
         }
     }
     text
+}
+
+/// Edits the cipher suite and extensions of the ServerHello at the front of a
+/// client's pending input, keeping the rest of the server's flight.
+pub(super) fn rewrite_server_hello(
+    rx: &Buffer,
+    edit: impl FnOnce(&mut u16, &mut Vec<(u16, Vec<u8>)>),
+) {
+    let mut rx = rx.lock().unwrap();
+    let bytes: Vec<u8> = rx.drain(..).collect();
+    let message = wire::first_record_message(&bytes).expect("a ServerHello record");
+    let hello = wire::ServerHello::parse(message).unwrap();
+    let mut cipher = hello.cipher;
+    let mut extensions: Vec<(u16, Vec<u8>)> = hello
+        .extensions
+        .iter()
+        .map(|(id, body)| (*id, body.to_vec()))
+        .collect();
+    edit(&mut cipher, &mut extensions);
+    let edited = wire::ServerHello {
+        cipher,
+        extensions: extensions
+            .iter()
+            .map(|(id, body)| (*id, &body[..]))
+            .collect(),
+    };
+    let rewritten = edited.reencode(message).unwrap();
+    let end = 5 + usize::from(u16::from_be_bytes([bytes[3], bytes[4]]));
+    let fragment = [&rewritten[..], &bytes[5 + message.len()..end]].concat();
+    let len = u16::try_from(fragment.len()).unwrap().to_be_bytes();
+    rx.extend(&bytes[..3]);
+    rx.extend(len);
+    rx.extend(fragment);
+    rx.extend(&bytes[end..]);
+}
+
+/// Replaces the body of extension `id` in a list of owned extensions.
+pub(super) fn replace_extension(extensions: &mut [(u16, Vec<u8>)], id: u16, body: &[u8]) {
+    let entry = extensions
+        .iter_mut()
+        .find(|(ext, _)| *ext == id)
+        .expect("the extension");
+    entry.1 = body.to_vec();
 }

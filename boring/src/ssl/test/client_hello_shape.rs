@@ -19,7 +19,7 @@ const KEY_SHARE: u16 = 51;
 const X25519: u16 = 0x001d;
 const P256: u16 = 0x0017;
 const P384: u16 = 0x0018;
-const FFDHE2048: u16 = 0x0100;
+const FFDHE4096: u16 = 0x0102;
 
 /// A ClientHello as sent.
 #[derive(Debug, Clone)]
@@ -287,7 +287,7 @@ fn unknown_client(policy: Option<UnknownValues>) -> Ssl {
     let mut ssl = client(|ctx| {
         ctx.set_min_proto_version(Some(SslVersion::TLS1_2)).unwrap();
     });
-    ssl.set_raw_supported_groups(&[X25519, FFDHE2048, P256])
+    ssl.set_raw_supported_groups(&[X25519, FFDHE4096, P256])
         .unwrap();
     ssl.set_raw_supported_versions(&[0x0304, 0x0303, 0x0302])
         .unwrap();
@@ -345,7 +345,7 @@ fn unknown_values_can_be_preserved() {
     // The server ignores what it does not know; the handshake completes.
     client.done();
     let hello = &hellos[0];
-    assert_eq!(hello.groups(), [X25519, FFDHE2048, P256]);
+    assert_eq!(hello.groups(), [X25519, FFDHE4096, P256]);
     assert_eq!(hello.versions(), [0x0304, 0x0303, 0x0302]);
     assert_eq!(hello.sigalgs(), [0x0403, 0x0808, 0x0804]);
     assert_eq!(
@@ -444,7 +444,7 @@ fn shape_setters_reject_servers_and_started_handshakes() {
 
     let mut ssl = client(|_| {});
     assert!(
-        ssl.set_raw_supported_groups(&[FFDHE2048]).is_err(),
+        ssl.set_raw_supported_groups(&[FFDHE4096]).is_err(),
         "none supported"
     );
     assert!(ssl.set_raw_signature_algorithms(&[0x0403; 257]).is_err());
@@ -455,8 +455,8 @@ mod model {
     use proptest::prelude::*;
 
     const KNOWN_GROUPS: [u16; 4] = [X25519, P256, P384, 0x0019];
-    // FFDHE 2048/3072 and X448: real groups BoringSSL does not implement.
-    const UNKNOWN_GROUPS: [u16; 3] = [FFDHE2048, 0x0101, 0x001e];
+    // FFDHE 4096/6144 and X448: real groups BoringSSL does not implement.
+    const UNKNOWN_GROUPS: [u16; 3] = [FFDHE4096, 0x0103, 0x001e];
     const KNOWN_VERSIONS: [u16; 2] = [0x0304, 0x0303];
     const UNKNOWN_VERSIONS: [u16; 3] = [0x0302, 0x0301, 0x7f1c];
     const KNOWN_SIGALGS: [u16; 4] = [0x0403, 0x0804, 0x0401, 0x0503];
@@ -817,7 +817,7 @@ fn key_shares_without_a_supported_group_request_a_retry() {
         for shares in [
             &[][..],
             &[UNKNOWN],
-            &[FFDHE2048],
+            &[FFDHE4096],
             &[0x0a0a],
             &[UNKNOWN, 0x0a0a],
         ] {

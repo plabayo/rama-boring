@@ -725,7 +725,7 @@ mod tests {
                     .with_extension_body(ExtensionType::from(0x8a8a), [1, 2, 3])
                     .with_extension_body(ExtensionType::from(22), [9]);
                 ssl.set_client_hello_shape(&shape).unwrap();
-                ssl.set_raw_supported_groups(&[0x0a0a, 0x001d, 0x0100, 0x0017])
+                ssl.set_raw_supported_groups(&[0x0a0a, 0x001d, 0x0102, 0x0017])
                     .unwrap();
                 ssl.set_extension_order(&[0x8a8a, 0, 22, 10, 13, 43, 51, 0x1a1a])
                     .unwrap();
