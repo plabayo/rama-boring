@@ -4,10 +4,11 @@
 //! server's records themselves, with the server write key from the key block.
 
 use super::memory::{client_context, handshake, server_context, End};
+use super::wire;
 use crate::ffi;
 use crate::ssl::{
-    Error, ErrorCode, Ssl, SslContentType, SslContext, SslContextBuilder, SslRenegotiateMode,
-    SslStream, SslVersion,
+    ClientHelloShape, Error, ErrorCode, Ssl, SslContentType, SslContext, SslContextBuilder,
+    SslRenegotiateMode, SslStream, SslVersion,
 };
 use crate::symm::{encrypt_aead, Cipher};
 use foreign_types::ForeignTypeRef;
@@ -41,7 +42,10 @@ struct Connection {
 
 impl Connection {
     fn new(client: &SslContext, mode: Option<SslRenegotiateMode>) -> Self {
-        let mut ssl = Ssl::new(client).unwrap();
+        Self::with(Ssl::new(client).unwrap(), mode)
+    }
+
+    fn with(mut ssl: Ssl, mode: Option<SslRenegotiateMode>) -> Self {
         if let Some(mode) = mode {
             ssl.set_renegotiate_mode(mode);
         }
@@ -120,9 +124,13 @@ impl Connection {
 
     /// How many ClientHellos the client wrote.
     fn client_hellos(&self) -> usize {
+        self.client_hello_messages().len()
+    }
+
+    fn client_hello_messages(&self) -> Vec<Vec<u8>> {
         self.written_messages(SslContentType::HANDSHAKE)
             .filter(|bytes| bytes.first() == Some(&1))
-            .count()
+            .collect()
     }
 
     fn written_messages(&self, content_type: SslContentType) -> impl Iterator<Item = Vec<u8>> {
@@ -273,4 +281,36 @@ fn renegotiation_mode_is_per_connection() {
     never.hello_request();
     freely.renegotiating();
     never.refused();
+}
+
+/// RFC 5746, section 3.5: a renegotiation ClientHello sends renegotiation_info
+/// with the saved client_verify_data and never the SCSV, even when the initial
+/// one omitted the extension or listed the SCSV.
+#[test]
+fn renegotiation_sends_renegotiation_info_without_scsv() {
+    const RENEGOTIATION_INFO: u16 = 0xff01;
+    const SCSV: u16 = 0x00ff;
+    for omit in [false, true] {
+        let mut ssl = Ssl::new(&client()).unwrap();
+        ssl.set_raw_cipher_list(&[0xc02f, SCSV]).unwrap();
+        ssl.set_client_hello_shape(&ClientHelloShape::new().with_omit_renegotiation_info(omit))
+            .unwrap();
+        let mut conn = Connection::with(ssl, Some(SslRenegotiateMode::FREELY));
+        assert!(conn.client.ssl().secure_renegotiation_support());
+        let mut client_verify_data = [0; 12];
+        assert_eq!(conn.client.ssl().finished(&mut client_verify_data), 12);
+        conn.hello_request();
+        conn.renegotiating();
+        let hellos = conn.client_hello_messages();
+        let initial = wire::ClientHello::parse(&hellos[0]).unwrap();
+        assert!(initial.ciphers.contains(&SCSV));
+        assert_eq!(
+            initial.extension(RENEGOTIATION_INFO),
+            (!omit).then_some(&[0][..])
+        );
+        let renegotiation = wire::ClientHello::parse(&hellos[1]).unwrap();
+        assert_eq!(renegotiation.ciphers, [0xc02f]);
+        let body = renegotiation.extension(RENEGOTIATION_INFO).unwrap();
+        assert_eq!(body, [&[12][..], &client_verify_data].concat());
+    }
 }

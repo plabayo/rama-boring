@@ -104,6 +104,7 @@ pub struct ClientHelloShape {
     legacy_extensions: bool,
     ec_point_formats: bool,
     omit_psk_key_exchange_modes: bool,
+    omit_renegotiation_info: bool,
     ech_grease: Option<EchGreaseShape>,
     extension_bodies: Vec<(ExtensionType, Vec<u8>)>,
 }
@@ -206,6 +207,26 @@ impl ClientHelloShape {
     #[must_use]
     pub fn with_omit_psk_key_exchange_modes(mut self, omit: bool) -> Self {
         self.set_omit_psk_key_exchange_modes(omit);
+        self
+    }
+
+    /// Omits renegotiation_info from an initial ClientHello, leaving EMS as
+    /// configured, as browsers that signal RFC 5746 through the
+    /// `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` cipher value (`0x00ff`) instead do.
+    ///
+    /// With that SCSV in the raw cipher list, the server's renegotiation_info
+    /// is solicited and checked as if the extension had been sent; without
+    /// it, the client signals no RFC 5746 support and rejects one. A
+    /// renegotiation ClientHello still sends the extension, without the SCSV
+    /// (RFC 5746, section 3.5).
+    pub fn set_omit_renegotiation_info(&mut self, omit: bool) -> &mut Self {
+        self.omit_renegotiation_info = omit;
+        self
+    }
+
+    #[must_use]
+    pub fn with_omit_renegotiation_info(mut self, omit: bool) -> Self {
+        self.set_omit_renegotiation_info(omit);
         self
     }
 
@@ -710,6 +731,7 @@ impl SslRef {
             ech_grease_payload_len: shape.ech_grease.map_or(0, |s| s.payload_len()),
             ec_point_formats: shape.ec_point_formats.into(),
             omit_psk_key_exchange_modes: shape.omit_psk_key_exchange_modes.into(),
+            omit_renegotiation_info: shape.omit_renegotiation_info.into(),
         };
         unsafe { cvt(ffi::RAMA_SSL_set_client_hello_shape(self.as_ptr(), &native)).map(|_| ()) }
     }

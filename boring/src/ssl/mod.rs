@@ -1614,7 +1614,9 @@ impl SslContextBuilder {
     /// protocol version, authentication requirements, or local support. The list
     /// is exact: a GREASE codepoint is a GREASE slot at its position (with a fresh
     /// value unless [`GreaseValues::Pinned`]), and context GREASE adds no other
-    /// GREASE cipher. Fallback SCSV is not added a second time.
+    /// GREASE cipher. Fallback SCSV is not added a second time. A renegotiation
+    /// ClientHello drops `TLS_EMPTY_RENEGOTIATION_INFO_SCSV` (`0x00ff`), which
+    /// RFC 5746 forbids next to its renegotiation_info.
     ///
     /// This is a cipher-list setter, so setter ordering matters: calling it after
     /// [`SslContextBuilder::set_compliance_policy`] replaces the policy's TLS 1.2

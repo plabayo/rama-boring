@@ -1902,6 +1902,7 @@ mod lifecycle;
 mod memory;
 mod panic_safety;
 mod renegotiation;
+mod renegotiation_info;
 mod session_order;
 pub(crate) mod wire;
 mod wire_fuzz;
