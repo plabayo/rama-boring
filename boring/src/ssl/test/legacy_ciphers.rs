@@ -271,6 +271,8 @@ fn client_keys(conn: &Connection, suite: &Suite) -> ClientKeys {
     let key_len = (suite.cipher)().key_len();
     let ptr = conn.client.ssl().as_ptr();
     let mut block = vec![0; 2 * (mac_len + key_len)];
+    // SAFETY: `ptr` is the live client SSL; the getters only read it, and
+    // `block` is exactly the asserted key block length.
     let seq = unsafe {
         assert_eq!(ffi::SSL_get_key_block_len(ptr), block.len());
         assert_eq!(
@@ -476,17 +478,43 @@ fn expansion(rule: &str) -> Vec<u16> {
     ids
 }
 
-/// Pinned to the lists of the library before these suites existed.
+// The default cipher orders of the library before these suites existed. With
+// AES hardware, AES-GCM comes before ChaCha20-Poly1305; without it, after. The
+// rest of each list is the same either way.
+const HELLO_WITH_AES_HW: [u16; 17] = [
+    0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc009, 0xc013, 0xc00a,
+    0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
+];
+const HELLO_WITHOUT_AES_HW: [u16; 17] = [
+    0x1303, 0x1301, 0x1302, 0xcca9, 0xcca8, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xc009, 0xc013, 0xc00a,
+    0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
+];
+const ALL_WITH_AES_HW: [u16; 19] = [
+    0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xccac, 0xc009, 0xc013, 0xc035, 0xc00a, 0xc014,
+    0xc036, 0x009c, 0x009d, 0x002f, 0x008c, 0x0035, 0x008d,
+];
+const ALL_WITHOUT_AES_HW: [u16; 19] = [
+    0xcca9, 0xcca8, 0xccac, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xc009, 0xc013, 0xc035, 0xc00a, 0xc014,
+    0xc036, 0x009c, 0x009d, 0x002f, 0x008c, 0x0035, 0x008d,
+];
+
+/// Pinned to the lists of the library before these suites existed, in the
+/// order for this machine's AES hardware, the same for every list.
 #[test]
 fn default_offers_and_rules_are_unchanged() {
     let [ciphers, groups, key_shares, extensions] = default_hello();
-    assert_eq!(
-        ciphers,
-        [
-            0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc009, 0xc013,
-            0xc00a, 0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
-        ]
-    );
+    let aes_hw = ciphers == HELLO_WITH_AES_HW;
+    if !aes_hw {
+        assert_eq!(ciphers, HELLO_WITHOUT_AES_HW);
+    }
+    let all = if aes_hw {
+        ALL_WITH_AES_HW
+    } else {
+        ALL_WITHOUT_AES_HW
+    };
+    assert_eq!(expansion("ALL"), all);
+    assert_eq!(expansion("DEFAULT"), all);
+    // Groups, key shares and the extension order have no hardware branch.
     assert_eq!(
         groups,
         [0x11ec, 0x001d, 0x0202, 0x0017, 0x0018, 0x0019, 0x6399, 0xfe30]
@@ -496,12 +524,20 @@ fn default_offers_and_rules_are_unchanged() {
         extensions,
         [0x0017, 0xff01, 0x000a, 0x000b, 0x0023, 0x000d, 0x0033, 0x002d, 0x002b]
     );
-    let all = [
-        0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xccac, 0xc009, 0xc013, 0xc035, 0xc00a,
-        0xc014, 0xc036, 0x009c, 0x009d, 0x002f, 0x008c, 0x0035, 0x008d,
-    ];
-    assert_eq!(expansion("ALL"), all);
-    assert_eq!(expansion("DEFAULT"), all);
+}
+
+/// The two pinned orders differ only by where the AES-GCM block sits.
+#[test]
+fn pinned_orders_hold_the_same_suites() {
+    let sorted = |list: &[u16]| {
+        let mut list = list.to_vec();
+        list.sort_unstable();
+        list
+    };
+    assert_eq!(sorted(&HELLO_WITH_AES_HW), sorted(&HELLO_WITHOUT_AES_HW));
+    assert_eq!(sorted(&ALL_WITH_AES_HW), sorted(&ALL_WITHOUT_AES_HW));
+    assert_eq!(HELLO_WITH_AES_HW[9..], HELLO_WITHOUT_AES_HW[9..]);
+    assert_eq!(ALL_WITH_AES_HW[7..], ALL_WITHOUT_AES_HW[7..]);
 }
 
 /// A default server never picks the suites: it skips them for a later shared

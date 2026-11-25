@@ -5,7 +5,8 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use crate::config::Config;
 
@@ -813,6 +814,7 @@ fn generate_bindings(config: &Config) {
     let target_rust_version =
         bindgen::RustTarget::stable(82, 0).expect("bindgen does not recognize target rust version");
 
+    let non_exhaustive_matched = Arc::new(AtomicBool::new(false));
     let mut builder = bindgen::Builder::default()
         .rust_target(target_rust_version) // bindgen MSRV is 1.70, so this is enough
         .derive_copy(true)
@@ -835,7 +837,9 @@ fn generate_bindings(config: &Config) {
         .clang_args(get_extra_clang_args_for_bindgen(config))
         .clang_arg("-I")
         .clang_arg(include_path.display().to_string())
-        .parse_callbacks(Box::new(NonExhaustiveOptions));
+        .parse_callbacks(Box::new(NonExhaustiveOptions {
+            matched: non_exhaustive_matched.clone(),
+        }));
 
     if let Some(sysroot) = &config.env.sysroot {
         builder = builder
@@ -890,6 +894,11 @@ fn generate_bindings(config: &Config) {
     }
 
     let bindings = builder.generate().expect("Unable to generate bindings");
+    // A silent miss would make the next shape field a breaking change again.
+    assert!(
+        non_exhaustive_matched.load(Ordering::Relaxed),
+        "bindgen never saw `rama_ssl_client_hello_shape_st`: it is no longer #[non_exhaustive]"
+    );
     let mut source_code = Vec::new();
     bindings
         .write(Box::new(&mut source_code))
@@ -929,12 +938,17 @@ impl bindgen::callbacks::ParseCallbacks for UnprefixedTypeNames {
 /// Marks option structs that gain fields over time `#[non_exhaustive]`, so a
 /// new field is not a breaking change. Callers start from `Default`.
 #[derive(Debug)]
-struct NonExhaustiveOptions;
+struct NonExhaustiveOptions {
+    matched: Arc<AtomicBool>,
+}
 
 impl bindgen::callbacks::ParseCallbacks for NonExhaustiveOptions {
     fn add_attributes(&self, info: &bindgen::callbacks::AttributeInfo<'_>) -> Vec<String> {
         match info.name {
-            "rama_ssl_client_hello_shape_st" => vec!["#[non_exhaustive]".to_owned()],
+            "rama_ssl_client_hello_shape_st" => {
+                self.matched.store(true, Ordering::Relaxed);
+                vec!["#[non_exhaustive]".to_owned()]
+            }
             _ => Vec::new(),
         }
     }

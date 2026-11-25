@@ -541,6 +541,8 @@ impl SslRef {
     /// handshake completes.
     #[corresponds(RAMA_SSL_set_raw_cipher_list)]
     pub fn set_raw_cipher_list(&mut self, cipher_list: &[u16]) -> Result<(), ErrorStack> {
+        // SAFETY: `self` is a live SSL, borrowed mutably; `cipher_list` is valid for
+        // `cipher_list.len()` values for the call, and the callee copies them.
         unsafe {
             cvt(ffi::RAMA_SSL_set_raw_cipher_list(
                 self.as_ptr(),
@@ -602,6 +604,8 @@ impl SslRef {
     /// completed or for more than 256 IDs.
     #[corresponds(RAMA_SSL_set_server_extension_order)]
     pub fn set_server_extension_order(&mut self, ids: &[u16]) -> Result<(), ErrorStack> {
+        // SAFETY: `self` is a live SSL, borrowed mutably; `ids` is valid for
+        // `ids.len()` values for the call, and the callee copies them.
         unsafe {
             cvt(ffi::RAMA_SSL_set_server_extension_order(
                 self.as_ptr(),
@@ -637,6 +641,8 @@ impl SslRef {
     }
 
     fn tls13_server_ciphers(&mut self, cipher_ids: &[u16], strict: bool) -> Result<(), ErrorStack> {
+        // SAFETY: `self` is a live SSL, borrowed mutably; `cipher_ids` is valid for
+        // `cipher_ids.len()` values for the call, and the callee copies them.
         unsafe {
             cvt(ffi::RAMA_SSL_set_tls13_server_ciphers(
                 self.as_ptr(),
@@ -673,6 +679,8 @@ impl SslRef {
         algorithms: &[CertificateCompressionAlgorithm],
     ) -> Result<(), ErrorStack> {
         let ids: Vec<u16> = algorithms.iter().map(|algorithm| algorithm.0).collect();
+        // SAFETY: `self` is a live SSL, borrowed mutably; `ids` is valid for
+        // `ids.len()` values for the call, and the callee copies them.
         unsafe {
             cvt(ffi::RAMA_SSL_set_cert_compression_algs(
                 self.as_ptr(),
@@ -715,6 +723,7 @@ impl SslRef {
                 len: body.len(),
             })
             .collect();
+        // Zeroed is valid and native for every field, per the C header.
         let mut native = ffi::RAMA_SSL_CLIENT_HELLO_SHAPE::default();
         native.grease_lists_set = shape.grease_lists.is_some().into();
         native.grease_lists = shape.grease_lists.map_or(0, |lists| lists.bits());
@@ -732,6 +741,11 @@ impl SslRef {
         native.ec_point_formats = shape.ec_point_formats.into();
         native.omit_psk_key_exchange_modes = shape.omit_psk_key_exchange_modes.into();
         native.omit_renegotiation_info = shape.omit_renegotiation_info.into();
+        // SAFETY: `self` is a live SSL, borrowed mutably. `native` is a complete,
+        // initialised struct. `extension_bodies` points to `bodies.len()`
+        // initialised entries, each `body` valid for `len` bytes of `shape`.
+        // `bodies` and `shape` outlive the call, and the callee copies what it
+        // needs and keeps no pointer (`RAMA_SSL_set_client_hello_shape` docs).
         unsafe { cvt(ffi::RAMA_SSL_set_client_hello_shape(self.as_ptr(), &native)).map(|_| ()) }
     }
 
@@ -742,6 +756,8 @@ impl SslRef {
     /// [`Self::set_curves`] or [`Self::set_curves_list`] replaces this list.
     #[corresponds(RAMA_SSL_set_raw_supported_groups)]
     pub fn set_raw_supported_groups(&mut self, groups: &[u16]) -> Result<(), ErrorStack> {
+        // SAFETY: `self` is a live SSL, borrowed mutably; `groups` is valid for
+        // `groups.len()` values for the call, and the callee copies them.
         unsafe {
             cvt(ffi::RAMA_SSL_set_raw_supported_groups(
                 self.as_ptr(),
@@ -760,6 +776,8 @@ impl SslRef {
     /// empty list, asking the server for a HelloRetryRequest.
     #[corresponds(RAMA_SSL_set_raw_key_shares)]
     pub fn set_raw_key_shares(&mut self, groups: &[u16]) -> Result<(), ErrorStack> {
+        // SAFETY: `self` is a live SSL, borrowed mutably; `groups` is valid for
+        // `groups.len()` values for the call, and the callee copies them.
         unsafe {
             cvt(ffi::RAMA_SSL_set_raw_key_shares(
                 self.as_ptr(),
@@ -775,6 +793,8 @@ impl SslRef {
     /// configured minimum and maximum follow [`UnknownValues`].
     #[corresponds(RAMA_SSL_set_raw_supported_versions)]
     pub fn set_raw_supported_versions(&mut self, versions: &[u16]) -> Result<(), ErrorStack> {
+        // SAFETY: `self` is a live SSL, borrowed mutably; `versions` is valid for
+        // `versions.len()` values for the call, and the callee copies them.
         unsafe {
             cvt(ffi::RAMA_SSL_set_raw_supported_versions(
                 self.as_ptr(),
@@ -791,6 +811,8 @@ impl SslRef {
     /// against [`Self::set_verify_algorithm_prefs`].
     #[corresponds(RAMA_SSL_set_raw_signature_algorithms)]
     pub fn set_raw_signature_algorithms(&mut self, algorithms: &[u16]) -> Result<(), ErrorStack> {
+        // SAFETY: `self` is a live SSL, borrowed mutably; `algorithms` is valid for
+        // `algorithms.len()` values for the call, and the callee copies them.
         unsafe {
             cvt(ffi::RAMA_SSL_set_raw_signature_algorithms(
                 self.as_ptr(),

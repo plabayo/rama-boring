@@ -1,5 +1,5 @@
 diff --git a/crypto/cipher/e_tls.cc b/crypto/cipher/e_tls.cc
-index 0edf61a..6b61abb 100644
+index 0edf61a..67b5c20 100644
 --- a/crypto/cipher/e_tls.cc
 +++ b/crypto/cipher/e_tls.cc
 @@ -428,6 +428,22 @@ static int aead_aes_128_cbc_sha256_tls_init(EVP_AEAD_CTX *ctx,
@@ -25,10 +25,14 @@ index 0edf61a..6b61abb 100644
  static int aead_aes_256_cbc_sha1_tls_init(EVP_AEAD_CTX *ctx, const uint8_t *key,
                                            size_t key_len, size_t tag_len,
                                            enum evp_aead_direction_t dir) {
-@@ -519,6 +535,38 @@ static const EVP_AEAD aead_aes_128_cbc_sha256_tls = {
+@@ -519,6 +535,47 @@ static const EVP_AEAD aead_aes_128_cbc_sha256_tls = {
      aead_tls_tag_len,
  };
  
++static_assert(SHA256_DIGEST_LENGTH + 32 <= EVP_AEAD_MAX_KEY_LENGTH &&
++                  16 + SHA256_DIGEST_LENGTH <= EVP_AEAD_MAX_OVERHEAD,
++              "AES-256-CBC-SHA256 exceeds the AEAD limits");
++
 +static const EVP_AEAD aead_aes_256_cbc_sha256_tls = {
 +    SHA256_DIGEST_LENGTH + 32,  // key len (SHA256 + AES256)
 +    16,                         // nonce len (IV)
@@ -44,6 +48,11 @@ index 0edf61a..6b61abb 100644
 +    nullptr,  // get_iv
 +    aead_tls_tag_len,
 +};
++
++// The SHA-384 key and overhead sit exactly at the AEAD limits.
++static_assert(SHA384_DIGEST_LENGTH + 32 <= EVP_AEAD_MAX_KEY_LENGTH &&
++                  16 + SHA384_DIGEST_LENGTH <= EVP_AEAD_MAX_OVERHEAD,
++              "AES-256-CBC-SHA384 exceeds the AEAD limits");
 +
 +static const EVP_AEAD aead_aes_256_cbc_sha384_tls = {
 +    SHA384_DIGEST_LENGTH + 32,  // key len (SHA384 + AES256)
@@ -64,7 +73,7 @@ index 0edf61a..6b61abb 100644
  static const EVP_AEAD aead_aes_256_cbc_sha1_tls = {
      SHA_DIGEST_LENGTH + 32,  // key len (SHA1 + AES256)
      16,                      // nonce len (IV)
-@@ -595,6 +643,14 @@ const EVP_AEAD *EVP_aead_aes_128_cbc_sha256_tls() {
+@@ -595,6 +652,14 @@ const EVP_AEAD *EVP_aead_aes_128_cbc_sha256_tls() {
    return &aead_aes_128_cbc_sha256_tls;
  }
  

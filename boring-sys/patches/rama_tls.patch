@@ -1,5 +1,5 @@
 diff --git a/include/openssl/ssl.h b/include/openssl/ssl.h
-index 3b48c2a..cbd720f 100644
+index 3b48c2a..2afc546 100644
 --- a/include/openssl/ssl.h
 +++ b/include/openssl/ssl.h
 @@ -1739,8 +1739,19 @@ OPENSSL_EXPORT int SSL_CTX_set_strict_cipher_list(SSL_CTX *ctx,
@@ -61,7 +61,7 @@ index 3b48c2a..cbd720f 100644
  OPENSSL_EXPORT void SSL_CTX_set_reverify_on_resume(SSL_CTX *ctx, int enabled);
  
  // SSL_ST_* are possible values for `SSL_state`, the bitmasks that make them up,
-@@ -5565,7 +5582,223 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
+@@ -5565,7 +5582,225 @@ OPENSSL_EXPORT void SSL_CTX_set_grease_sigalgs_enabled(SSL_CTX *ctx,
  // permute extensions. For now, this is only implemented for the ClientHello.
  OPENSSL_EXPORT void SSL_CTX_set_permute_extensions(SSL_CTX *ctx, int enabled);
  
@@ -176,7 +176,8 @@ index 3b48c2a..cbd720f 100644
 +// choices. |grease_lists| applies when |grease_lists_set|; otherwise the
 +// context's GREASE settings do. With a real ECH config, GREASE slots and
 +// preserved extensions of the extension order do not apply: ClientHelloInner
-+// references the outer extensions natively.
++// references the outer extensions natively. An all-zero struct is valid and
++// keeps the native behaviour for every field; new fields must keep that.
 +typedef struct rama_ssl_client_hello_shape_st {
 +  int grease_lists_set;
 +  uint32_t grease_lists;
@@ -223,8 +224,9 @@ index 3b48c2a..cbd720f 100644
 +// before it writes its ClientHello. It validates everything first: on error,
 +// the previous shape stays. It fails for a server, once the ClientHello was
 +// written, for an out-of-range value, a body over 65535 bytes, a repeated
-+// body, or a body of an extension BoringSSL builds. It returns one on success
-+// and zero on error.
++// body, or a body of an extension BoringSSL builds. It copies what it needs and
++// keeps no pointer into |shape| or its bodies. It returns one on success and
++// zero on error.
 +OPENSSL_EXPORT int RAMA_SSL_set_client_hello_shape(
 +    SSL *ssl, const RAMA_SSL_CLIENT_HELLO_SHAPE *shape);
 +
